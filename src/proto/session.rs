@@ -1,7 +1,7 @@
 //! The sans-IO client session (PLAN 7.4): bytes in, bytes out, events out,
 //! deadlines out. No socket, no clock, no randomness.
 
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, string::String, vec::Vec};
 use core::fmt;
 
 use super::{
@@ -141,6 +141,8 @@ pub struct SessionConfig {
     pub reply_limits: ReplyLimits,
     /// Output buffer size in octets (default 16 KiB; at least 1 KiB).
     pub output_capacity: usize,
+    /// Queue an [`Event::Reply`] for every reply (default false).
+    pub reply_events: bool,
 }
 
 impl Default for SessionConfig {
@@ -155,6 +157,7 @@ impl Default for SessionConfig {
             recipient_policy: RecipientPolicy::Any,
             reply_limits: ReplyLimits::default(),
             output_capacity: 16 * 1024,
+            reply_events: false,
         }
     }
 }
@@ -191,6 +194,16 @@ pub enum SessionState {
 pub enum Event {
     /// The server's greeting.
     Greeting(Reply),
+    /// A reply arrived (only with [`SessionConfig::reply_events`]): its
+    /// codes, never its text (T-30).
+    Reply {
+        /// The command it answers.
+        stage: Stage,
+        /// The reply code.
+        code: super::ReplyCode,
+        /// The enhanced status code, when the server sends them.
+        enhanced: Option<super::EnhancedCode>,
+    },
     /// Ready for a transaction.
     Ready {
         /// The connection is TLS.
@@ -542,6 +555,13 @@ impl Session {
             return Err(self.close(e));
         };
         let stage = p.what.stage();
+        if self.config.reply_events {
+            self.events.push_back(Event::Reply {
+                stage,
+                code,
+                enhanced: self.parser.enhanced(),
+            });
+        }
         if code.get() == 421 {
             let reply = self.parser.take();
             let e = Error::new(ErrorKind::Rejected)
@@ -695,9 +715,15 @@ impl Session {
             .caps
             .as_ref()
             .filter(|c| c.has(Extension::Auth))
-            .and_then(|c| Exchange::choose(auth, c.auth_mechanism_names()));
-        let Some(mechanism) = chosen else {
-            return Err(self.close(Error::new(ErrorKind::AuthUnavailable).at(Stage::Auth)));
+            .map_or(Ok(None), |c| {
+                Exchange::choose(auth, c.auth_mechanism_names())
+            });
+        let mechanism = match chosen {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                return Err(self.close(Error::new(ErrorKind::AuthUnavailable).at(Stage::Auth)));
+            }
+            Err(e) => return Err(self.close(Error::from(e).at(Stage::Auth))),
         };
         let (line, exchange) = match Exchange::start(auth, mechanism) {
             Ok(x) => x,
@@ -715,16 +741,21 @@ impl Session {
     fn on_auth_reply(&mut self, code: super::ReplyCode, now: Millis) -> Result<(), Error> {
         match code.get() {
             235 => {
-                let Some(ex) = self.exchange.take() else {
+                let Some(mut ex) = self.exchange.take() else {
                     return Err(
                         self.close(Error::from(ProtocolError::UnexpectedReply).at(Stage::Auth))
                     );
                 };
-                if !ex.complete() {
+                match ex.finish() {
+                    Ok(true) => {}
                     // 235 before the exchange was complete.
-                    return Err(
-                        self.close(Error::from(ProtocolError::UnexpectedReply).at(Stage::Auth))
-                    );
+                    Ok(false) => {
+                        return Err(
+                            self.close(Error::from(ProtocolError::UnexpectedReply).at(Stage::Auth))
+                        );
+                    }
+                    // The client refuses the success (SCRAM: no server proof).
+                    Err(e) => return Err(self.close(Error::from(e).at(Stage::Auth))),
                 }
                 self.authenticated = true;
                 self.events.push_back(Event::Authenticated {
@@ -763,7 +794,11 @@ impl Session {
             }
             _ => {
                 let reply = self.parser.take();
-                Err(self.close(auth_error(reply)))
+                let detail = self
+                    .exchange
+                    .as_ref()
+                    .and_then(|e| e.detail().map(String::from));
+                Err(self.close(auth_error(reply).with_detail(detail.as_deref())))
             }
         }
     }

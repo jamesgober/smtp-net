@@ -427,6 +427,10 @@ pub enum ConfigError {
     /// A session configured to authenticate over plaintext to a peer not
     /// confirmed to be loopback (T-8).
     AuthWithPlaintextRemote,
+    /// More than 4 DKIM signers on one server.
+    TooManyDkimSigners,
+    /// A pool size outside 1 to 64.
+    PoolSize,
 }
 
 impl fmt::Display for ConfigError {
@@ -448,6 +452,8 @@ impl fmt::Display for ConfigError {
             ConfigError::AuthWithPlaintextRemote => {
                 "credentials are sent only over TLS or to a peer confirmed to be loopback"
             }
+            ConfigError::TooManyDkimSigners => "a server takes at most 4 DKIM signers",
+            ConfigError::PoolSize => "a pool holds 1 to 64 connections",
         })
     }
 }
@@ -586,6 +592,107 @@ impl fmt::Display for PayloadError {
     }
 }
 
+/// DKIM signing or key loading failed (API 8.7).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DkimError {
+    /// The `d=` domain is not a valid ASCII domain name.
+    InvalidDomain,
+    /// The selector is not dot-separated letters, digits, and hyphens.
+    InvalidSelector,
+    /// A header name in the signed or oversigned list is not a field name.
+    InvalidHeaderName,
+    /// The key is not in a format this crate reads (PKCS#8 or PKCS#1, PEM
+    /// or DER, unencrypted), or is not a key for the algorithm asked for.
+    KeyFormat,
+    /// The RSA modulus is shorter than the minimum.
+    KeyTooSmall {
+        /// The modulus length in bits.
+        bits: u32,
+        /// The smallest accepted length.
+        minimum: u32,
+    },
+    /// The RSA modulus is longer than 4096 bits, the most every verifier
+    /// must handle (RFC 8301 section 3.2).
+    KeyTooLarge {
+        /// The modulus length in bits.
+        bits: u32,
+    },
+    /// The message has no From header, which DKIM must sign.
+    MissingFrom,
+    /// The header block is over its budget (64 KiB).
+    HeaderBlockTooLarge,
+    /// The message is not RFC 5322 text DKIM can sign.
+    MalformedMessage {
+        /// The 1-based line where the problem is.
+        line: usize,
+    },
+    /// The `i=` identity is outside the `d=` domain (RFC 6376 section 3.5).
+    IdentityOutsideDomain,
+    /// The signing backend failed.
+    Signing,
+}
+
+impl fmt::Display for DkimError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DkimError::InvalidDomain => f.write_str("the DKIM domain (d=) is not a valid ASCII domain name"),
+            DkimError::InvalidSelector => f.write_str(
+                "the DKIM selector is not dot-separated labels of letters, digits, and hyphens",
+            ),
+            DkimError::InvalidHeaderName => f.write_str("a DKIM signed header name is not a valid field name"),
+            DkimError::KeyFormat => f.write_str(
+                "the DKIM key is not an unencrypted PKCS#8 or PKCS#1 key (PEM or DER) for this algorithm",
+            ),
+            DkimError::KeyTooSmall { bits, minimum } => write!(
+                f,
+                "the DKIM RSA key has {bits} bits; at least {minimum} are required"
+            ),
+            DkimError::KeyTooLarge { bits } => write!(
+                f,
+                "the DKIM RSA key has {bits} bits; receivers only must handle up to 4096"
+            ),
+            DkimError::MissingFrom => f.write_str("the message has no From header, which DKIM must sign"),
+            DkimError::HeaderBlockTooLarge => f.write_str("the message header block is over 64 KiB"),
+            DkimError::MalformedMessage { line } => write!(
+                f,
+                "the message cannot be DKIM signed: line {line} is not a header field"
+            ),
+            DkimError::IdentityOutsideDomain => {
+                f.write_str("the DKIM identity (i=) is outside the signing domain (d=)")
+            }
+            DkimError::Signing => f.write_str("the DKIM signing backend failed"),
+        }
+    }
+}
+
+/// A [`BodySource`](crate::BodySource) failed.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SourceError {
+    /// The source failed, with its reason.
+    Failed(&'static str),
+    /// Reading failed.
+    #[cfg(feature = "std")]
+    Io(std::io::ErrorKind),
+    /// The source was read already: a message with a streamed attachment
+    /// serializes once.
+    Consumed,
+}
+
+impl fmt::Display for SourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SourceError::Failed(reason) => write!(f, "the attachment source failed: {reason}"),
+            #[cfg(feature = "std")]
+            SourceError::Io(kind) => write!(f, "reading the attachment source failed ({kind})"),
+            SourceError::Consumed => f.write_str(
+                "the streamed attachment was read already; build the message again to resend it",
+            ),
+        }
+    }
+}
+
 /// A serialization sink refused bytes.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -675,6 +782,10 @@ pub enum ErrorKind {
     Sink(SinkError),
     /// A job payload could not be decoded.
     Payload(PayloadError),
+    /// DKIM signing or key loading failed.
+    Dkim(DkimError),
+    /// A streamed attachment's source failed.
+    Source(SourceError),
     /// The TCP connection could not be opened.
     #[cfg(feature = "std")]
     Connect(std::io::ErrorKind),
@@ -716,6 +827,9 @@ pub enum ErrorKind {
     ExtensionRequired(Extension),
     /// The connection closed before the conversation ended.
     ConnectionClosed,
+    /// Every connection of a [`Pool`](crate::Pool) stayed busy past its
+    /// wait limit; nothing was sent.
+    PoolExhausted,
     /// A caller buffer is too small.
     BufferTooSmall,
 }
@@ -731,6 +845,8 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Random => f.write_str("the operating system's random source failed; retry later"),
             ErrorKind::Sink(e) => fmt::Display::fmt(e, f),
             ErrorKind::Payload(e) => fmt::Display::fmt(e, f),
+            ErrorKind::Dkim(e) => fmt::Display::fmt(e, f),
+            ErrorKind::Source(e) => fmt::Display::fmt(e, f),
             #[cfg(feature = "std")]
             ErrorKind::Connect(kind) => write!(
                 f,
@@ -768,6 +884,9 @@ impl fmt::Display for ErrorKind {
                 ext.keyword()
             ),
             ErrorKind::ConnectionClosed => f.write_str("the mail server closed the connection"),
+            ErrorKind::PoolExhausted => f.write_str(
+                "every pooled connection stayed busy past the wait limit; nothing was sent, retry later",
+            ),
             ErrorKind::BufferTooSmall => f.write_str("the output buffer is too small"),
         }
     }
@@ -785,6 +904,8 @@ struct Inner {
     possibly_delivered: bool,
     retry_after: Option<Duration>,
     security_event: bool,
+    /// The server's XOAUTH2 error status, when it sent one.
+    detail: Option<alloc::string::String>,
     recipients: Vec<RecipientFailure>,
 }
 
@@ -819,6 +940,7 @@ impl Error {
                 possibly_delivered: false,
                 retry_after: None,
                 security_event,
+                detail: None,
                 recipients: Vec::new(),
             }),
         }
@@ -847,6 +969,11 @@ impl Error {
     #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn with_retry_after(mut self, d: Duration) -> Error {
         self.inner.retry_after = Some(d);
+        self
+    }
+
+    pub(crate) fn with_detail(mut self, detail: Option<&str>) -> Error {
+        self.inner.detail = detail.map(alloc::string::String::from);
         self
     }
 
@@ -913,6 +1040,14 @@ impl Error {
         self.inner.security_event
     }
 
+    /// For `AuthFailed` after XOAUTH2: the `status` of the server's error
+    /// document (for example `"401"` for an expired token, the cue to
+    /// refresh it). Nothing else of the document is kept.
+    #[must_use]
+    pub fn auth_detail(&self) -> Option<&str> {
+        self.inner.detail.as_deref()
+    }
+
     /// Per-recipient replies, for `AllRecipientsRejected` and for partial
     /// failures under `RecipientPolicy::All`.
     #[must_use]
@@ -927,12 +1062,15 @@ fn default_disposition(kind: &ErrorKind) -> (Disposition, bool) {
         ErrorKind::Random
         | ErrorKind::Timeout
         | ErrorKind::ConnectionClosed
-        | ErrorKind::Throttled => (Temporary, false),
+        | ErrorKind::Throttled
+        | ErrorKind::PoolExhausted => (Temporary, false),
         ErrorKind::Tls(TlsFailure::Handshake | TlsFailure::Closed) => (Temporary, false),
         ErrorKind::Tls(TlsFailure::CertificateRejected) => (Permanent, true),
         #[cfg(feature = "std")]
         ErrorKind::Connect(_) | ErrorKind::Io(_) => (Temporary, false),
         ErrorKind::Sink(SinkError::Full) => (Permanent, false),
+        #[cfg(feature = "std")]
+        ErrorKind::Source(SourceError::Io(_)) => (Temporary, false),
         #[cfg(feature = "std")]
         ErrorKind::Sink(SinkError::Io(_)) => (Temporary, false),
         ErrorKind::Protocol(_) => (Temporary, true),
@@ -940,7 +1078,14 @@ fn default_disposition(kind: &ErrorKind) -> (Disposition, bool) {
         ErrorKind::StartTlsUnavailable | ErrorKind::StartTlsInjection => (Temporary, true),
         // A NUL in a credential is the caller's input; a bad challenge or an
         // endless exchange is the server's misbehaviour.
-        ErrorKind::Sasl(crate::proto::SaslError::InvalidCredential) => (Permanent, false),
+        ErrorKind::Sasl(
+            crate::proto::SaslError::InvalidCredential
+            | crate::proto::SaslError::NonAsciiCredential
+            | crate::proto::SaslError::NonceMissing
+            | crate::proto::SaslError::InvalidMechanismName
+            | crate::proto::SaslError::ResponseTooLong
+            | crate::proto::SaslError::ServerError,
+        ) => (Permanent, false),
         ErrorKind::Sasl(_) => (Temporary, true),
         _ => (Permanent, false),
     }
@@ -1017,7 +1162,9 @@ from_nested!(
     UsageError => Usage,
     ProtocolError => Protocol,
     SinkError => Sink,
-    PayloadError => Payload
+    PayloadError => Payload,
+    DkimError => Dkim,
+    SourceError => Source
 );
 
 #[cfg(test)]

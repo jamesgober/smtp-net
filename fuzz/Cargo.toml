@@ -12,7 +12,7 @@ libfuzzer-sys = "0.4"
 
 [dependencies.smtp-net]
 path = ".."
-features = ["testing"]
+features = ["testing", "dkim", "scram"]
 
 # Keeps this crate out of any parent workspace.
 [workspace]
@@ -77,6 +77,20 @@ bench = false
 [[bin]]
 name = "prepared_decode"
 path = "fuzz_targets/prepared_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dkim"
+path = "fuzz_targets/dkim.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sasl"
+path = "fuzz_targets/sasl.rs"
 test = false
 doc = false
 bench = false

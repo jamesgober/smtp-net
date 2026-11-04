@@ -266,7 +266,9 @@ fn test_session_is_send() {
 }
 
 impl Session {
+    /// A copy outside any AUTH exchange (an exchange holds a mechanism and is not cloned).
     fn clone_for_test(&self) -> Session {
+        assert!(self.exchange.is_none());
         Session {
             config: self.config.clone(),
             state: self.state,
@@ -277,7 +279,7 @@ impl Session {
             caps: self.caps.clone(),
             secure: self.secure,
             tls_protocol: self.tls_protocol,
-            exchange: self.exchange.clone(),
+            exchange: None,
             authenticated: self.authenticated,
             secret_out: self.secret_out,
             txn: self.txn.clone(),

@@ -52,7 +52,8 @@ enum Entry {
 
 /// A conversation as data: `C: ` lines the client must send, `S: ` lines the
 /// server answers with. `C: <BODY>` stands for the message body through the
-/// end-of-data line; `C: <RAW n>` for exactly `n` octets (a BDAT chunk); `S: <EOF>` closes the connection; `S: <TIMEOUT>` lets
+/// end-of-data line; `C: <EMPTY>` for an empty line (an empty AUTH
+/// response); `C: <RAW n>` for exactly `n` octets (a BDAT chunk); `S: <EOF>` closes the connection; `S: <TIMEOUT>` lets
 /// every deadline pass. Lines starting with `#` and blank lines are ignored.
 ///
 /// # Examples
@@ -82,7 +83,9 @@ impl Transcript {
                 continue;
             }
             let entry = if let Some(c) = line.strip_prefix("C: ") {
-                if c == "<BODY>" {
+                if c == "<EMPTY>" {
+                    Entry::Client(String::new())
+                } else if c == "<BODY>" {
                     Entry::ClientBody
                 } else if let Some(count) =
                     c.strip_prefix("<RAW ").and_then(|r| r.strip_suffix('>'))
@@ -716,6 +719,9 @@ pub enum Fault {
         /// The rate.
         bytes_per_second: u32,
     },
+    /// SCRAM-SHA-256: send a server signature with one bit flipped, as a
+    /// server that does not know the password would.
+    BadScramSignature,
 }
 
 /// A message as the [`TestServer`] received it.
@@ -777,6 +783,7 @@ pub struct TestServerBuilder {
     tls: TlsMode,
     tls_name: String,
     auth: Option<(String, String)>,
+    oauth: Option<(String, String)>,
 }
 
 impl TestServerBuilder {
@@ -832,9 +839,18 @@ impl TestServerBuilder {
         self
     }
 
-    /// Offer `AUTH PLAIN LOGIN` and accept this user and password.
+    /// Offer `AUTH PLAIN LOGIN` (and `SCRAM-SHA-256` with the `scram`
+    /// feature) and accept this user and password.
     pub fn auth(mut self, user: &str, password: &str) -> Self {
         self.auth = Some((user.to_string(), password.to_string()));
+        self
+    }
+
+    /// Offer `AUTH XOAUTH2` and accept this user and token. A wrong token
+    /// gets Google's answer: a `334` error document (`"status":"401"`),
+    /// then `535` after the client's empty line.
+    pub fn oauth2(mut self, user: &str, token: &str) -> Self {
+        self.oauth = Some((user.to_string(), token.to_string()));
         self
     }
 
@@ -936,6 +952,7 @@ impl TestServer {
             tls: TlsMode::None,
             tls_name: "localhost".to_string(),
             auth: None,
+            oauth: None,
         }
     }
 
@@ -964,6 +981,9 @@ impl TestServer {
             .tls_connector(TestTls);
         if let Some((u, p)) = &self.config.auth {
             b = b.credentials(Credentials::password(u, p.as_str()));
+        }
+        if let Some((u, t)) = &self.config.oauth {
+            b = b.credentials(Credentials::oauth2(u, t.as_str()));
         }
         b
     }
@@ -1372,8 +1392,18 @@ fn serve(
                 {
                     lines.push("250-STARTTLS".to_string());
                 }
+                let mut mechs = String::new();
                 if cfg.auth.is_some() {
-                    lines.push("250-AUTH PLAIN LOGIN".to_string());
+                    mechs.push_str(" PLAIN LOGIN");
+                    if cfg!(feature = "scram") {
+                        mechs.push_str(" SCRAM-SHA-256");
+                    }
+                }
+                if cfg.oauth.is_some() {
+                    mechs.push_str(" XOAUTH2");
+                }
+                if !mechs.is_empty() {
+                    lines.push(format!("250-AUTH{mechs}"));
                 }
                 if let Some(last) = lines.last_mut() {
                     *last = last.replacen("250-", "250 ", 1);
@@ -1401,10 +1431,6 @@ fn serve(
                 rcpts.clear();
             }
             Stage::Auth => {
-                let Some((want_user, want_pass)) = cfg.auth.clone() else {
-                    c.reply(stage, "503 5.5.1 AUTH not available")?;
-                    continue;
-                };
                 let mut words = line.split(' ').skip(1);
                 let mech = words.next().unwrap_or("").to_ascii_uppercase();
                 let initial = words.next().map(str::to_string);
@@ -1414,6 +1440,48 @@ fn serve(
                         .ok()
                         .map(|()| out)
                 };
+                if mech == "XOAUTH2" {
+                    let Some((want_user, want_token)) = cfg.oauth.clone() else {
+                        c.reply(stage, "504 5.5.4 mechanism not available")?;
+                        continue;
+                    };
+                    let want = format!("user={want_user}\x01auth=Bearer {want_token}\x01\x01");
+                    let got = initial.as_deref().and_then(decode).unwrap_or_default();
+                    if got == want.as_bytes() {
+                        user = Some(want_user);
+                        c.reply(stage, "235 2.7.0 authenticated")?;
+                    } else {
+                        let mut doc = Vec::new();
+                        crate::encode::base64_append(
+                            br#"{"status":"401","schemes":"bearer","scope":"https://mail.google.com/"}"#,
+                            &mut doc,
+                        );
+                        c.reply(stage, &format!("334 {}", String::from_utf8_lossy(&doc)))?;
+                        let Some(l) = c.read_line()? else {
+                            return Ok(());
+                        };
+                        c.log("C: ", &format!("<{} octets>", l.len().saturating_sub(2)));
+                        c.reply(stage, "535 5.7.8 Username and Password not accepted")?;
+                    }
+                    continue;
+                }
+                let Some((want_user, want_pass)) = cfg.auth.clone() else {
+                    c.reply(stage, "503 5.5.1 AUTH not available")?;
+                    continue;
+                };
+                #[cfg(feature = "scram")]
+                if mech == "SCRAM-SHA-256" {
+                    let first = initial.as_deref().and_then(decode).unwrap_or_default();
+                    match scram_server(&mut c, stage, &first, &want_user, &want_pass)? {
+                        Some(true) => {
+                            user = Some(want_user);
+                            c.reply(stage, "235 2.7.0 authenticated")?;
+                        }
+                        Some(false) => c.reply(stage, "535 5.7.8 authentication failed")?,
+                        None => return Ok(()),
+                    }
+                    continue;
+                }
                 let (got_user, got_pass) = match mech.as_str() {
                     "PLAIN" => {
                         let payload = match initial {
@@ -1635,4 +1703,86 @@ fn between(s: &str, open: char, close: char) -> String {
     let start = s.find(open).map_or(0, |i| i + 1);
     let end = s.rfind(close).unwrap_or(s.len());
     s.get(start..end).unwrap_or("").to_string()
+}
+
+/// The server side of SCRAM-SHA-256 for [`TestServer`]: salt and iteration
+/// count fixed, nonce extended with a fixed suffix. `Some(true)` when the
+/// client's proof is right (the server signature has been sent and
+/// acknowledged), `Some(false)` when it is wrong, `None` on EOF.
+#[cfg(feature = "scram")]
+fn scram_server(
+    c: &mut Conn<'_>,
+    stage: Stage,
+    client_first: &[u8],
+    want_user: &str,
+    password: &str,
+) -> std::io::Result<Option<bool>> {
+    use crypt_io::{hash::sha256, kdf::pbkdf2_hmac_sha256, mac::hmac_sha256};
+
+    const SALT: &[u8] = b"smtp-net-test-salt";
+    let b64 = |b: &[u8]| {
+        let mut out = Vec::new();
+        crate::encode::base64_append(b, &mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let Some(bare) = client_first.strip_prefix(b"n,,") else {
+        return Ok(Some(false));
+    };
+    let bare = String::from_utf8_lossy(bare).into_owned();
+    let Some((name, nonce)) = bare.strip_prefix("n=").and_then(|b| b.split_once(",r=")) else {
+        return Ok(Some(false));
+    };
+    let name = name.replace("=2C", ",").replace("=3D", "=");
+    let server_first = format!("r={nonce}srv-test-nonce,s={},i=4096", b64(SALT));
+    c.reply(stage, &format!("334 {}", b64(server_first.as_bytes())))?;
+    let Some(l) = c.read_line()? else {
+        return Ok(None);
+    };
+    c.log(
+        "C: ",
+        &format!("<redacted {} octets>", l.len().saturating_sub(2)),
+    );
+    let mut final_msg = Vec::new();
+    let text = String::from_utf8_lossy(&l).trim_end().to_string();
+    if crate::encode::base64_decode(text.as_bytes(), &mut final_msg).is_err() {
+        return Ok(Some(false));
+    }
+    let final_msg = String::from_utf8_lossy(&final_msg).into_owned();
+    let Some((without_proof, proof)) = final_msg.rsplit_once(",p=") else {
+        return Ok(Some(false));
+    };
+    let mut salted = [0u8; 32];
+    let mac = |k: &[u8], d: &[u8]| hmac_sha256(k, d).unwrap_or([0; 32]);
+    if pbkdf2_hmac_sha256(password.as_bytes(), SALT, 4096, &mut salted).is_err() {
+        return Ok(Some(false));
+    }
+    let stored = sha256(&mac(&salted, b"Client Key"));
+    let auth_message = format!("{bare},{server_first},{without_proof}");
+    let signature = mac(&stored, auth_message.as_bytes());
+    let mut proof_bytes = Vec::new();
+    let _ = crate::encode::base64_decode(proof.as_bytes(), &mut proof_bytes);
+    let client_key: Vec<u8> = proof_bytes
+        .iter()
+        .zip(signature.iter())
+        .map(|(p, s)| p ^ s)
+        .collect();
+    let expected_final = format!("c=biws,r={nonce}srv-test-nonce");
+    if name != want_user || without_proof != expected_final || sha256(&client_key) != stored {
+        return Ok(Some(false));
+    }
+    let server_sig = mac(&mac(&salted, b"Server Key"), auth_message.as_bytes());
+    let fault = c.fault(|f| *f == Fault::BadScramSignature).is_some();
+    let mut v = server_sig;
+    if fault {
+        v[0] ^= 1;
+    }
+    c.reply(
+        stage,
+        &format!("334 {}", b64(format!("v={}", b64(&v)).as_bytes())),
+    )?;
+    let Some(l) = c.read_line()? else {
+        return Ok(None);
+    };
+    c.log("C: ", &format!("<{} octets>", l.len().saturating_sub(2)));
+    Ok(Some(true))
 }

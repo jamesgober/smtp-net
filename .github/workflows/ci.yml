@@ -79,6 +79,11 @@ jobs:
         run: cargo build --target thumbv7em-none-eabi --no-default-features
       - name: Clippy (no default features)
         run: cargo clippy --target thumbv7em-none-eabi --no-default-features -- -D warnings
+      # SCRAM is pure Rust and needs no std (the caller supplies the nonce).
+      - name: Build and clippy (scram)
+        run: |
+          cargo build --target thumbv7em-none-eabi --no-default-features --features scram
+          cargo clippy --target thumbv7em-none-eabi --no-default-features --features scram -- -D warnings
 
   dependencies:
     name: No third-party runtime dependency
@@ -208,6 +213,26 @@ jobs:
           echo "missing:$missing"
           sudo tail -n 50 /var/log/exim4/mainlog
           exit 1
+
+  dkim:
+    # An independent verifier (dkimpy) checks the signatures, so no
+    # reference implementation enters the crate's dependency graph.
+    name: DKIM (independent verifier)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install dkimpy
+        run: python -m pip install dkimpy pynacl
+      - name: Write the signed corpus
+        run: SMTP_NET_DKIM_CORPUS="$RUNNER_TEMP/dkim" cargo test --features testing,dkim --test dkim
+      - name: Verify with dkimpy
+        run: python -I .github/scripts/dkim_verify.py "$RUNNER_TEMP/dkim"
 
   package:
     name: Package

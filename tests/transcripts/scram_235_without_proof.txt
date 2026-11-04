@@ -1,0 +1,12 @@
+# A 235 before the server proved it knows the password is refused.
+# config: loopback scram
+# expect:
+# closed: temp security
+S: 220 mx.example.com ESMTP
+C: EHLO [127.0.0.1]
+S: 250-mx.example.com
+S: 250 AUTH SCRAM-SHA-256
+C: AUTH SCRAM-SHA-256 biwsbj11c2VyLHI9ck9wck5HZndFYmVSV2diTkVrcU8=
+S: 334 cj1yT3ByTkdmd0ViZVJXZ2JORWtxTyVodllEcFdVYTJSYVRDQWZ1eEZJbGopaE5sRiRrMCxzPVcyMlphSjBTTlk3c29Fc1VFamI2Z1E9PSxpPTQwOTY=
+C: Yz1iaXdzLHI9ck9wck5HZndFYmVSV2diTkVrcU8laHZZRHBXVWEyUmFUQ0FmdXhGSWxqKWhObEYkazAscD1kSHpiWmFwV0lrNGpVaE4rVXRlOXl0YWc5empmTUhnc3FtbWl6N0FuZFZRPQ==
+S: 235 2.7.0 ok

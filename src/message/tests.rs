@@ -893,3 +893,131 @@ fn test_caller_tree_depth_and_count_checked_at_build() {
         ErrorKind::Build(BuildError::TooManyParts)
     ));
 }
+
+#[cfg(feature = "std")]
+mod streamed {
+    use alloc::boxed::Box;
+
+    use super::*;
+    use crate::error::SourceError;
+    use crate::message::part::{Attachment, BodySource, ReadSource};
+
+    /// Hands out `data` at most `step` octets per read.
+    struct Trickle {
+        data: Vec<u8>,
+        at: usize,
+        step: usize,
+    }
+    impl BodySource for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, SourceError> {
+            let n = self.step.min(buf.len()).min(self.data.len() - self.at);
+            buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    struct Broken;
+    impl BodySource for Broken {
+        fn read(&mut self, _: &mut [u8]) -> Result<usize, SourceError> {
+            Err(SourceError::Failed("disk unplugged"))
+        }
+    }
+
+    fn with(a: Attachment) -> Message {
+        Message::builder()
+            .from("a@example.com")
+            .unwrap()
+            .to("b@example.org")
+            .unwrap()
+            .text("see attached")
+            .unwrap()
+            .attachment(a)
+            .unwrap()
+            .build_with(&mut Counter(0), T)
+            .unwrap()
+    }
+
+    fn data(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 7 % 251) as u8).collect()
+    }
+
+    #[test]
+    fn test_streamed_output_matches_in_memory() {
+        for n in [0, 1, 56, 57, 58, 3647, 3648, 3649, 10_000] {
+            let mem = with(Attachment::new("f.bin", "application/octet-stream", data(n)).unwrap());
+            for step in [1, 13, 4096] {
+                let src = Trickle {
+                    data: data(n),
+                    at: 0,
+                    step,
+                };
+                let a = Attachment::from_source(
+                    "f.bin",
+                    "application/octet-stream",
+                    n as u64,
+                    Box::new(src),
+                )
+                .unwrap();
+                assert!(a.is_streamed());
+                let streamed = with(a);
+                assert_eq!(streamed.encoded_len(), mem.encoded_len(), "{n}");
+                let bytes = streamed.to_bytes().unwrap();
+                assert_eq!(bytes, mem.to_bytes().unwrap(), "{n} {step}");
+                assert_eq!(bytes.len() as u64, streamed.encoded_len());
+            }
+        }
+    }
+
+    #[test]
+    fn test_declared_length_is_exact() {
+        for (declared, actual) in [(100u64, 99usize), (100, 101), (0, 1)] {
+            let src = ReadSource::new(std::io::Cursor::new(data(actual)));
+            let m = with(
+                Attachment::from_source("f", "application/pdf", declared, Box::new(src)).unwrap(),
+            );
+            let e = m.to_bytes().unwrap_err();
+            assert!(
+                matches!(e.kind(), ErrorKind::Build(BuildError::LengthMismatch { declared: d, .. }) if *d == declared),
+                "{e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_source_is_read_once_and_errors_propagate() {
+        let src = ReadSource::new(std::io::Cursor::new(data(10)));
+        let m = with(Attachment::from_source("f", "application/pdf", 10, Box::new(src)).unwrap());
+        let copy = m.clone();
+        m.prepare().unwrap();
+        let e = copy.prepare().unwrap_err();
+        assert_eq!(e.kind(), &ErrorKind::Source(SourceError::Consumed));
+        assert!(e.is_permanent());
+
+        let m =
+            with(Attachment::from_source("f", "application/pdf", 10, Box::new(Broken)).unwrap());
+        let e = m.to_bytes().unwrap_err();
+        assert_eq!(
+            e.kind(),
+            &ErrorKind::Source(SourceError::Failed("disk unplugged"))
+        );
+        assert!(e.to_string().contains("disk unplugged"));
+    }
+
+    #[test]
+    fn test_declared_length_counts_against_the_budget() {
+        let src = ReadSource::new(std::io::Cursor::new(Vec::new()));
+        let huge = Attachment::from_source("f", "application/pdf", 1 << 40, Box::new(src)).unwrap();
+        let e = Message::builder()
+            .from("a@example.com")
+            .unwrap()
+            .to("b@example.org")
+            .unwrap()
+            .attachment(huge)
+            .unwrap_err();
+        assert!(
+            matches!(e.kind(), ErrorKind::Build(BuildError::TooLarge { .. })),
+            "{e:?}"
+        );
+    }
+}

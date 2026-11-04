@@ -461,6 +461,41 @@ impl PreparedMessage {
     pub fn has_8bit(&self) -> bool {
         self.eight_bit
     }
+
+    /// Adds a `DKIM-Signature` header from each signer, in the order given,
+    /// in front of the message. Works on any bytes [`from_raw`](Self::from_raw)
+    /// accepted, not only on messages this crate built (FR-53). The
+    /// signatures are independent of each other.
+    ///
+    /// # Errors
+    ///
+    /// `Dkim(...)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use smtp_net::{Address, DkimKey, DkimSigner, Envelope, PreparedMessage};
+    /// let signer = DkimSigner::new("example.com", "s2026", DkimKey::ed25519_from_seed(&[7; 32])?)?;
+    /// let env = Envelope::new(Address::parse("a@example.com")?, &[Address::parse("b@example.org")?])?;
+    /// let raw = b"From: a@example.com\r\nSubject: hi\r\n\r\nbody\r\n".to_vec();
+    /// let signed = PreparedMessage::from_raw(env, raw)?.sign(&[signer], 1_700_000_000)?;
+    /// assert!(signed.bytes().starts_with(b"DKIM-Signature: "));
+    /// # Ok::<(), smtp_net::Error>(())
+    /// ```
+    #[cfg(feature = "dkim")]
+    pub fn sign(
+        mut self,
+        signers: &[crate::DkimSigner],
+        now_unix: u64,
+    ) -> Result<PreparedMessage, Error> {
+        if signers.is_empty() {
+            return Ok(self);
+        }
+        let mut bytes = crate::dkim::sign_all(signers, &self.bytes, now_unix)?;
+        bytes.extend_from_slice(&self.bytes);
+        self.bytes = bytes;
+        Ok(self)
+    }
 }
 
 /// Magic at the start of every job payload.

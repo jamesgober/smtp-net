@@ -12,8 +12,97 @@ use super::{
 };
 use crate::{
     encode::{self, B64_LINE_INPUT, MIME_LINE_LENGTH, QpState, base64_encoded_len},
-    error::{Error, HeaderError, SinkError},
+    error::{Error, HeaderError, SinkError, SourceError},
 };
+
+/// Where a streamed attachment's content comes from: pulled in pieces while
+/// the message is serialized, so the whole file is never held raw.
+///
+/// `read` fills some of `buf` and returns how many octets it wrote; `0`
+/// means the end. Under `std`, [`ReadSource`] adapts any `std::io::Read`.
+pub trait BodySource: Send {
+    /// Reads the next piece.
+    ///
+    /// # Errors
+    ///
+    /// Any [`SourceError`]; serialization stops with it.
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, SourceError>;
+}
+
+/// A [`BodySource`] over a `std::io::Read` (a file, a socket, a cursor).
+///
+/// # Examples
+///
+/// ```
+/// use smtp_net::{Attachment, ReadSource};
+/// let data = vec![7u8; 10_000];
+/// let a = Attachment::from_source(
+///     "data.bin",
+///     "application/octet-stream",
+///     data.len() as u64,
+///     Box::new(ReadSource::new(std::io::Cursor::new(data))),
+/// )?;
+/// assert_eq!(a.len(), 10_000);
+/// # Ok::<(), smtp_net::Error>(())
+/// ```
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub struct ReadSource<R>(R);
+
+#[cfg(feature = "std")]
+impl<R: std::io::Read + Send> ReadSource<R> {
+    /// Wraps `reader`.
+    pub fn new(reader: R) -> ReadSource<R> {
+        ReadSource(reader)
+    }
+}
+
+#[cfg(feature = "std")]
+impl<R: std::io::Read + Send> BodySource for ReadSource<R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, SourceError> {
+        loop {
+            match self.0.read(buf) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(SourceError::Io(e.kind())),
+            }
+        }
+    }
+}
+
+/// A single-use source and its declared length, shared by clones of the
+/// message that holds it (the first serialization reads it).
+#[cfg(feature = "std")]
+#[derive(Clone)]
+pub(crate) struct Streamed {
+    len: u64,
+    cell: alloc::sync::Arc<std::sync::Mutex<Option<alloc::boxed::Box<dyn BodySource>>>>,
+}
+
+#[cfg(feature = "std")]
+impl PartialEq for Streamed {
+    fn eq(&self, other: &Streamed) -> bool {
+        alloc::sync::Arc::ptr_eq(&self.cell, &other.cell)
+    }
+}
+#[cfg(feature = "std")]
+impl Eq for Streamed {}
+
+#[cfg(feature = "std")]
+impl fmt::Debug for Streamed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Streamed")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Data {
+    Bytes(Vec<u8>),
+    #[cfg(feature = "std")]
+    Source(Streamed),
+}
 
 /// Longest attachment file name, in octets.
 const MAX_FILE_NAME: usize = 255;
@@ -186,7 +275,7 @@ fn check_file_name(name: &str) -> Result<(), HeaderError> {
 pub struct Attachment {
     file_name: String,
     content_type: ContentType,
-    bytes: Vec<u8>,
+    data: Data,
 }
 
 impl Attachment {
@@ -202,8 +291,60 @@ impl Attachment {
         Ok(Attachment {
             file_name: String::from(file_name),
             content_type,
-            bytes,
+            data: Data::Bytes(bytes),
         })
+    }
+
+    /// An attachment whose content is pulled from `source` while the
+    /// message is serialized: `len` octets exactly (fewer or more is an
+    /// error). The source is read once; serializing the message again
+    /// fails with `Source(Consumed)`. `send` still holds the encoded
+    /// message in memory (it needs it to retry and to split recipients);
+    /// [`Message::write_to`](crate::Message::write_to) streams end to end.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new). At serialization: `Build(LengthMismatch)`,
+    /// `Source(..)`.
+    #[cfg(feature = "std")]
+    pub fn from_source(
+        file_name: &str,
+        content_type: &str,
+        len: u64,
+        source: alloc::boxed::Box<dyn BodySource>,
+    ) -> Result<Attachment, Error> {
+        check_file_name(file_name)?;
+        let content_type = ContentType::parse(content_type)?;
+        Ok(Attachment {
+            file_name: String::from(file_name),
+            content_type,
+            data: Data::Source(Streamed {
+                len,
+                cell: alloc::sync::Arc::new(std::sync::Mutex::new(Some(source))),
+            }),
+        })
+    }
+
+    /// The content length in octets (declared, for a streamed attachment).
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        match &self.data {
+            Data::Bytes(b) => b.len() as u64,
+            #[cfg(feature = "std")]
+            Data::Source(s) => s.len,
+        }
+    }
+
+    /// True when the content is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// True for an attachment made by `from_source`.
+    #[must_use]
+    pub fn is_streamed(&self) -> bool {
+        !matches!(self.data, Data::Bytes(_))
     }
 
     /// The file name.
@@ -212,10 +353,14 @@ impl Attachment {
         &self.file_name
     }
 
-    /// The content.
+    /// The content (empty for a streamed attachment).
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        match &self.data {
+            Data::Bytes(b) => b,
+            #[cfg(feature = "std")]
+            Data::Source(_) => &[],
+        }
     }
 }
 
@@ -224,7 +369,7 @@ impl fmt::Debug for Attachment {
         f.debug_struct("Attachment")
             .field("file_name", &self.file_name)
             .field("content_type", &self.content_type.essence)
-            .field("len", &self.bytes.len())
+            .field("len", &self.len())
             .finish()
     }
 }
@@ -343,6 +488,9 @@ pub(crate) enum Body {
     },
     /// Binary content, always base64.
     Bytes(Vec<u8>),
+    /// Binary content from a source, always base64.
+    #[cfg(feature = "std")]
+    Source(Streamed),
     Multipart {
         kind: Multipart,
         boundary: String,
@@ -443,6 +591,8 @@ impl Part {
                 *current = encoding;
             }
             Body::Bytes(_) if encoding == TransferEncoding::Base64 => {}
+            #[cfg(feature = "std")]
+            Body::Source(_) if encoding == TransferEncoding::Base64 => {}
             _ => return Err(mismatch()),
         }
         Ok(self)
@@ -475,7 +625,11 @@ impl Part {
             content_type,
             disposition: Some(("attachment", vec![(String::from("filename"), a.file_name)])),
             content_id: None,
-            body: Body::Bytes(a.bytes),
+            body: match a.data {
+                Data::Bytes(b) => Body::Bytes(b),
+                #[cfg(feature = "std")]
+                Data::Source(s) => Body::Source(s),
+            },
             head: Vec::new(),
         }
     }
@@ -528,6 +682,8 @@ impl Part {
         match &self.body {
             Body::Text { encoding, .. } => Some(*encoding),
             Body::Bytes(_) => Some(TransferEncoding::Base64),
+            #[cfg(feature = "std")]
+            Body::Source(_) => Some(TransferEncoding::Base64),
             Body::Multipart { .. } => None,
         }
     }
@@ -550,6 +706,8 @@ impl Part {
         match &self.body {
             Body::Text { encoding, .. } => *encoding == TransferEncoding::EightBit,
             Body::Bytes(_) => false,
+            #[cfg(feature = "std")]
+            Body::Source(_) => false,
             Body::Multipart { parts, .. } => parts.iter().any(Part::has_8bit),
         }
     }
@@ -616,6 +774,8 @@ impl Part {
         match &self.body {
             Body::Text { text, encoding } => text_len(text, *encoding),
             Body::Bytes(b) => base64_encoded_len(b.len() as u64),
+            #[cfg(feature = "std")]
+            Body::Source(s) => base64_encoded_len(s.len),
             Body::Multipart {
                 boundary, parts, ..
             } => {
@@ -631,10 +791,12 @@ impl Part {
     }
 
     /// Writes this part's body.
-    pub(crate) fn write_body<S: Sink>(&self, sink: &mut S) -> Result<(), SinkError> {
+    pub(crate) fn write_body<S: Sink>(&self, sink: &mut S) -> Result<(), Error> {
         match &self.body {
-            Body::Text { text, encoding } => write_text(text, *encoding, sink),
-            Body::Bytes(b) => write_base64(b, sink),
+            Body::Text { text, encoding } => Ok(write_text(text, *encoding, sink)?),
+            Body::Bytes(b) => Ok(write_base64(b, sink)?),
+            #[cfg(feature = "std")]
+            Body::Source(s) => write_source(s, sink),
             Body::Multipart {
                 boundary, parts, ..
             } => {
@@ -649,7 +811,7 @@ impl Part {
                 }
                 sink.write(b"--")?;
                 sink.write(boundary.as_bytes())?;
-                sink.write(b"--\r\n")
+                Ok(sink.write(b"--\r\n")?)
             }
         }
     }
@@ -803,6 +965,43 @@ fn write_base64<S: Sink>(bytes: &[u8], sink: &mut S) -> Result<(), SinkError> {
         sink.write(buf.get(..n).unwrap_or(&[]))?;
     }
     Ok(())
+}
+
+/// Pulls a streamed attachment through base64, holding the declared length
+/// to the octet.
+#[cfg(feature = "std")]
+fn write_source<S: Sink>(s: &Streamed, sink: &mut S) -> Result<(), Error> {
+    let taken = s
+        .cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let Some(mut source) = taken else {
+        return Err(SourceError::Consumed.into());
+    };
+    let mismatch = |actual| crate::error::BuildError::LengthMismatch {
+        declared: s.len,
+        actual,
+    };
+    // 64 base64 lines of input per read.
+    let mut buf = [0u8; B64_LINE_INPUT * 64];
+    let mut b = B64Stream::new();
+    let mut total = 0u64;
+    loop {
+        let n = source.read(&mut buf)?.min(buf.len());
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > s.len {
+            return Err(mismatch(total).into());
+        }
+        b.push(buf.get(..n).unwrap_or(&[]), sink)?;
+    }
+    if total != s.len {
+        return Err(mismatch(total).into());
+    }
+    Ok(b.finish(sink)?)
 }
 
 /// Base64 over bytes that arrive in pieces, in 76-character lines.

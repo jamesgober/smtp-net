@@ -257,6 +257,35 @@ impl Message {
             eight_bit,
         ))
     }
+
+    /// As [`prepare`](Self::prepare), then each signer adds its
+    /// `DKIM-Signature` header, in the order given (RFC 8463 section 6:
+    /// one RSA and one Ed25519 signature is the usual pair). `now_unix` is
+    /// the `t=` time. Sign once, before the payload is stored: retries send
+    /// the same signed bytes.
+    ///
+    /// # Errors
+    ///
+    /// As `prepare`, plus `Dkim(...)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use smtp_net::{DkimKey, DkimSigner, Message};
+    /// let signer = DkimSigner::new("example.com", "s2026", DkimKey::ed25519_from_seed(&[7; 32])?)?;
+    /// let msg = Message::text("no-reply@example.com", "user@example.org", "Hi", "Hello.")?;
+    /// let prepared = msg.prepare_signed(&[signer], 1_700_000_000)?;
+    /// assert!(prepared.bytes().starts_with(b"DKIM-Signature: v=1; a=ed25519-sha256;"));
+    /// # Ok::<(), smtp_net::Error>(())
+    /// ```
+    #[cfg(feature = "dkim")]
+    pub fn prepare_signed(
+        &self,
+        signers: &[crate::DkimSigner],
+        now_unix: u64,
+    ) -> Result<PreparedMessage, Error> {
+        self.prepare()?.sign(signers, now_unix)
+    }
 }
 
 impl fmt::Debug for Message {
@@ -522,7 +551,7 @@ impl MessageBuilder {
         if self.attachments.len() + self.inlines.len() + 4 > usize::from(self.limits.max_parts) {
             return Err(BuildError::TooManyParts.into());
         }
-        let size = attachment.bytes().len() as u64;
+        let size = attachment.len();
         if size > self.limits.max_message_size {
             return Err(BuildError::TooLarge {
                 size,

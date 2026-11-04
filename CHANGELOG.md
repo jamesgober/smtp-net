@@ -13,6 +13,52 @@
 
 ---
 
+## [0.5.0] - 2026-11-04
+
+Feature complete: DKIM, SCRAM-SHA-256, XOAUTH2, the connection pool, the
+observer hook, and streamed attachments.
+
+### Added
+
+- DKIM signing (feature `dkim`): `DkimKey` (Ed25519 from a seed or PKCS#8,
+  RSA 2048 to 4096 bits from PKCS#8 or PKCS#1, PEM or DER, `dns_record`),
+  `DkimSigner` (relaxed or simple canonicalization, default header and
+  oversign lists, `x=`, `i=`), `Message::prepare_signed`,
+  `PreparedMessage::sign` for raw input, `ServerBuilder::dkim` (several
+  signatures). RFC 8463 Appendix A is reproduced byte for byte.
+- `BodyCanonicalizer` and `HeaderCanonicalizer`, streaming and `no_std`, in
+  every build.
+- SCRAM-SHA-256 (feature `scram`): server nonce, iteration range, and server
+  signature checked (constant time); first in the default mechanism list.
+- XOAUTH2: `Credentials::oauth2`; `Error::auth_detail` gives the server's
+  error status.
+- Custom SASL mechanisms: `Mechanism`, `Step`, `CustomMechanism`,
+  `Credentials::Custom`.
+- `Pool`: a bounded set of connections shared by threads, lock-free
+  checkout (loom models), `PoolExhausted` after the wait limit.
+- `Observer`, `ObservedEvent`, `SecurityEventKind`, `ServerBuilder::observer`;
+  `Event::Reply` and `SessionConfig::reply_events` in the session.
+- `Attachment::from_source`, `BodySource`, `ReadSource`, `SourceError`;
+  `Attachment::len`, `is_empty`, `is_streamed`.
+- Test support: `TestServerBuilder::oauth2`, SCRAM in `TestServer`,
+  `Fault::BadScramSignature`, `C: <EMPTY>` in transcripts.
+- `docs/ARCHITECTURE.md`, `docs/DELIVERABILITY.md`; examples
+  `send_with_dkim` and `dkim_dns_record`; fuzz targets `dkim` and `sasl`;
+  8 more transcripts (68 in all); CI checks every DKIM signature with
+  dkimpy, an independent verifier.
+
+### Changed
+
+- The default mechanism list is `[ScramSha256 (feature scram), Plain, Login,
+  XOAuth2, Other]`, filtered by the kind of credentials.
+- crypt-io 1.3; tls-net 0.5 (from 0.3).
+
+### Fixed
+
+- Two CI flakes: the Exim delivery check now waits for deliveries in
+  progress, and the hourly-limit refund test no longer reuses a released
+  port.
+
 ## [0.4.0] - 2026-11-04
 
 Extended: TLS relays, AUTH, CHUNKING, DSN, pacing, and job payloads.
