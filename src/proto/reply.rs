@@ -129,6 +129,24 @@ pub struct Reply {
 }
 
 impl Reply {
+    /// The reply recorded for a recipient deferred as one too many (FR-42).
+    pub(crate) fn too_many() -> Reply {
+        let mut text = Vec::with_capacity(40);
+        text.extend_from_slice(b"4.5.3 too many recipients for one transaction");
+        text.push(b'\n');
+        Reply {
+            code: ReplyCode(452),
+            enhanced: Some(EnhancedCode {
+                class: 4,
+                subject: 5,
+                detail: 3,
+            }),
+            text,
+            lines: 1,
+            truncated: false,
+        }
+    }
+
     /// A reply built from parts (tests, test servers).
     #[cfg(test)]
     pub(crate) fn synthetic(code: ReplyCode, text: &[u8]) -> Reply {
@@ -419,6 +437,11 @@ impl ReplyParser {
 
     pub(crate) fn code(&self) -> Option<ReplyCode> {
         self.code
+    }
+
+    /// The enhanced code of the completed reply, when there is one.
+    pub(crate) fn enhanced(&self) -> Option<EnhancedCode> {
+        self.first_enhanced
     }
 
     pub(crate) fn text(&self) -> &[u8] {

@@ -13,6 +13,45 @@
 
 ---
 
+## [0.4.0] - 2026-11-04
+
+Extended: TLS relays, AUTH, CHUNKING, DSN, pacing, and job payloads.
+
+### Added
+
+- STARTTLS and implicit TLS in the driver through the `TlsConnector` seam
+  over net-io's sans-IO TLS session; feature `tls` (on by default) uses
+  tls-net's client with certificate verification always on; `Server::starttls`,
+  `Server::implicit_tls`, `ServerBuilder::tls`, `tls_connector`.
+- AUTH PLAIN and LOGIN with a caller allowlist (`Credentials`, `Secret`,
+  `MechanismList`); credentials only over TLS or to a verified loopback peer;
+  `Server::login`, `ServerBuilder::credentials`, `mechanisms`.
+- CHUNKING (BDAT), DSN (`Dsn`, `Envelope::dsn`), `Envelope::null_sender`, and
+  the too-many-recipients deferral (`Event::Deferred`; `Client` sends the
+  deferred recipients in further transactions).
+- `SendGate` and the lock-free `HourlyLimit` (never over-admits; loom models).
+- `PreparedMessage::encode` and `decode` (versioned, CRC-32C checked) and
+  `send_prepared`.
+- `MessageBuilder::list_unsubscribe` (RFC 2369 and 8058), `auto_submitted`,
+  `date_unix_with_offset`, `body`, and the public `Part` constructors.
+- Test support: `TestTls`, real TLS engines through `tls_engine`, AUTH, BDAT,
+  and DSN in `TestServer`; fixture certificates in `tests/fixtures/`.
+- 21 more transcripts (60 in all), real-TLS tests with rustls on both sides,
+  CI interop over real STARTTLS and implicit TLS against Mailpit, the
+  `prepared_decode` fuzz target, examples `prepared_job` and `hourly_limit`.
+
+### Fixed
+
+- `Address` equality compared only the domain, so `b@example.org` equalled
+  `d@example.org`.
+- `MessageBuilder::date_unix` was ignored; the build time was stamped instead.
+
+### Changed
+
+- Default features are `std`, `client`, `tls`.
+- `Event::Deferred` carries recipient indices instead of a range.
+- crypt-io 1.3 (`zeroize` only) wipes credentials.
+
 ## [0.3.0] - 2026-11-04
 
 The core: messages, the sans-IO session, and local submission.
@@ -92,7 +131,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/smtp-net/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/smtp-net/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/smtp-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/smtp-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/smtp-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/smtp-net/releases/tag/v0.1.0

@@ -6,13 +6,17 @@ use core::fmt;
 
 use super::{
     Capabilities, ClientName, Millis, Reply, ReplyLimits, ReplyParser, Timeouts,
-    classify::{rejected_disposition, reply_error},
+    classify::{auth_error, rejected_disposition, reply_error},
     command::Line,
+    sasl::{Auth, Exchange, MAX_AUTH_LINE, MechanismName},
     stuff::DotStuffer,
 };
 use crate::{
-    error::{Disposition, Error, ErrorKind, Extension, Stage, UsageError},
-    message::prepared::Envelope,
+    error::{
+        BuildError, ConfigError, Disposition, Error, ErrorKind, Extension, ProtocolError, Stage,
+        UsageError,
+    },
+    message::prepared::{DsnPolicy, DsnReturn, Envelope, xtext},
 };
 
 /// Largest pipelined command group written before its replies are read (RFC
@@ -20,13 +24,18 @@ use crate::{
 const GROUP_LIMIT: usize = 4096;
 /// Smallest output buffer: one command line plus a terminator.
 const MIN_OUTPUT: usize = 1024;
+/// A BDAT body larger than this is written only after the MAIL and RCPT
+/// replies are in, so the client never blocks writing while the server
+/// blocks writing replies (PLAN 7.6) **[est.]**.
+const BDAT_PIPELINE_LIMIT: u64 = 64 * 1024;
 
 /// How the transport is secured.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionSecurity {
     /// No TLS. `peer_is_loopback` is the driver's confirmation that the
-    /// connected peer address is loopback; it permits the HELO fallback.
+    /// connected peer address is loopback; it permits the HELO fallback and
+    /// AUTH over plaintext.
     Plaintext {
         /// The connected peer is a loopback address.
         peer_is_loopback: bool,
@@ -118,10 +127,14 @@ pub struct SessionConfig {
     pub client_name: ClientName,
     /// Transport security (default: `StartTlsRequired`).
     pub security: SessionSecurity,
+    /// Credentials and mechanism allowlist; `None` sends no AUTH.
+    pub auth: Option<Auth>,
     /// Stage timeouts (default: RFC 5321).
     pub timeouts: Timeouts,
     /// Use PIPELINING when offered (default true).
     pub pipelining: bool,
+    /// Use CHUNKING (BDAT) when offered (default true).
+    pub chunking: bool,
     /// Policy for refused recipients (default `Any`).
     pub recipient_policy: RecipientPolicy,
     /// Reply budgets.
@@ -135,8 +148,10 @@ impl Default for SessionConfig {
         SessionConfig {
             client_name: ClientName::default(),
             security: SessionSecurity::StartTlsRequired,
+            auth: None,
             timeouts: Timeouts::rfc5321(),
             pipelining: true,
+            chunking: true,
             recipient_policy: RecipientPolicy::Any,
             reply_limits: ReplyLimits::default(),
             output_capacity: 16 * 1024,
@@ -158,7 +173,7 @@ pub enum SessionState {
     Authenticating,
     /// Ready for `begin`.
     Ready,
-    /// MAIL, RCPT, DATA, or RSET in progress.
+    /// MAIL, RCPT, DATA, BDAT, or RSET in progress.
     InTransaction,
     /// Accepting body bytes through `body`.
     Body,
@@ -185,6 +200,11 @@ pub enum Event {
     },
     /// Run the TLS handshake now, then call `tls_established`.
     StartTls,
+    /// AUTH succeeded.
+    Authenticated {
+        /// The mechanism used.
+        mechanism: MechanismName,
+    },
     /// A recipient was accepted.
     RecipientAccepted {
         /// Index in the envelope's recipients.
@@ -212,6 +232,13 @@ pub enum Event {
         /// Recipients left for a further transaction.
         deferred: usize,
     },
+    /// The server refused these recipients as too many for one transaction
+    /// (`452` or `552` with `x.5.3`, FR-42): send them in a further
+    /// transaction. Follows `Delivered`.
+    Deferred {
+        /// Indices in the envelope's recipients.
+        recipients: Vec<usize>,
+    },
     /// The transaction failed; the session is ready for another one.
     TransactionFailed(Error),
     /// The session closed; `error` is `None` after a clean QUIT.
@@ -227,12 +254,17 @@ enum Expect {
     Ehlo,
     Helo,
     StartTls,
+    Auth,
     Mail,
     Rcpt(usize),
     Data,
     DataEnd,
     /// The reply to a lone dot sent after an unwanted 354.
     Discard,
+    /// The reply to a BDAT chunk that is not the last.
+    Bdat,
+    /// The reply to `BDAT n LAST`.
+    BdatLast,
     Rset,
     Noop,
     Quit,
@@ -245,14 +277,21 @@ impl Expect {
             Expect::Ehlo => Stage::Ehlo,
             Expect::Helo => Stage::Helo,
             Expect::StartTls => Stage::StartTls,
+            Expect::Auth => Stage::Auth,
             Expect::Mail => Stage::Mail,
             Expect::Rcpt(_) => Stage::Rcpt,
             Expect::Data => Stage::Data,
             Expect::DataEnd | Expect::Discard => Stage::DataEnd,
+            Expect::Bdat | Expect::BdatLast => Stage::Bdat,
             Expect::Rset => Stage::Rset,
             Expect::Noop => Stage::Noop,
             Expect::Quit => Stage::Quit,
         }
+    }
+
+    /// The reply that ends the data: lost after it was written means possibly delivered.
+    fn is_end(self) -> bool {
+        matches!(self, Expect::DataEnd | Expect::BdatLast)
     }
 }
 
@@ -268,11 +307,14 @@ struct Txn {
     flags: BodyFlags,
     size: u64,
     pipelined: bool,
+    bdat: bool,
+    dsn: bool,
     mail_queued: bool,
     next_rcpt: usize,
     data_queued: bool,
     accepted: usize,
     rejected: Vec<(usize, Reply, Disposition)>,
+    deferred: Vec<usize>,
     failed: Option<Error>,
     stuffer: DotStuffer,
     /// Bytes of output up to and including the end-of-data sequence not yet transmitted.
@@ -308,6 +350,10 @@ pub struct Session {
     caps: Option<Capabilities>,
     secure: bool,
     tls_protocol: Option<TlsProtocol>,
+    exchange: Option<Exchange>,
+    authenticated: bool,
+    /// The output holds an AUTH response: wiped once it is transmitted.
+    secret_out: bool,
     txn: Option<Txn>,
     body_deadline: Option<Millis>,
     /// Bytes counted into the current pipelined group.
@@ -319,6 +365,7 @@ impl fmt::Debug for Session {
         f.debug_struct("Session")
             .field("state", &self.state)
             .field("secure", &self.secure)
+            .field("authenticated", &self.authenticated)
             .field("pending", &self.pending.len())
             .field("output", &self.out.len())
             .finish()
@@ -331,10 +378,20 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// `Config(BufferTooSmall)` for an output capacity below 1 KiB.
+    /// `Config(BufferTooSmall)` for an output capacity below 1 KiB;
+    /// `Config(AuthWithPlaintextRemote)` for credentials over plaintext to a
+    /// peer not confirmed loopback (T-8).
     pub fn new(config: SessionConfig, now: Millis) -> Result<Session, Error> {
         if config.output_capacity < MIN_OUTPUT {
-            return Err(crate::error::ConfigError::BufferTooSmall.into());
+            return Err(ConfigError::BufferTooSmall.into());
+        }
+        if config.auth.is_some()
+            && config.security
+                == (SessionSecurity::Plaintext {
+                    peer_is_loopback: false,
+                })
+        {
+            return Err(ConfigError::AuthWithPlaintextRemote.into());
         }
         let mut s = Session {
             state: SessionState::AwaitGreeting,
@@ -345,6 +402,9 @@ impl Session {
             caps: None,
             secure: false,
             tls_protocol: None,
+            exchange: None,
+            authenticated: false,
+            secret_out: false,
             txn: None,
             body_deadline: None,
             group: 0,
@@ -365,7 +425,8 @@ impl Session {
             Expect::Mail => t.mail,
             Expect::Rcpt(_) => t.rcpt,
             Expect::Data => t.data_init,
-            Expect::DataEnd | Expect::Discard => t.data_end,
+            Expect::Bdat => t.data_block,
+            Expect::DataEnd | Expect::Discard | Expect::BdatLast => t.data_end,
             _ => t.command,
         };
         self.pending.push_back(Pending {
@@ -380,27 +441,38 @@ impl Session {
         }))
     }
 
+    fn end_written(&self) -> bool {
+        self.txn.as_ref().is_some_and(|t| t.end_unsent == Some(0))
+    }
+
     /// Closes the session with `error` and queues `Event::Closed`.
     fn close(&mut self, mut error: Error) -> Error {
-        let possibly = matches!(
-            self.pending.front(),
-            Some(Pending {
-                what: Expect::DataEnd,
-                ..
-            })
-        ) && self.txn.as_ref().is_some_and(|t| t.end_unsent == Some(0));
+        let possibly = self.pending.iter().any(|p| p.what.is_end()) && self.end_written();
         if possibly {
             error = error.delivered_maybe(true);
         }
         self.state = SessionState::Closed;
         self.pending.clear();
-        self.out.clear();
+        self.wipe_output();
         self.txn = None;
+        self.exchange = None;
         self.body_deadline = None;
         self.events.push_back(Event::Closed {
             error: Some(error.clone()),
         });
         error
+    }
+
+    /// Clears the output; when it held an AUTH response, overwrites the
+    /// buffer first (best effort without unsafe code).
+    fn wipe_output(&mut self) {
+        if self.secret_out {
+            let cap = self.out.capacity();
+            self.out.clear();
+            self.out.resize(cap, 0);
+            self.secret_out = false;
+        }
+        self.out.clear();
     }
 
     /// Feeds bytes received from the server. Parses complete replies, advances
@@ -411,8 +483,9 @@ impl Session {
     /// # Errors
     ///
     /// The error that closed the session (also reported as `Event::Closed`):
-    /// `Protocol(..)`, `Rejected`, `StartTlsInjection`, `StartTlsUnavailable`,
-    /// and `Usage` when the session expects no input.
+    /// `Protocol(..)`, `Rejected`, `AuthFailed`, `AuthUnavailable`,
+    /// `StartTlsInjection`, `StartTlsUnavailable`, and `Usage` when the
+    /// session expects no input.
     pub fn receive(&mut self, input: &[u8], now: Millis) -> Result<usize, Error> {
         if matches!(self.state, SessionState::Closed | SessionState::NeedTls) {
             if input.is_empty() {
@@ -464,20 +537,17 @@ impl Session {
                     .with_reply(self.parser.take())
                     .with_disposition(Disposition::Temporary)
             } else {
-                Error::from(crate::error::ProtocolError::UnexpectedReply)
+                Error::from(ProtocolError::UnexpectedReply)
             };
             return Err(self.close(e));
         };
         let stage = p.what.stage();
         if code.get() == 421 {
-            let after_end = p.what == Expect::DataEnd
-                && self.txn.as_ref().is_some_and(|t| t.end_unsent == Some(0));
             let reply = self.parser.take();
             let e = Error::new(ErrorKind::Rejected)
                 .with_reply(reply)
                 .with_disposition(Disposition::Temporary)
-                .at(stage)
-                .delivered_maybe(after_end);
+                .at(stage);
             self.pending.push_front(p);
             return Err(self.close(e));
         }
@@ -489,8 +559,7 @@ impl Session {
                     self.state = SessionState::Negotiating;
                     self.send_ehlo(now)
                 } else if code.is_positive() {
-                    Err(self
-                        .close(Error::from(crate::error::ProtocolError::UnexpectedReply).at(stage)))
+                    Err(self.close(Error::from(ProtocolError::UnexpectedReply).at(stage)))
                 } else {
                     Err(self.close(reply_error(stage, reply)))
                 }
@@ -540,6 +609,7 @@ impl Session {
                     Err(self.close(reply_error(stage, reply)))
                 }
             }
+            Expect::Auth => self.on_auth_reply(code, now),
             Expect::Rset => {
                 if code.is_positive() {
                     self.finish_transaction();
@@ -563,9 +633,13 @@ impl Session {
                 self.events.push_back(Event::Closed { error: None });
                 Ok(())
             }
-            Expect::Mail | Expect::Rcpt(_) | Expect::Data | Expect::DataEnd | Expect::Discard => {
-                self.on_txn_reply(p.what, code, now)
-            }
+            Expect::Mail
+            | Expect::Rcpt(_)
+            | Expect::Data
+            | Expect::DataEnd
+            | Expect::Discard
+            | Expect::Bdat
+            | Expect::BdatLast => self.on_txn_reply(p.what, code, now),
         }
     }
 
@@ -591,12 +665,107 @@ impl Session {
             let e = Error::new(ErrorKind::StartTlsUnavailable).at(Stage::Ehlo);
             return Err(self.close(e));
         }
+        if self.config.auth.is_some() && !self.authenticated {
+            return self.start_auth(now);
+        }
         self.state = SessionState::Ready;
         self.events.push_back(Event::Ready {
             secure: self.secure,
-            authenticated: false,
+            authenticated: self.authenticated,
         });
         Ok(())
+    }
+
+    fn start_auth(&mut self, now: Millis) -> Result<(), Error> {
+        // No AUTH state is reachable without TLS or a confirmed loopback peer (T-8).
+        let allowed = self.secure
+            || self.config.security
+                == (SessionSecurity::Plaintext {
+                    peer_is_loopback: true,
+                });
+        if !allowed {
+            return Err(
+                self.close(Error::from(ConfigError::AuthWithPlaintextRemote).at(Stage::Auth))
+            );
+        }
+        let Some(auth) = self.config.auth.as_ref() else {
+            return Ok(());
+        };
+        let chosen = self
+            .caps
+            .as_ref()
+            .filter(|c| c.has(Extension::Auth))
+            .and_then(|c| Exchange::choose(auth, c.auth_mechanism_names()));
+        let Some(mechanism) = chosen else {
+            return Err(self.close(Error::new(ErrorKind::AuthUnavailable).at(Stage::Auth)));
+        };
+        let (line, exchange) = match Exchange::start(auth, mechanism) {
+            Ok(x) => x,
+            Err(e) => return Err(self.close(Error::from(e).at(Stage::Auth))),
+        };
+        self.out.extend_from_slice(&line);
+        self.out.extend_from_slice(b"\r\n");
+        self.secret_out = true;
+        self.exchange = Some(exchange);
+        self.state = SessionState::Authenticating;
+        self.expect(Expect::Auth, now);
+        Ok(())
+    }
+
+    fn on_auth_reply(&mut self, code: super::ReplyCode, now: Millis) -> Result<(), Error> {
+        match code.get() {
+            235 => {
+                let Some(ex) = self.exchange.take() else {
+                    return Err(
+                        self.close(Error::from(ProtocolError::UnexpectedReply).at(Stage::Auth))
+                    );
+                };
+                if !ex.complete() {
+                    // 235 before the exchange was complete.
+                    return Err(
+                        self.close(Error::from(ProtocolError::UnexpectedReply).at(Stage::Auth))
+                    );
+                }
+                self.authenticated = true;
+                self.events.push_back(Event::Authenticated {
+                    mechanism: ex.mechanism,
+                });
+                self.state = SessionState::Ready;
+                self.events.push_back(Event::Ready {
+                    secure: self.secure,
+                    authenticated: true,
+                });
+                Ok(())
+            }
+            334 => {
+                let text = self.parser.text();
+                let challenge = text.split(|&b| b == b'\n').next().unwrap_or(&[]);
+                let step = match self.exchange.as_mut() {
+                    Some(ex) => ex.respond(challenge),
+                    None => {
+                        return Err(
+                            self.close(Error::from(ProtocolError::UnexpectedReply).at(Stage::Auth))
+                        );
+                    }
+                };
+                match step {
+                    Ok(Some(response)) if response.len() + 2 <= MAX_AUTH_LINE => {
+                        self.out.extend_from_slice(&response);
+                        self.out.extend_from_slice(b"\r\n");
+                        self.secret_out = true;
+                        self.expect(Expect::Auth, now);
+                        Ok(())
+                    }
+                    Ok(_) => Err(self
+                        .close(Error::from(crate::proto::SaslError::TooManySteps).at(Stage::Auth))),
+                    Err(e) => Err(self.close(Error::from(e).at(Stage::Auth))),
+                }
+            }
+            _ => {
+                let reply = self.parser.take();
+                Err(self.close(auth_error(reply)))
+            }
+        }
     }
 
     fn on_txn_reply(
@@ -606,7 +775,7 @@ impl Session {
         now: Millis,
     ) -> Result<(), Error> {
         let Some(txn) = self.txn.as_mut() else {
-            return Err(self.close(Error::from(crate::error::ProtocolError::UnexpectedReply)));
+            return Err(self.close(Error::from(ProtocolError::UnexpectedReply)));
         };
         match what {
             Expect::Mail if !code.is_positive() => {
@@ -614,9 +783,16 @@ impl Session {
                 txn.failed = Some(reply_error(Stage::Mail, reply));
             }
             Expect::Rcpt(i) if txn.failed.is_none() => {
+                let too_many = matches!(code.get(), 452 | 552)
+                    && self
+                        .parser
+                        .enhanced()
+                        .is_some_and(|e| e.subject == 5 && e.detail == 3);
                 if matches!(code.get(), 250 | 251) {
                     txn.accepted += 1;
                     self.events.push_back(Event::RecipientAccepted { index: i });
+                } else if too_many {
+                    txn.deferred.push(i);
                 } else {
                     let reply = self.parser.take();
                     let disposition = rejected_disposition(code);
@@ -630,7 +806,9 @@ impl Session {
             }
             Expect::Data => {
                 if code.get() == 354 {
-                    if txn.failed.is_some() || txn.accepted == 0 || self.policy_refuses() {
+                    let unwanted =
+                        txn.failed.is_some() || txn.accepted == 0 || self.policy_refuses();
+                    if unwanted {
                         // RFC 2920 3.1: end the unwanted data with a lone dot.
                         self.fail_recipients_if_needed();
                         self.out.extend_from_slice(b".\r\n");
@@ -651,32 +829,58 @@ impl Session {
                     }
                 }
             }
-            Expect::DataEnd => {
+            Expect::Bdat if !code.is_positive() && txn.failed.is_none() => {
+                if txn.accepted == 0 {
+                    self.fail_recipients_if_needed();
+                } else {
+                    let reply = self.parser.take();
+                    if let Some(t) = self.txn.as_mut() {
+                        t.failed = Some(reply_error(Stage::Bdat, reply));
+                    }
+                }
+            }
+            Expect::DataEnd | Expect::BdatLast => {
                 let reply = self.parser.take();
-                if code.is_positive() {
+                if code.is_positive() && txn.failed.is_none() {
                     let (accepted, rejected) = (txn.accepted, txn.rejected.len());
+                    let deferred = core::mem::take(&mut txn.deferred);
                     self.events.push_back(Event::Delivered {
                         reply,
                         accepted,
                         rejected,
-                        deferred: 0,
+                        deferred: deferred.len(),
                     });
+                    if !deferred.is_empty() {
+                        self.events.push_back(Event::Deferred {
+                            recipients: deferred,
+                        });
+                    }
                     self.txn = None;
                     self.state = SessionState::Ready;
                     return Ok(());
                 }
-                txn.failed = Some(reply_error(Stage::DataEnd, reply));
-                // The server ends the transaction after the end-of-data reply.
-                let e = txn
-                    .failed
-                    .take()
-                    .unwrap_or_else(|| Error::new(ErrorKind::Rejected));
-                self.txn = None;
-                self.state = SessionState::Ready;
-                self.events.push_back(Event::TransactionFailed(e));
-                return Ok(());
+                if txn.failed.is_none() {
+                    let stage = if what == Expect::DataEnd {
+                        Stage::DataEnd
+                    } else {
+                        Stage::Bdat
+                    };
+                    txn.failed = Some(reply_error(stage, reply));
+                }
+                if what == Expect::DataEnd {
+                    // The server ends the transaction after the end-of-data reply.
+                    let e = txn
+                        .failed
+                        .take()
+                        .unwrap_or_else(|| Error::new(ErrorKind::Rejected));
+                    self.txn = None;
+                    self.state = SessionState::Ready;
+                    self.events.push_back(Event::TransactionFailed(e));
+                    return Ok(());
+                }
+                // After a failed BDAT the server's state is unknown (RFC 3030): RSET.
+                self.state = SessionState::InTransaction;
             }
-            Expect::Discard => {}
             _ => {}
         }
         if self.pending.is_empty() && self.state == SessionState::InTransaction {
@@ -687,7 +891,10 @@ impl Session {
 
     fn policy_refuses(&self) -> bool {
         self.config.recipient_policy == RecipientPolicy::All
-            && self.txn.as_ref().is_some_and(|t| !t.rejected.is_empty())
+            && self
+                .txn
+                .as_ref()
+                .is_some_and(|t| !t.rejected.is_empty() || !t.deferred.is_empty())
     }
 
     /// Sets the transaction's failure from its refused recipients, when it has none yet.
@@ -696,16 +903,17 @@ impl Session {
         if txn.failed.is_some() {
             return;
         }
-        let temporary = txn
-            .rejected
-            .iter()
-            .any(|(_, _, d)| *d == Disposition::Temporary);
+        let temporary = !txn.deferred.is_empty()
+            || txn
+                .rejected
+                .iter()
+                .any(|(_, _, d)| *d == Disposition::Temporary);
         let kind = if txn.accepted == 0 {
             ErrorKind::AllRecipientsRejected
         } else {
             ErrorKind::Rejected
         };
-        let recipients = txn
+        let mut recipients: Vec<_> = txn
             .rejected
             .iter()
             .filter_map(|(i, r, d)| {
@@ -715,6 +923,12 @@ impl Session {
                     .map(|a| (a.clone(), r.clone(), *d))
             })
             .collect();
+        for i in &txn.deferred {
+            if let Some(a) = txn.envelope.recipients().get(*i) {
+                let reply = Reply::too_many();
+                recipients.push((a.clone(), reply, Disposition::Temporary));
+            }
+        }
         let e = Error::new(kind)
             .at(Stage::Rcpt)
             .with_disposition(if temporary {
@@ -768,15 +982,32 @@ impl Session {
             return Ok(());
         }
         let waiting = !self.pending.is_empty();
-        if waiting && (!pipelined || self.config.recipient_policy == RecipientPolicy::All) {
+        let hold = !pipelined
+            || self.config.recipient_policy == RecipientPolicy::All
+            || (txn.bdat && txn.size > BDAT_PIPELINE_LIMIT);
+        if waiting && hold {
             return Ok(());
         }
-        if !waiting {
-            // Every recipient reply is in.
-            if txn.accepted == 0 || self.policy_refuses() {
-                self.fail_recipients_if_needed();
-                return self.advance(now);
+        if !waiting && (txn.accepted == 0 || self.policy_refuses()) {
+            // Every recipient reply is in, and none (or not all) were accepted.
+            self.fail_recipients_if_needed();
+            return self.advance(now);
+        }
+        if txn.bdat {
+            let size = txn.size;
+            if size > 0 {
+                let mut l = Line::new(&mut self.out);
+                l.put(b"BDAT ").decimal(size);
+                l.end()?;
+                self.expect(Expect::Bdat, now);
             }
+            if let Some(t) = self.txn.as_mut() {
+                t.data_queued = true;
+            }
+            self.state = SessionState::Body;
+            self.body_deadline = Some(now.after(self.config.timeouts.data_block));
+            self.events.push_back(Event::BodyWanted);
+            return Ok(());
         }
         push_command(&mut self.out, b"DATA");
         self.expect(Expect::Data, now);
@@ -803,6 +1034,22 @@ impl Session {
         if txn.flags.smtputf8 {
             l.put(b" SMTPUTF8");
         }
+        if let Some(d) = txn.envelope.dsn_parameters().filter(|_| txn.dsn) {
+            match d.return_content() {
+                Some(DsnReturn::Full) => {
+                    l.put(b" RET=FULL");
+                }
+                Some(DsnReturn::Headers) => {
+                    l.put(b" RET=HDRS");
+                }
+                None => {}
+            }
+            if let Some(id) = d.envelope_id_value() {
+                let mut x = Vec::with_capacity(id.len() * 3);
+                xtext(id.as_bytes(), &mut x);
+                l.put(b" ENVID=").put(&x);
+            }
+        }
         l.end()?;
         txn.mail_queued = true;
         self.group += self.out.len() - start;
@@ -815,8 +1062,37 @@ impl Session {
         let Some(txn) = self.txn.as_mut() else {
             return Ok(());
         };
+        let addr = txn.envelope.recipients().get(i);
         let mut l = Line::new(&mut self.out);
-        l.put(b"RCPT TO:").path(txn.envelope.recipients().get(i));
+        l.put(b"RCPT TO:").path(addr);
+        if let Some(d) = txn.envelope.dsn_parameters().filter(|_| txn.dsn) {
+            let n = d.notify();
+            if n.bits() == 0 {
+                l.put(b" NOTIFY=NEVER");
+            } else {
+                l.put(b" NOTIFY=");
+                let mut first = true;
+                for (on, word) in [
+                    (n.success(), &b"SUCCESS"[..]),
+                    (n.failure(), b"FAILURE"),
+                    (n.delay(), b"DELAY"),
+                ] {
+                    if on {
+                        if !first {
+                            l.put(b",");
+                        }
+                        l.put(word);
+                        first = false;
+                    }
+                }
+            }
+            // ORCPT carries the address as given; UTF-8 addresses need RFC 6533 types: omitted.
+            if let Some(a) = addr.filter(|a| !a.needs_smtputf8()) {
+                let mut x = Vec::with_capacity(a.as_str().len() + 8);
+                xtext(a.as_str().as_bytes(), &mut x);
+                l.put(b" ORCPT=rfc822;").put(&x);
+            }
+        }
         l.end()?;
         txn.next_rcpt = i + 1;
         self.group += self.out.len() - start;
@@ -839,10 +1115,14 @@ impl Session {
     }
 
     /// Acknowledges that the first `n` bytes of [`transmit`](Session::transmit)
-    /// were written (saturating at the pending length).
+    /// were written (saturating at the pending length). Output that held an
+    /// AUTH response is overwritten once it is all written.
     pub fn transmitted(&mut self, n: usize) {
         let n = n.min(self.out.len());
         self.out.drain(..n);
+        if self.out.is_empty() {
+            self.wipe_output();
+        }
         if let Some(t) = self.txn.as_mut() {
             if let Some(left) = t.end_unsent.as_mut() {
                 *left = left.saturating_sub(n);
@@ -890,8 +1170,8 @@ impl Session {
     /// The transport closed or failed (EOF, reset, I/O error). Closes the
     /// session and returns the classified error: temporary, with
     /// `possibly_delivered` when the end of the data was written and its reply
-    /// not read (RFC 1047, T-18). After a clean QUIT it returns the
-    /// `ConnectionClosed` error without changing anything.
+    /// not read (RFC 1047, T-18). After a QUIT it closes cleanly and returns
+    /// the error for the record only.
     pub fn connection_lost(&mut self, cause: ErrorKind) -> Error {
         let stage = match self.state {
             SessionState::Body => Stage::Body,
@@ -940,8 +1220,10 @@ impl Session {
     }
 
     /// Starts a transaction: checks the envelope against the server's
-    /// capabilities (SIZE, SMTPUTF8, 8BITMIME), then queues MAIL, RCPT, and
-    /// DATA, as one group when PIPELINING is offered (PLAN 7.6).
+    /// capabilities (SIZE, SMTPUTF8, 8BITMIME, DSN), then queues MAIL, RCPT,
+    /// and DATA or BDAT, as one group when PIPELINING is offered (PLAN 7.6).
+    /// With CHUNKING, `size` must be the exact length of the bytes passed to
+    /// [`body`](Session::body).
     ///
     /// # Errors
     ///
@@ -958,13 +1240,14 @@ impl Session {
             return Err(self.wrong_state());
         }
         let caps = self.caps.as_ref();
+        let has = |e| caps.is_some_and(|c| c.has(e));
         let smtputf8 = flags.smtputf8 || envelope.needs_smtputf8();
-        if smtputf8 && !caps.is_some_and(|c| c.has(Extension::Smtputf8)) {
+        if smtputf8 && !has(Extension::Smtputf8) {
             return Err(
                 Error::new(ErrorKind::ExtensionRequired(Extension::Smtputf8)).at(Stage::Mail),
             );
         }
-        if flags.eight_bit && !caps.is_some_and(|c| c.has(Extension::EightBitMime)) {
+        if flags.eight_bit && !has(Extension::EightBitMime) {
             return Err(
                 Error::new(ErrorKind::ExtensionRequired(Extension::EightBitMime)).at(Stage::Mail),
             );
@@ -974,8 +1257,17 @@ impl Session {
                 return Err(Error::new(ErrorKind::MessageTooLarge { size, limit }).at(Stage::Mail));
             }
         }
-        let pipelined =
-            self.config.pipelining && caps.is_some_and(|c| c.has(Extension::Pipelining));
+        let dsn = match envelope.dsn_parameters() {
+            Some(d) if !has(Extension::Dsn) && d.policy() == DsnPolicy::Required => {
+                return Err(
+                    Error::new(ErrorKind::ExtensionRequired(Extension::Dsn)).at(Stage::Mail)
+                );
+            }
+            Some(_) => has(Extension::Dsn),
+            None => false,
+        };
+        let pipelined = self.config.pipelining && has(Extension::Pipelining);
+        let bdat = self.config.chunking && has(Extension::Chunking);
         self.txn = Some(Txn {
             envelope: envelope.clone(),
             flags: BodyFlags {
@@ -984,13 +1276,20 @@ impl Session {
             },
             size,
             pipelined,
+            bdat,
+            dsn,
             mail_queued: false,
             next_rcpt: 0,
             data_queued: false,
             accepted: 0,
             rejected: Vec::new(),
+            deferred: Vec::new(),
             failed: None,
-            stuffer: DotStuffer::new(),
+            stuffer: if bdat {
+                DotStuffer::raw()
+            } else {
+                DotStuffer::new()
+            },
             end_unsent: None,
         });
         self.state = SessionState::InTransaction;
@@ -1003,12 +1302,14 @@ impl Session {
     }
 
     /// Accepts body bytes (the serialized message) up to the free output
-    /// capacity, dot-stuffing them; returns how many were taken. Flush
-    /// [`transmit`](Session::transmit) and call again with the rest.
+    /// capacity, dot-stuffing them for DATA (BDAT sends them as they are);
+    /// returns how many were taken. Flush [`transmit`](Session::transmit) and
+    /// call again with the rest.
     ///
     /// # Errors
     ///
-    /// `Build(BareLineFeed)`, `Build(BareCarriageReturn)` (permanent: the
+    /// `Build(BareLineFeed)`, `Build(BareCarriageReturn)`, and with CHUNKING
+    /// `Build(LengthMismatch)` past the size given to `begin` (permanent: the
     /// session closes, since the server holds a partial message);
     /// `Usage(WrongState)`.
     pub fn body(&mut self, chunk: &[u8], now: Millis) -> Result<usize, Error> {
@@ -1019,6 +1320,15 @@ impl Session {
         let Some(txn) = self.txn.as_mut() else {
             return Err(self.wrong_state());
         };
+        if txn.bdat && txn.stuffer.taken() + chunk.len() as u64 > txn.size {
+            let actual = txn.stuffer.taken() + chunk.len() as u64;
+            let e = Error::from(BuildError::LengthMismatch {
+                declared: txn.size,
+                actual,
+            })
+            .at(Stage::Body);
+            return Err(self.close(e).with_disposition(Disposition::Permanent));
+        }
         match txn.stuffer.push(chunk, &mut self.out, cap) {
             Ok(n) => {
                 self.body_deadline = Some(now.after(self.config.timeouts.data_block));
@@ -1031,13 +1341,15 @@ impl Session {
         }
     }
 
-    /// Ends the body: writes the end-of-data sequence and waits for its reply.
-    /// From the moment those bytes are transmitted, a lost connection is
-    /// `possibly_delivered`.
+    /// Ends the body: writes the end-of-data sequence (or the last BDAT
+    /// chunk) and waits for its reply. From the moment those bytes are
+    /// transmitted, a lost connection is `possibly_delivered`.
     ///
     /// # Errors
     ///
-    /// `Build(BareCarriageReturn)` for a body ending in CR, `Usage(WrongState)`.
+    /// `Build(BareCarriageReturn)` for a body ending in CR, with CHUNKING
+    /// `Build(LengthMismatch)` when fewer bytes came than `begin` declared,
+    /// `Usage(WrongState)`.
     pub fn end_body(&mut self, now: Millis) -> Result<(), Error> {
         if self.state != SessionState::Body {
             return Err(self.wrong_state());
@@ -1045,14 +1357,43 @@ impl Session {
         let Some(txn) = self.txn.as_mut() else {
             return Err(self.wrong_state());
         };
-        if let Err(b) = txn.stuffer.finish(&mut self.out) {
-            let e = Error::from(b).at(Stage::Body);
-            return Err(self.close(e).with_disposition(Disposition::Permanent));
+        let what = if txn.bdat {
+            let taken = txn.stuffer.taken();
+            if taken != txn.size {
+                let e = Error::from(BuildError::LengthMismatch {
+                    declared: txn.size,
+                    actual: taken,
+                })
+                .at(Stage::Body);
+                return Err(self.close(e).with_disposition(Disposition::Permanent));
+            }
+            if txn.stuffer.pending_cr() {
+                let e = Error::from(BuildError::BareCarriageReturn {
+                    position: taken.saturating_sub(1),
+                })
+                .at(Stage::Body);
+                return Err(self.close(e).with_disposition(Disposition::Permanent));
+            }
+            if taken > 0 && !txn.stuffer.ends_crlf() {
+                // The same message as DATA would carry: it ends with CRLF.
+                self.out.extend_from_slice(b"BDAT 2 LAST\r\n\r\n");
+            } else {
+                self.out.extend_from_slice(b"BDAT 0 LAST\r\n");
+            }
+            Expect::BdatLast
+        } else {
+            if let Err(b) = txn.stuffer.finish(&mut self.out) {
+                let e = Error::from(b).at(Stage::Body);
+                return Err(self.close(e).with_disposition(Disposition::Permanent));
+            }
+            Expect::DataEnd
+        };
+        if let Some(t) = self.txn.as_mut() {
+            t.end_unsent = Some(self.out.len());
         }
-        txn.end_unsent = Some(self.out.len());
         self.state = SessionState::AwaitDataEnd;
         self.body_deadline = None;
-        self.expect(Expect::DataEnd, now);
+        self.expect(what, now);
         Ok(())
     }
 
@@ -1060,7 +1401,7 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// `Usage(WrongState)` outside `Ready` and `InTransaction`.
+    /// `Usage(WrongState)` outside `Ready`.
     pub fn reset(&mut self, now: Millis) -> Result<(), Error> {
         if !matches!(self.state, SessionState::Ready) {
             return Err(self.wrong_state());
@@ -1123,6 +1464,12 @@ impl Session {
     #[must_use]
     pub fn is_secure(&self) -> bool {
         self.secure
+    }
+
+    /// True after AUTH succeeded.
+    #[must_use]
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated
     }
 
     /// The TLS version, after `tls_established`.

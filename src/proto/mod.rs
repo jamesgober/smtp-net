@@ -5,6 +5,7 @@ mod capability;
 mod classify;
 pub(crate) mod command;
 mod reply;
+mod sasl;
 mod session;
 mod stuff;
 mod timeouts;
@@ -12,6 +13,7 @@ mod timeouts;
 pub use capability::Capabilities;
 pub use command::{ClientName, MAX_COMMAND_LINE, MAX_TEXT_LINE};
 pub use reply::{EnhancedCode, Reply, ReplyCode, ReplyLimits, ReplyParser, TextLossy};
+pub use sasl::{Auth, Credentials, MAX_AUTH_LINE, MechanismList, MechanismName, SaslError, Secret};
 pub use session::{
     BodyFlags, Event, RecipientPolicy, Session, SessionConfig, SessionSecurity, SessionState,
     TlsInfo, TlsProtocol,

@@ -73,3 +73,10 @@ path = "fuzz_targets/transcript.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "prepared_decode"
+path = "fuzz_targets/prepared_decode.rs"
+test = false
+doc = false
+bench = false

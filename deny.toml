@@ -30,7 +30,11 @@ allow = [
     "0BSD",
 ]
 confidence-threshold = 0.93
-exceptions = []
+# webpki-roots is data (the Mozilla root program bundle, through tls-net)
+# under CDLA-Permissive-2.0; allowed for that crate only.
+exceptions = [
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
 
 [bans]
 multiple-versions = "warn"

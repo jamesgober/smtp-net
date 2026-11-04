@@ -1,5 +1,6 @@
 use alloc::{format, string::String, vec, vec::Vec};
 
+use super::part::TransferEncoding;
 use super::*;
 use crate::error::{AddressError, ErrorKind};
 
@@ -784,4 +785,111 @@ fn test_tier1_constructors() {
             .message_id(),
         m.message_id()
     );
+}
+
+#[test]
+fn test_date_unix_is_used_and_offset_shown_local() {
+    // Regression: 0.3.0 ignored date_unix and stamped the build time.
+    let m = base().date_unix(0).build_with(&mut Counter(0), T).unwrap();
+    assert_eq!(
+        m.headers().get("Date"),
+        Some("Thu, 01 Jan 1970 00:00:00 +0000")
+    );
+    let m = base()
+        .date_unix_with_offset(0, 120)
+        .unwrap()
+        .build_with(&mut Counter(0), T)
+        .unwrap();
+    assert_eq!(
+        m.headers().get("Date"),
+        Some("Thu, 01 Jan 1970 02:00:00 +0200")
+    );
+    let m = base()
+        .date_unix_with_offset(T, -1439)
+        .unwrap()
+        .build_with(&mut Counter(0), 0)
+        .unwrap();
+    assert!(m.headers().get("Date").unwrap().ends_with("-2359"));
+    assert!(base().date_unix_with_offset(0, 1440).is_err());
+    assert!(base().date_unix_with_offset(0, -1440).is_err());
+}
+
+#[test]
+fn test_caller_built_tree_and_forced_encodings() {
+    let tree = Part::multipart(
+        Multipart::Mixed,
+        vec![
+            Part::text("text/plain", "hello\n").unwrap(),
+            Part::binary("application/octet-stream", vec![0, 1, 2]).unwrap(),
+            Part::text("text/plain", "caf\u{e9}")
+                .unwrap()
+                .transfer_encoding(TransferEncoding::Base64)
+                .unwrap(),
+        ],
+    );
+    let m = base().body(tree).build_with(&mut Counter(0), T).unwrap();
+    let s = bytes(&m);
+    check_wire_rules(&s);
+    assert!(
+        m.headers()
+            .get("Content-Type")
+            .unwrap()
+            .starts_with("multipart/mixed")
+    );
+    assert_eq!(s.matches("Content-Transfer-Encoding: base64").count(), 2);
+    assert!(
+        Part::text("image/png", "x").is_err(),
+        "text parts need text/*"
+    );
+    assert!(Part::text("text/plain", "a\rb").is_err());
+    assert!(Part::binary("bad", vec![]).is_err());
+    let e = Part::binary("application/pdf", vec![])
+        .unwrap()
+        .transfer_encoding(TransferEncoding::QuotedPrintable)
+        .unwrap_err();
+    assert!(matches!(
+        e.kind(),
+        ErrorKind::Build(BuildError::EncodingMismatch)
+    ));
+    assert!(
+        Part::text("text/plain", &"x".repeat(999))
+            .unwrap()
+            .transfer_encoding(TransferEncoding::EightBit)
+            .is_err()
+    );
+    assert!(
+        Part::text("text/plain", "caf\u{e9}")
+            .unwrap()
+            .transfer_encoding(TransferEncoding::EightBit)
+            .is_ok()
+    );
+    assert!(
+        Part::multipart(Multipart::Related, vec![])
+            .transfer_encoding(TransferEncoding::Base64)
+            .is_err()
+    );
+}
+
+#[test]
+fn test_caller_tree_depth_and_count_checked_at_build() {
+    let mut p = Part::text("text/plain", "x").unwrap();
+    for _ in 0..9 {
+        p = Part::multipart(Multipart::Mixed, vec![p]);
+    }
+    let e = base().body(p).build_with(&mut Counter(0), T).unwrap_err();
+    assert!(matches!(
+        e.kind(),
+        ErrorKind::Build(BuildError::DepthExceeded)
+    ));
+    let many: Vec<Part> = (0..101)
+        .map(|_| Part::text("text/plain", "x").unwrap())
+        .collect();
+    let e = base()
+        .body(Part::multipart(Multipart::Mixed, many))
+        .build_with(&mut Counter(0), T)
+        .unwrap_err();
+    assert!(matches!(
+        e.kind(),
+        ErrorKind::Build(BuildError::TooManyParts)
+    ));
 }

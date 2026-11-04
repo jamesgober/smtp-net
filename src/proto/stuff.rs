@@ -14,6 +14,8 @@ pub(crate) struct DotStuffer {
     /// True when the last bytes written were CRLF (or nothing was written).
     ends_crlf: bool,
     offset: u64,
+    /// False for BDAT: the bytes go as they are, still checked for bare CR and LF.
+    stuff: bool,
 }
 
 impl DotStuffer {
@@ -23,7 +25,31 @@ impl DotStuffer {
             pending_cr: false,
             ends_crlf: false,
             offset: 0,
+            stuff: true,
         }
+    }
+
+    /// For BDAT chunks: no dot-stuffing (RFC 3030), the same line checks.
+    pub(crate) fn raw() -> DotStuffer {
+        DotStuffer {
+            stuff: false,
+            ..DotStuffer::new()
+        }
+    }
+
+    /// Input bytes taken so far.
+    pub(crate) fn taken(&self) -> u64 {
+        self.offset
+    }
+
+    /// True when the input so far ends with CRLF.
+    pub(crate) fn ends_crlf(&self) -> bool {
+        self.ends_crlf
+    }
+
+    /// True when the input so far ends with a CR whose LF has not come yet.
+    pub(crate) fn pending_cr(&self) -> bool {
+        self.pending_cr
     }
 
     /// Stuffs bytes of `input` into `out` while `out` stays within `cap`;
@@ -57,7 +83,7 @@ impl DotStuffer {
                     position: self.offset,
                 });
             } else {
-                if self.at_line_start && b == b'.' {
+                if self.stuff && self.at_line_start && b == b'.' {
                     out.push(b'.');
                 }
                 out.push(b);

@@ -89,3 +89,36 @@ fn test_interop_tier1_send() {
     let report = smtp_net::send(&server, &m).unwrap();
     println!("SENT {}", report.message_id());
 }
+
+/// Real TLS interop: Mailpit with the fixture certificate, STARTTLS on
+/// `SMTP_NET_INTEROP_STARTTLS_PORT` and implicit TLS on
+/// `SMTP_NET_INTEROP_IMPLICIT_PORT`, verified against the fixture CA.
+#[cfg(feature = "tls")]
+#[test]
+fn test_interop_tls_with_verification() {
+    let ca = include_bytes!("fixtures/ca.pem");
+    for (var, security) in [
+        ("SMTP_NET_INTEROP_STARTTLS_PORT", Security::StartTls),
+        ("SMTP_NET_INTEROP_IMPLICIT_PORT", Security::ImplicitTls),
+    ] {
+        let Some(port) = std::env::var(var).ok().and_then(|p| p.parse::<u16>().ok()) else {
+            continue;
+        };
+        let server = Server::builder("localhost", security)
+            .port(port)
+            .tls(tls_net::client_with_ca_pem(ca).unwrap())
+            .credentials(smtp_net::Credentials::password("interop", "any"))
+            .build()
+            .unwrap();
+        let m = Message::text(
+            "no-reply@example.com",
+            "user@example.org",
+            "TLS interop",
+            "over TLS",
+        )
+        .unwrap();
+        let report = smtp_net::send(&server, &m).unwrap();
+        assert!(report.was_secure());
+        println!("SENT {}", report.message_id());
+    }
+}

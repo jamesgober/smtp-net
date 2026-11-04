@@ -39,9 +39,10 @@
 //!
 //! ## Status
 //!
-//! `0.3.0`: messages, the session, and submission to a mail server on the
-//! same machine. TLS relays and AUTH arrive in `0.4.0`, DKIM in `0.5.0`
-//! (`dev/ROADMAP.md` in the [repository](https://github.com/jamesgober/smtp-net)).
+//! `0.4.0`: messages, the session, local submission, STARTTLS and implicit
+//! TLS relays with AUTH, CHUNKING, DSN, pacing, and job payloads. DKIM,
+//! XOAUTH2, and SCRAM arrive in `0.5.0` (`dev/ROADMAP.md` in the
+//! [repository](https://github.com/jamesgober/smtp-net)).
 
 #![doc(html_root_url = "https://docs.rs/smtp-net")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -62,6 +63,7 @@ mod address;
 mod client;
 mod encode;
 mod error;
+mod gate;
 mod message;
 mod proto;
 #[cfg(feature = "testing")]
@@ -74,34 +76,42 @@ pub use encode::{
 };
 pub use error::{
     AddressError, AddressPart, BuildError, ConfigError, Disposition, Error, ErrorKind, Extension,
-    HeaderError, ProtocolError, RecipientFailure, SinkError, Stage, UsageError,
+    HeaderError, PayloadError, ProtocolError, RecipientFailure, SinkError, Stage, TlsFailure,
+    UsageError,
 };
 pub use message::{
-    Message, MessageBuilder, MessageLimits,
+    AutoSubmitted, Message, MessageBuilder, MessageLimits,
     header::{
         HeaderName, Headers, MAX_ENCODED_WORD, MAX_HEADER_LINE, RECOMMENDED_HEADER_LINE,
         check_header_value, encode_word, fold_header,
     },
     id::RandomSource,
-    part::{Attachment, ContentType, Inline, Multipart, TransferEncoding},
-    prepared::{Envelope, PreparedMessage},
+    part::{Attachment, ContentType, Inline, Multipart, Part, TransferEncoding},
+    prepared::{Dsn, DsnNotify, DsnPolicy, DsnReturn, Envelope, PreparedMessage},
     sink::{CountingSink, Sink},
 };
 #[cfg(feature = "std")]
 pub use message::{id::OsRandom, sink::IoSink};
 pub use proto::{
-    BodyFlags, Capabilities, ClientName, EnhancedCode, Event, MAX_COMMAND_LINE, MAX_TEXT_LINE,
-    Millis, RecipientPolicy, Reply, ReplyCode, ReplyLimits, ReplyParser, Session, SessionConfig,
+    Auth, BodyFlags, Capabilities, ClientName, Credentials, EnhancedCode, Event, MAX_AUTH_LINE,
+    MAX_COMMAND_LINE, MAX_TEXT_LINE, MechanismList, MechanismName, Millis, RecipientPolicy, Reply,
+    ReplyCode, ReplyLimits, ReplyParser, SaslError, Secret, Session, SessionConfig,
     SessionSecurity, SessionState, TextLossy, Timeouts, TlsInfo, TlsProtocol,
 };
 
 #[cfg(feature = "client")]
-pub use client::{Client, Report, Security, Server, ServerBuilder, send, send_local};
+pub use client::{
+    Client, Report, Security, Server, ServerBuilder, TlsConnector, TlsSetupError, send, send_local,
+    send_prepared,
+};
+#[cfg(target_has_atomic = "64")]
+pub use gate::HourlyLimit;
+pub use gate::{Admission, CountUnit, SendGate};
 
 #[cfg(feature = "testing")]
 pub use testing::{
     Fault, ReceivedMessage, ScriptMismatch, ScriptOutcome, ScriptedServer, TestServer,
-    TestServerBuilder, Transcript,
+    TestServerBuilder, TestTls, Transcript,
 };
 
 /// Crate version string, populated by Cargo at build time.

@@ -123,7 +123,7 @@ impl fmt::Display for Domain {
 /// assert!(smtp_net::Address::parse("a@b>\r\nRCPT TO:<c@d").is_err());
 /// # Ok::<(), smtp_net::AddressError>(())
 /// ```
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Address {
     domain: Domain,
 }
@@ -197,6 +197,21 @@ impl Address {
     #[must_use]
     pub fn same_mailbox(&self, other: &Address) -> bool {
         self.local_part() == other.local_part() && self.domain.eq_ignore_case(&other.domain)
+    }
+}
+
+/// Equal when the whole addresses are equal as written (local part and
+/// domain); [`same_mailbox`](Address::same_mailbox) ignores domain case.
+impl PartialEq for Address {
+    fn eq(&self, other: &Address) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+impl Eq for Address {}
+
+impl core::hash::Hash for Address {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
     }
 }
 
@@ -710,6 +725,15 @@ mod tests {
         ));
         assert!(Address::parse("a(comment)@b.example").is_err());
         assert!(Address::parse("<@a:b@c.example>").is_err());
+    }
+
+    #[test]
+    fn test_address_equality_compares_the_whole_address() {
+        let b = Address::parse("b@example.org").unwrap();
+        let d = Address::parse("d@example.org").unwrap();
+        assert_ne!(b, d, "same domain, different local part");
+        assert_eq!(b, Address::parse("b@example.org").unwrap());
+        assert_ne!(b, Address::parse("b@example.net").unwrap());
     }
 
     #[test]

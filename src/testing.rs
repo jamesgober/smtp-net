@@ -3,8 +3,9 @@
 //! injection.
 
 use std::{
+    boxed::Box,
     format,
-    io::{BufRead, BufReader, Write},
+    io::{Read as _, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     string::{String, ToString},
     sync::{
@@ -16,10 +17,16 @@ use std::{
     vec::Vec,
 };
 
+use net_io::{
+    TlsCloseKind, TlsError, TlsEvent, TlsFailure as NetTlsFailure, TlsInfo as NetTlsInfo,
+    TlsProgress, TlsSession,
+};
+
 use crate::{
-    client::{Security, Server},
+    client::{Security, Server, ServerBuilder, TlsConnector, TlsSetupError},
     error::{Error, ErrorKind, Stage},
     message::prepared::PreparedMessage,
+    proto::Credentials,
     proto::{BodyFlags, Event, Millis, Session, TlsInfo, TlsProtocol},
 };
 
@@ -33,6 +40,8 @@ enum Entry {
     Client(String),
     /// Any client lines up to and including the end-of-data `.` line.
     ClientBody,
+    /// Exactly this many client octets (a BDAT chunk).
+    ClientRaw(usize),
     /// Bytes the server sends (with CRLF).
     Server(Vec<u8>),
     /// The server closes the connection.
@@ -43,7 +52,7 @@ enum Entry {
 
 /// A conversation as data: `C: ` lines the client must send, `S: ` lines the
 /// server answers with. `C: <BODY>` stands for the message body through the
-/// end-of-data line; `S: <EOF>` closes the connection; `S: <TIMEOUT>` lets
+/// end-of-data line; `C: <RAW n>` for exactly `n` octets (a BDAT chunk); `S: <EOF>` closes the connection; `S: <TIMEOUT>` lets
 /// every deadline pass. Lines starting with `#` and blank lines are ignored.
 ///
 /// # Examples
@@ -75,6 +84,15 @@ impl Transcript {
             let entry = if let Some(c) = line.strip_prefix("C: ") {
                 if c == "<BODY>" {
                     Entry::ClientBody
+                } else if let Some(count) =
+                    c.strip_prefix("<RAW ").and_then(|r| r.strip_suffix('>'))
+                {
+                    let count = count.parse().map_err(|_| ScriptMismatch {
+                        line: n + 1,
+                        expected: "<RAW n>".into(),
+                        got: c.to_string(),
+                    })?;
+                    Entry::ClientRaw(count)
                 } else {
                     Entry::Client(c.to_string())
                 }
@@ -239,6 +257,16 @@ impl ScriptedServer {
                             got: got.unwrap_or_else(|| "(nothing)".into()),
                         });
                     }
+                }
+                Entry::ClientRaw(n) => {
+                    if d.sent.len() < *n {
+                        return Err(ScriptMismatch {
+                            line: *line,
+                            expected: format!("{n} raw octets"),
+                            got: format!("{} octets", d.sent.len()),
+                        });
+                    }
+                    d.sent.drain(..*n);
                 }
                 Entry::ClientBody => loop {
                     match d.take_line() {
@@ -437,6 +465,209 @@ impl Driver<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// A test TLS engine: framing only, no cryptography
+// ---------------------------------------------------------------------------
+
+/// A TLS stand-in for tests: a one-line handshake that checks the server
+/// name, then length-prefixed records of plaintext. It encrypts nothing and
+/// verifies nothing real; it exists so the driver's STARTTLS, implicit TLS,
+/// certificate-refusal, and injection paths run end to end against
+/// [`TestServer`] without a TLS library. Never use it for real mail.
+///
+/// # Examples
+///
+/// ```
+/// let server = smtp_net::TestServer::builder().starttls().start()?;
+/// let msg = smtp_net::Message::text("a@example.com", "b@example.org", "Hi", "over test TLS")?;
+/// let report = smtp_net::send(&server.server(), &msg)?;
+/// assert!(report.was_secure());
+/// # Ok::<(), smtp_net::Error>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TestTls;
+
+impl TlsConnector for TestTls {
+    fn session(
+        &self,
+        server_name: &str,
+        insecure: bool,
+    ) -> Result<Box<dyn TlsSession>, TlsSetupError> {
+        let mut hello = b"TESTTLS1 ".to_vec();
+        hello.extend_from_slice(server_name.as_bytes());
+        hello.extend_from_slice(if insecure {
+            b" insecure\n"
+        } else {
+            b" verify\n"
+        });
+        Ok(Box::new(TestTlsSession {
+            state: TestTlsState::Start,
+            hello,
+            sni: server_name.to_string(),
+        }))
+    }
+}
+
+/// The largest test TLS record payload.
+const TEST_RECORD: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TestTlsState {
+    Start,
+    AwaitReply,
+    Open,
+    Closed,
+}
+
+struct TestTlsSession {
+    state: TestTlsState,
+    hello: Vec<u8>,
+    sni: String,
+}
+
+impl TlsSession for TestTlsSession {
+    fn step<'i>(
+        &mut self,
+        input: &'i mut [u8],
+        output: &mut [u8],
+    ) -> Result<TlsProgress<'i>, TlsError> {
+        match self.state {
+            TestTlsState::Start => {
+                let n = self.hello.len();
+                let dst =
+                    output
+                        .get_mut(..n)
+                        .ok_or(TlsError::new(NetTlsFailure::OutputFull, 1, None))?;
+                dst.copy_from_slice(&self.hello);
+                self.state = TestTlsState::AwaitReply;
+                Ok(TlsProgress {
+                    consumed: 0,
+                    written: n,
+                    event: TlsEvent::Transmit,
+                })
+            }
+            TestTlsState::AwaitReply => {
+                let Some(nl) = input.iter().position(|&b| b == b'\n') else {
+                    if input.len() > 64
+                        || (!input.is_empty()
+                            && !b"TESTTLS1 "
+                                .starts_with(input.get(..input.len().min(9)).unwrap_or(&[])))
+                    {
+                        return Err(TlsError::new(NetTlsFailure::Protocol, 2, Some(50)));
+                    }
+                    return Ok(TlsProgress {
+                        consumed: 0,
+                        written: 0,
+                        event: TlsEvent::NeedInput,
+                    });
+                };
+                let line = input.get(..nl).unwrap_or(&[]);
+                if line == b"TESTTLS1 OK" {
+                    self.state = TestTlsState::Open;
+                    Ok(TlsProgress {
+                        consumed: nl + 1,
+                        written: 0,
+                        event: TlsEvent::HandshakeComplete,
+                    })
+                } else if line == b"TESTTLS1 REJECT" {
+                    // bad_certificate
+                    Err(TlsError::new(NetTlsFailure::Handshake, 3, Some(42)))
+                } else {
+                    Err(TlsError::new(NetTlsFailure::Protocol, 2, Some(50)))
+                }
+            }
+            TestTlsState::Open => {
+                let (Some(&hi), Some(&lo)) = (input.first(), input.get(1)) else {
+                    return Ok(TlsProgress {
+                        consumed: 0,
+                        written: 0,
+                        event: TlsEvent::NeedInput,
+                    });
+                };
+                let len = usize::from(u16::from_be_bytes([hi, lo]));
+                if len == 0 {
+                    self.state = TestTlsState::Closed;
+                    return Ok(TlsProgress {
+                        consumed: 2,
+                        written: 0,
+                        event: TlsEvent::PeerClosed,
+                    });
+                }
+                if len > TEST_RECORD {
+                    return Err(TlsError::new(NetTlsFailure::Protocol, 4, Some(22)));
+                }
+                if input.len() < 2 + len {
+                    return Ok(TlsProgress {
+                        consumed: 0,
+                        written: 0,
+                        event: TlsEvent::NeedInput,
+                    });
+                }
+                let data = input.get(2..2 + len).unwrap_or(&[]);
+                Ok(TlsProgress {
+                    consumed: 2 + len,
+                    written: 0,
+                    event: TlsEvent::Data(data),
+                })
+            }
+            TestTlsState::Closed => Ok(TlsProgress {
+                consumed: 0,
+                written: 0,
+                event: TlsEvent::Closed,
+            }),
+        }
+    }
+
+    fn encrypt(&mut self, plaintext: &[u8], output: &mut [u8]) -> Result<usize, TlsError> {
+        if self.state != TestTlsState::Open {
+            return Err(TlsError::new(NetTlsFailure::State, 5, None));
+        }
+        let records = plaintext.len().div_ceil(TEST_RECORD);
+        if output.len() < plaintext.len() + 2 * records {
+            return Err(TlsError::new(NetTlsFailure::OutputFull, 6, None));
+        }
+        let mut at = 0;
+        for chunk in plaintext.chunks(TEST_RECORD) {
+            let len = u16::try_from(chunk.len()).unwrap_or(u16::MAX).to_be_bytes();
+            if let Some(d) = output.get_mut(at..at + 2) {
+                d.copy_from_slice(&len);
+            }
+            if let Some(d) = output.get_mut(at + 2..at + 2 + chunk.len()) {
+                d.copy_from_slice(chunk);
+            }
+            at += 2 + chunk.len();
+        }
+        Ok(at)
+    }
+
+    fn close(&mut self, output: &mut [u8]) -> Result<usize, TlsError> {
+        let d = output
+            .get_mut(..2)
+            .ok_or(TlsError::new(NetTlsFailure::OutputFull, 7, None))?;
+        d.copy_from_slice(&[0, 0]);
+        self.state = TestTlsState::Closed;
+        Ok(2)
+    }
+
+    fn on_transport_closed(&mut self) -> TlsCloseKind {
+        if self.state == TestTlsState::Closed {
+            TlsCloseKind::Clean
+        } else {
+            TlsCloseKind::Unclean
+        }
+    }
+
+    fn info(&self) -> Option<NetTlsInfo> {
+        (self.state == TestTlsState::Open)
+            .then(|| NetTlsInfo::new(Some(&self.sni), None, 0x0304, 0x1301))
+            .flatten()
+    }
+
+    fn input_capacity_required(&self) -> usize {
+        2 + TEST_RECORD
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The blocking loopback test server
 // ---------------------------------------------------------------------------
 
@@ -464,10 +695,12 @@ pub enum Fault {
         /// How long.
         by: Duration,
     },
-    /// Send these plaintext bytes right after the `220` to STARTTLS.
+    /// Send these plaintext bytes right after the `220` to STARTTLS (T-6).
     InjectAfterStartTls(&'static [u8]),
-    /// Never advertise STARTTLS.
+    /// Never advertise STARTTLS (T-5).
     OmitStartTls,
+    /// Refuse the test TLS handshake as a bad certificate (T-11).
+    RejectCertificate,
     /// Answer `stage` with a reply that is not valid SMTP.
     MalformedReply(Stage),
     /// Answer `stage` with a 2,000-octet line.
@@ -476,7 +709,7 @@ pub enum Fault {
     ExtraReply(Stage),
     /// Refuse the recipient at this zero-based index with `550 5.1.1`.
     RejectRecipient(usize),
-    /// Answer `452 4.5.3` to every recipient after the first `n`.
+    /// Answer `452 4.5.3` to every recipient after the first `n` of a transaction.
     TooManyRecipientsAfter(usize),
     /// Send replies at this many bytes per second.
     SlowDrip {
@@ -493,10 +726,18 @@ pub struct ReceivedMessage {
     pub from: String,
     /// The forward-paths the server accepted.
     pub recipients: Vec<String>,
-    /// The MAIL parameters (`SIZE=...`, `BODY=8BITMIME`, ...).
+    /// The MAIL parameters (`SIZE=...`, `BODY=8BITMIME`, `RET=...`, ...).
     pub mail_parameters: Vec<String>,
-    /// The message bytes after dot-unstuffing, CRLF line endings.
+    /// The RCPT parameters of each accepted recipient (`NOTIFY=...`, `ORCPT=...`).
+    pub rcpt_parameters: Vec<Vec<String>>,
+    /// The message bytes after dot-unstuffing (or as BDAT carried them).
     pub data: Vec<u8>,
+    /// True when the message arrived over the test TLS.
+    pub secure: bool,
+    /// True when it arrived with BDAT.
+    pub chunked: bool,
+    /// The user that authenticated on the connection, if any.
+    pub user: Option<String>,
 }
 
 #[derive(Default)]
@@ -506,18 +747,43 @@ struct Shared {
     connections: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TlsMode {
+    None,
+    StartTls,
+    Implicit,
+}
+
+/// Makes a server-side TLS session for each TLS connection.
+type EngineFactory = Arc<dyn Fn() -> Option<Box<dyn TlsSession>> + Send + Sync>;
+
+#[derive(Clone)]
+struct Engine(EngineFactory);
+
+impl core::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Engine")
+    }
+}
+
 /// Configures a [`TestServer`].
 #[must_use]
 #[derive(Clone, Debug)]
 pub struct TestServerBuilder {
+    engine: Option<Engine>,
     extensions: Vec<String>,
     faults: Vec<Fault>,
     ehlo_refused: bool,
+    tls: TlsMode,
+    tls_name: String,
+    auth: Option<(String, String)>,
 }
 
 impl TestServerBuilder {
     /// Replaces the advertised extensions (default: `PIPELINING`, `8BITMIME`,
-    /// `SIZE 10485760`, `ENHANCEDSTATUSCODES`, `SMTPUTF8`).
+    /// `SIZE 10485760`, `ENHANCEDSTATUSCODES`, `SMTPUTF8`, `DSN`).
+    /// `STARTTLS` and `AUTH` are added by [`starttls`](TestServerBuilder::starttls)
+    /// and [`auth`](TestServerBuilder::auth).
     pub fn extensions(mut self, list: &[&str]) -> Self {
         self.extensions = list.iter().map(|s| (*s).to_string()).collect();
         self
@@ -535,6 +801,43 @@ impl TestServerBuilder {
         self
     }
 
+    /// Offer STARTTLS over the [`TestTls`] stand-in.
+    pub fn starttls(mut self) -> Self {
+        self.tls = TlsMode::StartTls;
+        self
+    }
+
+    /// Speak the [`TestTls`] stand-in from the first byte (implicit TLS).
+    pub fn implicit_tls(mut self) -> Self {
+        self.tls = TlsMode::Implicit;
+        self
+    }
+
+    /// The name the test certificate is for (default `localhost`); a client
+    /// that verifies and asks for another name is refused.
+    pub fn tls_name(mut self, name: &str) -> Self {
+        self.tls_name = name.to_string();
+        self
+    }
+
+    /// Use a real server-side TLS engine (any net-io `TlsSession`, such as a
+    /// tls-net `ServerSession` built from the fixture certificates) instead of
+    /// the [`TestTls`] stand-in, for STARTTLS or implicit TLS. The client then
+    /// needs a matching connector (`ServerBuilder::tls_connector`).
+    pub fn tls_engine(
+        mut self,
+        factory: impl Fn() -> Option<Box<dyn TlsSession>> + Send + Sync + 'static,
+    ) -> Self {
+        self.engine = Some(Engine(Arc::new(factory)));
+        self
+    }
+
+    /// Offer `AUTH PLAIN LOGIN` and accept this user and password.
+    pub fn auth(mut self, user: &str, password: &str) -> Self {
+        self.auth = Some((user.to_string(), password.to_string()));
+        self
+    }
+
     /// Binds `127.0.0.1:0` and starts serving.
     ///
     /// # Errors
@@ -549,14 +852,14 @@ impl TestServerBuilder {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let config = Arc::new(self);
-        let (s, st) = (Arc::clone(&shared), Arc::clone(&stop));
+        let (s, st, c0) = (Arc::clone(&shared), Arc::clone(&stop), Arc::clone(&config));
         let thread = thread::spawn(move || {
             for stream in listener.incoming() {
                 if st.load(Ordering::SeqCst) {
                     break;
                 }
                 let Ok(stream) = stream else { continue };
-                let (s, c) = (Arc::clone(&s), Arc::clone(&config));
+                let (s, c) = (Arc::clone(&s), Arc::clone(&c0));
                 thread::spawn(move || {
                     let _ = serve(stream, &c, &s);
                 });
@@ -567,12 +870,14 @@ impl TestServerBuilder {
             shared,
             stop,
             thread: Some(thread),
+            config,
         })
     }
 }
 
 /// A blocking SMTP server on `127.0.0.1` for tests: it speaks enough SMTP to
-/// accept, record, and misbehave on command. Stops when dropped.
+/// accept, record, and misbehave on command, with AUTH, BDAT, DSN, and the
+/// [`TestTls`] stand-in. Stops when dropped.
 ///
 /// # Examples
 ///
@@ -590,6 +895,7 @@ pub struct TestServer {
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    config: Arc<TestServerBuilder>,
 }
 
 impl core::fmt::Debug for TestServer {
@@ -619,12 +925,17 @@ impl TestServer {
                 "SIZE 10485760",
                 "ENHANCEDSTATUSCODES",
                 "SMTPUTF8",
+                "DSN",
             ]
             .iter()
             .map(|s| (*s).to_string())
             .collect(),
+            engine: None,
             faults: Vec::new(),
             ehlo_refused: false,
+            tls: TlsMode::None,
+            tls_name: "localhost".to_string(),
+            auth: None,
         }
     }
 
@@ -634,11 +945,33 @@ impl TestServer {
         self.addr.port()
     }
 
-    /// A [`Server`] pointing at it (plaintext loopback, short timeouts).
+    /// A [`ServerBuilder`] pointing at it: plaintext loopback, or STARTTLS or
+    /// implicit TLS over [`TestTls`] to `localhost`, with the configured user
+    /// and password.
+    pub fn server_builder(&self) -> ServerBuilder {
+        let security = match self.config.tls {
+            TlsMode::None => Security::PlaintextLoopback,
+            TlsMode::StartTls => Security::StartTls,
+            TlsMode::Implicit => Security::ImplicitTls,
+        };
+        let host = if security == Security::PlaintextLoopback {
+            "127.0.0.1"
+        } else {
+            "localhost"
+        };
+        let mut b = Server::builder(host, security)
+            .port(self.port())
+            .tls_connector(TestTls);
+        if let Some((u, p)) = &self.config.auth {
+            b = b.credentials(Credentials::password(u, p.as_str()));
+        }
+        b
+    }
+
+    /// The [`Server`] of [`server_builder`](TestServer::server_builder).
     #[must_use]
     pub fn server(&self) -> Server {
-        Server::builder("127.0.0.1", Security::PlaintextLoopback)
-            .port(self.port())
+        self.server_builder()
             .build()
             .unwrap_or_else(|_| Server::local())
     }
@@ -652,7 +985,8 @@ impl TestServer {
             .unwrap_or_default()
     }
 
-    /// The conversation so far, `C: ` and `S: ` lines; message bodies omitted.
+    /// The conversation so far, `C: ` and `S: ` lines; message bodies omitted
+    /// and AUTH payloads shown as `<redacted N octets>` (T-9).
     #[must_use]
     pub fn transcript(&self) -> String {
         self.shared
@@ -678,9 +1012,81 @@ impl Drop for TestServer {
     }
 }
 
+/// A real TLS engine's buffers on the server side.
+struct EngineLink {
+    session: Box<dyn TlsSession>,
+    input: Vec<u8>,
+    filled: usize,
+    output: Vec<u8>,
+}
+
+impl EngineLink {
+    /// Steps the engine once over the buffered ciphertext.
+    fn step(&mut self, stream: &mut TcpStream, plain: &mut Vec<u8>) -> std::io::Result<EngineStep> {
+        let filled = self.filled;
+        let input = self.input.get_mut(..filled).unwrap_or(&mut []);
+        let p = self
+            .session
+            .step(input, &mut self.output)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        let (consumed, written) = (p.consumed, p.written);
+        let mut acted = consumed > 0 || written > 0;
+        let step = match p.event {
+            TlsEvent::NeedInput if acted => EngineStep::Again,
+            TlsEvent::NeedInput => EngineStep::NeedInput,
+            TlsEvent::HandshakeComplete => {
+                acted = true;
+                EngineStep::Handshaken
+            }
+            TlsEvent::Data(d) => {
+                plain.extend_from_slice(d);
+                acted = true;
+                EngineStep::Again
+            }
+            TlsEvent::PeerClosed | TlsEvent::Closed => EngineStep::Closed,
+            _ => EngineStep::Again,
+        };
+        if written > 0 {
+            stream.write_all(self.output.get(..written).unwrap_or(&[]))?;
+        }
+        let consumed = consumed.min(filled);
+        self.input.copy_within(consumed..filled, 0);
+        self.filled = filled - consumed;
+        if !acted && matches!(step, EngineStep::Again) {
+            return Ok(EngineStep::NeedInput);
+        }
+        Ok(step)
+    }
+
+    /// Reads more ciphertext; false at EOF.
+    fn read(&mut self, stream: &mut TcpStream) -> std::io::Result<bool> {
+        let need = self
+            .session
+            .input_capacity_required()
+            .max(self.filled + 4096);
+        if self.input.len() < need {
+            self.input.resize(need, 0);
+        }
+        let room = self.input.get_mut(self.filled..).unwrap_or(&mut []);
+        let n = stream.read(room)?;
+        self.filled += n;
+        Ok(n > 0)
+    }
+}
+
+enum EngineStep {
+    NeedInput,
+    Again,
+    Handshaken,
+    Closed,
+}
+
 struct Conn<'a> {
-    reader: BufReader<TcpStream>,
-    writer: TcpStream,
+    stream: TcpStream,
+    engine: Option<EngineLink>,
+    /// Plaintext received and not yet used.
+    plain: Vec<u8>,
+    tls: bool,
     cfg: &'a TestServerBuilder,
     shared: &'a Mutex<Shared>,
 }
@@ -730,30 +1136,165 @@ impl Conn<'_> {
     }
 
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if let Some(e) = self.engine.as_mut() {
+            for chunk in bytes.chunks(8 * 1024) {
+                let n = e
+                    .session
+                    .encrypt(chunk, &mut e.output)
+                    .map_err(|x| std::io::Error::other(format!("{x:?}")))?;
+                self.stream.write_all(e.output.get(..n).unwrap_or(&[]))?;
+            }
+            return Ok(());
+        }
+        let framed;
+        let bytes = if self.tls {
+            let mut f = Vec::with_capacity(bytes.len() + 2);
+            for chunk in bytes.chunks(TEST_RECORD) {
+                f.extend_from_slice(&u16::try_from(chunk.len()).unwrap_or(u16::MAX).to_be_bytes());
+                f.extend_from_slice(chunk);
+            }
+            framed = f;
+            &framed[..]
+        } else {
+            bytes
+        };
         if let Some(Fault::SlowDrip { bytes_per_second }) =
             self.fault(|f| matches!(f, Fault::SlowDrip { .. }))
         {
             let gap = Duration::from_secs(1) / (*bytes_per_second).max(1);
             for b in bytes {
-                self.writer.write_all(core::slice::from_ref(b))?;
+                self.stream.write_all(core::slice::from_ref(b))?;
                 thread::sleep(gap);
             }
             return Ok(());
         }
-        self.writer.write_all(bytes)
+        self.stream.write_all(bytes)
     }
 
     fn closes_at(&self, stage: Stage) -> bool {
         self.fault(|f| *f == Fault::CloseAt(stage)).is_some()
     }
 
-    fn read_line(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        let mut line = Vec::new();
-        let n = self.reader.read_until(b'\n', &mut line)?;
-        if n == 0 {
-            return Ok(None);
+    /// Reads more plaintext; false at EOF.
+    fn fill(&mut self) -> std::io::Result<bool> {
+        if let Some(e) = self.engine.as_mut() {
+            let before = self.plain.len();
+            loop {
+                match e.step(&mut self.stream, &mut self.plain)? {
+                    EngineStep::Closed => return Ok(self.plain.len() > before),
+                    EngineStep::NeedInput if self.plain.len() > before => return Ok(true),
+                    EngineStep::NeedInput => {
+                        if !e.read(&mut self.stream)? {
+                            return Ok(false);
+                        }
+                    }
+                    EngineStep::Again | EngineStep::Handshaken => {}
+                }
+            }
         }
-        Ok(Some(line))
+        if self.tls {
+            let mut len = [0u8; 2];
+            if self.stream.read_exact(&mut len).is_err() {
+                return Ok(false);
+            }
+            let n = usize::from(u16::from_be_bytes(len));
+            if n == 0 {
+                return Ok(false);
+            }
+            let mut rec = std::vec![0u8; n];
+            self.stream.read_exact(&mut rec)?;
+            self.plain.extend_from_slice(&rec);
+            return Ok(true);
+        }
+        let mut buf = [0u8; 4096];
+        let n = self.stream.read(&mut buf)?;
+        self.plain.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+        Ok(n > 0)
+    }
+
+    fn read_line(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        loop {
+            if let Some(nl) = self.plain.iter().position(|&b| b == b'\n') {
+                return Ok(Some(self.plain.drain(..=nl).collect()));
+            }
+            if !self.fill()? {
+                return Ok(None);
+            }
+        }
+    }
+
+    fn read_exact_plain(&mut self, n: usize) -> std::io::Result<Option<Vec<u8>>> {
+        while self.plain.len() < n {
+            if !self.fill()? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(self.plain.drain(..n).collect()))
+    }
+
+    /// The server side of the TLS handshake (the real engine when one is
+    /// configured, the test stand-in otherwise); false when it failed.
+    fn tls_accept(&mut self) -> std::io::Result<bool> {
+        if let Some(factory) = self.cfg.engine.clone() {
+            let Some(session) = (factory.0)() else {
+                return Ok(false);
+            };
+            let mut link = EngineLink {
+                session,
+                input: std::vec![0; 32 * 1024],
+                filled: 0,
+                output: std::vec![0; 32 * 1024],
+            };
+            loop {
+                match link.step(&mut self.stream, &mut self.plain) {
+                    Ok(EngineStep::Handshaken) => break,
+                    Ok(EngineStep::NeedInput) => {
+                        if !link.read(&mut self.stream)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(EngineStep::Again) => {}
+                    Ok(EngineStep::Closed) => {
+                        self.log("S: ", "<TLS refused: closed>");
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        self.log("S: ", &format!("<TLS refused: {e}>"));
+                        return Ok(false);
+                    }
+                }
+            }
+            self.log("S: ", "<TLS established>");
+            self.engine = Some(link);
+            self.tls = true;
+            return Ok(true);
+        }
+        let Some(hello) = self.read_line()? else {
+            return Ok(false);
+        };
+        let hello = String::from_utf8_lossy(&hello).trim_end().to_string();
+        let mut parts = hello.split(' ');
+        let ok_shape = parts.next() == Some("TESTTLS1");
+        let name = parts.next().unwrap_or("");
+        let insecure = parts.next() == Some("insecure");
+        let name_ok = insecure || name.eq_ignore_ascii_case(&self.cfg.tls_name);
+        let accept =
+            ok_shape && name_ok && self.fault(|f| *f == Fault::RejectCertificate).is_none();
+        self.stream.write_all(if accept {
+            b"TESTTLS1 OK\n"
+        } else {
+            b"TESTTLS1 REJECT\n"
+        })?;
+        self.log(
+            "S: ",
+            if accept {
+                "<TLS established>"
+            } else {
+                "<TLS refused>"
+            },
+        );
+        self.tls = accept;
+        Ok(accept)
     }
 }
 
@@ -766,52 +1307,73 @@ fn serve(
     if let Ok(mut s) = shared.lock() {
         s.connections += 1;
     }
-    let writer = stream.try_clone()?;
     let mut c = Conn {
-        reader: BufReader::new(stream),
-        writer,
+        stream,
+        engine: None,
+        plain: Vec::new(),
+        tls: false,
         cfg,
         shared,
     };
+    if cfg.tls == TlsMode::Implicit && !c.tls_accept()? {
+        return c.stream.shutdown(Shutdown::Both);
+    }
     if c.closes_at(Stage::Greeting) {
-        return c.writer.shutdown(Shutdown::Both);
+        return c.stream.shutdown(Shutdown::Both);
     }
     c.reply(Stage::Greeting, "220 test.smtp-net.invalid ESMTP")?;
     let mut from: Option<(String, Vec<String>)> = None;
-    let mut rcpts: Vec<String> = Vec::new();
+    let mut rcpts: Vec<(String, Vec<String>)> = Vec::new();
     let mut rcpt_index = 0usize;
     let mut delivered = 0usize;
+    let mut user: Option<String> = None;
+    let mut chunk: Vec<u8> = Vec::new();
     while let Some(raw) = c.read_line()? {
         let line = String::from_utf8_lossy(raw.strip_suffix(b"\r\n").unwrap_or(&raw)).into_owned();
-        c.log("C: ", &line);
         let upper = line.to_ascii_uppercase();
         let verb = upper.split(' ').next().unwrap_or("").to_string();
+        if verb == "AUTH" {
+            let mech = upper.split(' ').nth(1).unwrap_or("");
+            let shown = format!(
+                "AUTH {mech} <redacted {} octets>",
+                line.len().saturating_sub(6 + mech.len())
+            );
+            c.log("C: ", &shown);
+        } else {
+            c.log("C: ", &line);
+        }
         let stage = match verb.as_str() {
             "EHLO" => Stage::Ehlo,
             "HELO" => Stage::Helo,
             "MAIL" => Stage::Mail,
             "RCPT" => Stage::Rcpt,
             "DATA" => Stage::Data,
+            "BDAT" => Stage::Bdat,
             "RSET" => Stage::Rset,
             "NOOP" => Stage::Noop,
             "QUIT" => Stage::Quit,
             "STARTTLS" => Stage::StartTls,
+            "AUTH" => Stage::Auth,
             _ => Stage::Total,
         };
         if c.closes_at(stage) {
-            return c.writer.shutdown(Shutdown::Both);
+            return c.stream.shutdown(Shutdown::Both);
         }
         match stage {
             Stage::Ehlo if cfg.ehlo_refused => c.reply(stage, "502 5.5.1 EHLO not implemented")?,
             Stage::Ehlo => {
-                let mut lines = vec!["250-test.smtp-net.invalid".to_string()];
+                let mut lines = std::vec!["250-test.smtp-net.invalid".to_string()];
                 for e in &cfg.extensions {
-                    if e.eq_ignore_ascii_case("STARTTLS")
-                        && c.fault(|f| *f == Fault::OmitStartTls).is_some()
-                    {
-                        continue;
-                    }
                     lines.push(format!("250-{e}"));
+                }
+                if cfg.tls == TlsMode::StartTls
+                    && !c.tls
+                    && c.fault(|f| *f == Fault::OmitStartTls).is_none()
+                {
+                    lines.push("250-STARTTLS".to_string());
+                }
+                if cfg.auth.is_some() {
+                    lines.push("250-AUTH PLAIN LOGIN".to_string());
                 }
                 if let Some(last) = lines.last_mut() {
                     *last = last.replacen("250-", "250 ", 1);
@@ -820,15 +1382,97 @@ fn serve(
             }
             Stage::Helo => c.reply(stage, "250 test.smtp-net.invalid")?,
             Stage::StartTls => {
+                if cfg.tls != TlsMode::StartTls || c.tls {
+                    c.reply(stage, "503 5.5.1 STARTTLS not available")?;
+                    continue;
+                }
                 c.reply(stage, "220 2.0.0 go ahead")?;
                 if let Some(Fault::InjectAfterStartTls(b)) =
                     c.fault(|f| matches!(f, Fault::InjectAfterStartTls(_)))
                 {
                     let b: &[u8] = b;
-                    c.write(b)?;
+                    c.stream.write_all(b)?;
                 }
-                // No TLS engine here: the client either handshakes (and fails) or leaves.
-                return Ok(());
+                if !c.tls_accept()? {
+                    return c.stream.shutdown(Shutdown::Both);
+                }
+                // RFC 3207 4.2: forget everything from before TLS.
+                from = None;
+                rcpts.clear();
+            }
+            Stage::Auth => {
+                let Some((want_user, want_pass)) = cfg.auth.clone() else {
+                    c.reply(stage, "503 5.5.1 AUTH not available")?;
+                    continue;
+                };
+                let mut words = line.split(' ').skip(1);
+                let mech = words.next().unwrap_or("").to_ascii_uppercase();
+                let initial = words.next().map(str::to_string);
+                let decode = |s: &str| {
+                    let mut out = Vec::new();
+                    crate::encode::base64_decode(s.trim().as_bytes(), &mut out)
+                        .ok()
+                        .map(|()| out)
+                };
+                let (got_user, got_pass) = match mech.as_str() {
+                    "PLAIN" => {
+                        let payload = match initial {
+                            Some(p) => p,
+                            None => {
+                                c.reply(stage, "334 ")?;
+                                let Some(l) = c.read_line()? else {
+                                    return Ok(());
+                                };
+                                c.log(
+                                    "C: ",
+                                    &format!("<redacted {} octets>", l.len().saturating_sub(2)),
+                                );
+                                String::from_utf8_lossy(&l).trim_end().to_string()
+                            }
+                        };
+                        let raw = decode(&payload).unwrap_or_default();
+                        let mut parts = raw.split(|&b| b == 0).skip(1);
+                        let u = parts
+                            .next()
+                            .map(|u| String::from_utf8_lossy(u).into_owned());
+                        let p = parts
+                            .next()
+                            .map(|p| String::from_utf8_lossy(p).into_owned());
+                        (u, p)
+                    }
+                    "LOGIN" => {
+                        c.reply(stage, "334 VXNlcm5hbWU6")?;
+                        let Some(u) = c.read_line()? else {
+                            return Ok(());
+                        };
+                        c.log(
+                            "C: ",
+                            &format!("<redacted {} octets>", u.len().saturating_sub(2)),
+                        );
+                        c.reply(stage, "334 UGFzc3dvcmQ6")?;
+                        let Some(p) = c.read_line()? else {
+                            return Ok(());
+                        };
+                        c.log(
+                            "C: ",
+                            &format!("<redacted {} octets>", p.len().saturating_sub(2)),
+                        );
+                        let s = |b: Vec<u8>| {
+                            decode(String::from_utf8_lossy(&b).trim_end())
+                                .map(|v| String::from_utf8_lossy(&v).into_owned())
+                        };
+                        (s(u), s(p))
+                    }
+                    _ => (None, None),
+                };
+                if got_user.as_deref() == Some(want_user.as_str())
+                    && got_pass.as_deref() == Some(want_pass.as_str())
+                {
+                    user = got_user;
+                    c.reply(stage, "235 2.7.0 authenticated")?;
+                } else {
+                    c.reply(stage, "535 5.7.8 authentication failed")?;
+                }
             }
             Stage::Mail => {
                 let path = between(&line, '<', '>');
@@ -839,6 +1483,7 @@ fn serve(
                 from = Some((path, params));
                 rcpts.clear();
                 rcpt_index = 0;
+                chunk.clear();
                 c.reply(stage, "250 2.1.0 ok")?;
             }
             Stage::Rcpt => {
@@ -854,7 +1499,11 @@ fn serve(
                 {
                     c.reply(stage, "452 4.5.3 too many recipients")?;
                 } else {
-                    rcpts.push(between(&line, '<', '>'));
+                    let params: Vec<String> = line
+                        .rsplit_once('>')
+                        .map(|(_, p)| p.split_whitespace().map(str::to_string).collect())
+                        .unwrap_or_default();
+                    rcpts.push((between(&line, '<', '>'), params));
                     c.reply(stage, "250 2.1.5 ok")?;
                 }
             }
@@ -875,30 +1524,55 @@ fn serve(
                     data.extend_from_slice(l.strip_prefix(b".").unwrap_or(&l));
                 }
                 c.log("C: ", "<BODY>");
-                let (path, params) = from.take().unwrap_or_default();
-                if let Ok(mut s) = shared.lock() {
-                    s.received.push(ReceivedMessage {
-                        from: path,
-                        recipients: core::mem::take(&mut rcpts),
-                        mail_parameters: params,
+                if !store(
+                    &mut c,
+                    shared,
+                    &mut from,
+                    &mut rcpts,
+                    data,
+                    false,
+                    &user,
+                    &mut delivered,
+                )? {
+                    return Ok(());
+                }
+            }
+            Stage::Bdat => {
+                let mut words = upper.split_whitespace().skip(1);
+                let n: usize = words.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                let last = words.next() == Some("LAST");
+                let Some(bytes) = c.read_exact_plain(n)? else {
+                    return Ok(());
+                };
+                c.log("C: ", &format!("<BDAT {n} octets>"));
+                if from.is_none() || rcpts.is_empty() {
+                    c.reply(stage, "554 5.5.1 no valid recipients")?;
+                    continue;
+                }
+                chunk.extend_from_slice(&bytes);
+                if last {
+                    let data = core::mem::take(&mut chunk);
+                    if !store(
+                        &mut c,
+                        shared,
+                        &mut from,
+                        &mut rcpts,
                         data,
-                    });
-                }
-                if c.fault(|f| *f == Fault::CloseAfterDataEnd).is_some() {
-                    return c.writer.shutdown(Shutdown::Both);
-                }
-                c.reply(Stage::DataEnd, "250 2.0.0 queued")?;
-                delivered += 1;
-                if c.fault(|f| *f == Fault::CloseAfterMessages(delivered))
-                    .is_some()
-                {
-                    return c.writer.shutdown(Shutdown::Both);
+                        true,
+                        &user,
+                        &mut delivered,
+                    )? {
+                        return Ok(());
+                    }
+                } else {
+                    c.reply(stage, "250 2.0.0 chunk received")?;
                 }
             }
             Stage::Rset => {
                 from = None;
                 rcpts.clear();
                 rcpt_index = 0;
+                chunk.clear();
                 c.reply(stage, "250 2.0.0 ok")?;
             }
             Stage::Noop => c.reply(stage, "250 2.0.0 ok")?,
@@ -910,6 +1584,51 @@ fn serve(
         }
     }
     Ok(())
+}
+
+/// Records a received message and answers its end; false when the
+/// connection must close instead.
+#[allow(clippy::too_many_arguments)]
+fn store(
+    c: &mut Conn<'_>,
+    shared: &Mutex<Shared>,
+    from: &mut Option<(String, Vec<String>)>,
+    rcpts: &mut Vec<(String, Vec<String>)>,
+    data: Vec<u8>,
+    chunked: bool,
+    user: &Option<String>,
+    delivered: &mut usize,
+) -> std::io::Result<bool> {
+    let (path, params) = from.take().unwrap_or_default();
+    let taken = core::mem::take(rcpts);
+    if let Ok(mut s) = shared.lock() {
+        s.received.push(ReceivedMessage {
+            from: path,
+            recipients: taken.iter().map(|(r, _)| r.clone()).collect(),
+            mail_parameters: params,
+            rcpt_parameters: taken.into_iter().map(|(_, p)| p).collect(),
+            data,
+            secure: c.tls,
+            chunked,
+            user: user.clone(),
+        });
+    }
+    if c.fault(|f| *f == Fault::CloseAfterDataEnd).is_some() {
+        c.stream.shutdown(Shutdown::Both)?;
+        return Ok(false);
+    }
+    c.reply(
+        if chunked { Stage::Bdat } else { Stage::DataEnd },
+        "250 2.0.0 queued",
+    )?;
+    *delivered += 1;
+    if c.fault(|f| *f == Fault::CloseAfterMessages(*delivered))
+        .is_some()
+    {
+        c.stream.shutdown(Shutdown::Both)?;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn between(s: &str, open: char, close: char) -> String {
