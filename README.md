@@ -29,16 +29,39 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: scaffold (<code>0.1.0</code>).</strong> No functional code yet. The design is written down in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a> and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>; the public API is locked in <code>0.2.0</code>.
+        <strong>Status: design lock (<code>0.2.0</code>).</strong> The public API is written down in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. No functional code yet: <code>0.3.0</code> is the first release that sends mail.
     </blockquote>
 </div>
 
 <hr>
 <br>
 
+## Planned API
+
+The simple path is one call. This is the contract from the design lock; it ships in `0.3.0` (local submission) and `0.4.0` (TLS relays).
+
+```rust
+// Send a plain-text email through the local mail server (for example Exim on 127.0.0.1:25).
+let msg = smtp_net::Message::text(
+    "Example <no-reply@example.com>",
+    "user@example.org",
+    "Confirm your email address",
+    "Open this link to confirm: https://example.com/confirm/abc123",
+)?;
+let report = smtp_net::send_local(&msg)?;
+println!("accepted as {}", report.message_id());
+
+// Text plus HTML through a remote relay with STARTTLS on 587 and AUTH.
+let msg = smtp_net::Message::html(from, to, "Reset your password", html, text)?;
+let server = smtp_net::Server::starttls("mail.example.com").login("no-reply@example.com", password);
+smtp_net::send(&server, &msg)?;
+```
+
+Every error says whether it is **temporary** (retry later) or **permanent** (do not retry), and whether the message was **possibly delivered**, so a job system can retry, dead-letter, or flag a possible duplicate without reading SMTP reply codes.
+
 ## Scope
 
-SMTP submission (RFC 6409) with STARTTLS or implicit TLS, AUTH PLAIN and LOGIN (XOAUTH2 later), pipelining, size and capability negotiation, MIME building (text, HTML, attachments, inline images, encodings), header injection refusal, DKIM signing (Ed25519 and RSA), and a bounded outgoing queue hook. It does not receive mail.
+SMTP submission (RFC 6409) with STARTTLS or implicit TLS (RFC 8314); AUTH PLAIN, LOGIN, XOAUTH2, and SCRAM-SHA-256; PIPELINING, CHUNKING, SIZE, 8BITMIME, SMTPUTF8, DSN, and enhanced status codes; MIME building (text, HTML, attachments, inline images, quoted-printable and base64, RFC 2047 and RFC 2231 encoding) with header injection refused, never stripped; DKIM signing (Ed25519 and RSA-SHA256); a versioned, checksummed job payload; a pacing gate for host limits; and a test server with fault injection. It does not receive mail, run a queue, or spawn a `sendmail` binary.
 
 See [`dev/PLAN.md`](./dev/PLAN.md) for the full scope, what is deliberately left to other crates, and the decision log.
 

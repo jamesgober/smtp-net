@@ -4,10 +4,11 @@
 //!
 //! ## Status
 //!
-//! Scaffold. The design is written down in `dev/PLAN.md` and the milestone
-//! schedule in `dev/ROADMAP.md` (both in the
-//! [repository](https://github.com/jamesgober/smtp-net)); the public API
-//! begins with `0.2.0`.
+//! Design lock (`0.2.0`). The public API is written down in `docs/API.md`,
+//! the design and decisions in `dev/PLAN.md`, and the schedule in
+//! `dev/ROADMAP.md` (all in the
+//! [repository](https://github.com/jamesgober/smtp-net)). The first
+//! functional release is `0.3.0`; this release contains only [`VERSION`].
 
 #![doc(html_root_url = "https://docs.rs/smtp-net")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
