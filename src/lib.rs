@@ -28,7 +28,9 @@
 //!
 //! [`Message::builder`] for text, HTML, attachments, inline images, and
 //! custom headers; [`Server::builder`] for the port, EHLO name, timeouts,
-//! and recipient policy; [`Client`] to send many messages on one connection.
+//! credentials, DKIM signers, pacing, and recipient policy; [`Client`] to
+//! send many messages on one connection, `Pool` to share a few connections
+//! across threads.
 //!
 //! ## Tier 3: the sans-IO core
 //!
@@ -39,9 +41,11 @@
 //!
 //! ## Status
 //!
-//! `0.4.0`: messages, the session, local submission, STARTTLS and implicit
-//! TLS relays with AUTH, CHUNKING, DSN, pacing, and job payloads. DKIM,
-//! XOAUTH2, and SCRAM arrive in `0.5.0` (`dev/ROADMAP.md` in the
+//! `0.5.0`, feature complete: messages, the session, local submission,
+//! STARTTLS and implicit TLS relays, AUTH (SCRAM-SHA-256, PLAIN, LOGIN,
+//! XOAUTH2, custom mechanisms), DKIM signing (Ed25519 and RSA), CHUNKING,
+//! DSN, pacing, job payloads, a connection pool, and an observer hook.
+//! `0.6.0` measures and tunes performance (`dev/ROADMAP.md` in the
 //! [repository](https://github.com/jamesgober/smtp-net)).
 
 #![doc(html_root_url = "https://docs.rs/smtp-net")]
@@ -61,6 +65,7 @@ extern crate alloc;
 mod address;
 #[cfg(feature = "client")]
 mod client;
+mod dkim;
 mod encode;
 mod error;
 mod gate;
@@ -70,14 +75,17 @@ mod proto;
 mod testing;
 
 pub use address::{Address, Domain, MAX_DOMAIN, MAX_LOCAL_PART, MAX_PATH, Mailbox};
+pub use dkim::{BodyCanonicalizer, Canonicalization, HeaderCanonicalizer};
+#[cfg(feature = "dkim")]
+pub use dkim::{DKIM_RSA_MAX_BITS, DKIM_RSA_MIN_BITS, DkimAlgorithm, DkimKey, DkimSigner};
 pub use encode::{
     MIME_LINE_LENGTH, QpState, base64_encode_lines, base64_encoded_len, quoted_printable_encode,
     quoted_printable_finish,
 };
 pub use error::{
-    AddressError, AddressPart, BuildError, ConfigError, Disposition, Error, ErrorKind, Extension,
-    HeaderError, PayloadError, ProtocolError, RecipientFailure, SinkError, Stage, TlsFailure,
-    UsageError,
+    AddressError, AddressPart, BuildError, ConfigError, Disposition, DkimError, Error, ErrorKind,
+    Extension, HeaderError, PayloadError, ProtocolError, RecipientFailure, SinkError, SourceError,
+    Stage, TlsFailure, UsageError,
 };
 pub use message::{
     AutoSubmitted, Message, MessageBuilder, MessageLimits,
@@ -86,23 +94,24 @@ pub use message::{
         check_header_value, encode_word, fold_header,
     },
     id::RandomSource,
-    part::{Attachment, ContentType, Inline, Multipart, Part, TransferEncoding},
+    part::{Attachment, BodySource, ContentType, Inline, Multipart, Part, TransferEncoding},
     prepared::{Dsn, DsnNotify, DsnPolicy, DsnReturn, Envelope, PreparedMessage},
     sink::{CountingSink, Sink},
 };
 #[cfg(feature = "std")]
-pub use message::{id::OsRandom, sink::IoSink};
+pub use message::{id::OsRandom, part::ReadSource, sink::IoSink};
 pub use proto::{
-    Auth, BodyFlags, Capabilities, ClientName, Credentials, EnhancedCode, Event, MAX_AUTH_LINE,
-    MAX_COMMAND_LINE, MAX_TEXT_LINE, MechanismList, MechanismName, Millis, RecipientPolicy, Reply,
-    ReplyCode, ReplyLimits, ReplyParser, SaslError, Secret, Session, SessionConfig,
-    SessionSecurity, SessionState, TextLossy, Timeouts, TlsInfo, TlsProtocol,
+    Auth, BodyFlags, Capabilities, ClientName, Credentials, CustomMechanism, EnhancedCode, Event,
+    MAX_AUTH_LINE, MAX_COMMAND_LINE, MAX_TEXT_LINE, Mechanism, MechanismList, MechanismName,
+    Millis, RecipientPolicy, Reply, ReplyCode, ReplyLimits, ReplyParser, SaslError, Secret,
+    Session, SessionConfig, SessionSecurity, SessionState, Step, TextLossy, Timeouts, TlsInfo,
+    TlsProtocol,
 };
 
 #[cfg(feature = "client")]
 pub use client::{
-    Client, Report, Security, Server, ServerBuilder, TlsConnector, TlsSetupError, send, send_local,
-    send_prepared,
+    Client, ObservedEvent, Observer, Pool, Report, Security, SecurityEventKind, Server,
+    ServerBuilder, TlsConnector, TlsSetupError, send, send_local, send_prepared,
 };
 #[cfg(target_has_atomic = "64")]
 pub use gate::HourlyLimit;

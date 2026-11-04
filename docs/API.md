@@ -560,8 +560,7 @@ impl DkimSigner {
     pub fn headers(self, names: &[&str]) -> Result<Self, DkimError>;        // replaces the default list
     pub fn oversign(self, names: &[&str]) -> Result<Self, DkimError>;
     pub fn expiry(self, seconds: u32) -> Self;                              // x = t + seconds
-    pub fn identity(self, address: Address) -> Result<Self, DkimError>;      // i=, inside d= or a subdomain
-    pub fn allow_rsa_1024(self, allow: bool) -> Self;
+    pub fn identity(self, address: &Address) -> Result<Self, DkimError>;     // i=, inside d= or a subdomain
     pub fn sign(&self, message: &[u8], now_unix: u64) -> Result<String, DkimError>;   // the header line
     pub fn sign_into(&self, message: &[u8], now_unix: u64, out: &mut Vec<u8>) -> Result<(), DkimError>;
 }
@@ -578,7 +577,7 @@ pub enum DkimError {
 | Item | Behaviour | Errors | Cost | Grade | Tier | Ver |
 |---|---|---|---|---|---|---|
 | `DkimKey::ed25519_*` | loads through crypt-io `sign-ed25519`; the seed form serves keys stored in key-vault | `KeyFormat` | 20 µs to load **[est.]** | P0 | 2 | 0.5 |
-| `DkimKey::rsa_from_pem`, `rsa_from_der` | PKCS#8 or PKCS#1; modulus at least 2048 bits by default (RFC 8301 3.2 SHOULD), 1024 with `allow_rsa_1024`, at most 4096 (RFC 8301: verifiers must handle 1024 to 4096); encrypted PKCS#8 refused | `KeyFormat`, `KeyTooSmall`, `KeyTooLarge` | 100 µs to load **[est.]** | P0 | 2 | 0.5 |
+| `DkimKey::rsa_from_pem`, `rsa_from_der` | PKCS#8 or PKCS#1; modulus 2048 bits or more (RFC 8301 3.2 SHOULD; D-066), at most 4096 (RFC 8301: verifiers must handle 1024 to 4096); encrypted PKCS#8 refused | `KeyFormat`, `KeyTooSmall`, `KeyTooLarge` | 100 µs to load **[est.]** | P0 | 2 | 0.5 |
 | `DkimKey::algorithm` | which `a=` value the key produces | none | 0 alloc | P1 | 2 | 0.5 |
 | `DkimKey::dns_record` | Ed25519: `v=DKIM1; k=ed25519; p=<44 base64 characters>` (RFC 8463 4.2); RSA: `v=DKIM1; k=rsa; p=<base64 SubjectPublicKeyInfo>`; the docs say RSA records above 255 octets are published as several TXT strings | none | 1 alloc | P2 | 2 | 0.5 |
 | `DkimSigner::new` | domain validated as a `Domain`; selector as dot-separated LDH labels; defaults: relaxed/relaxed, the 7.10 header and oversign lists, no `x=`, no `i=` | `InvalidDomain`, `InvalidSelector` | 2 alloc | P0 | 2 | 0.5 |
@@ -586,7 +585,6 @@ pub enum DkimError {
 | `DkimSigner::headers`, `oversign` | replace the lists; `from` always kept even if omitted; names validated | `InvalidHeaderName` | 1 alloc | P2 | 2 | 0.5 |
 | `DkimSigner::expiry` | adds `x=` | none | 0 alloc | P2 | 2 | 0.5 |
 | `DkimSigner::identity` | adds `i=`; refused outside `d=` (RFC 6376 3.5) | `IdentityOutsideDomain` | 1 alloc | P3 | 2 | 0.5 |
-| `DkimSigner::allow_rsa_1024` | lowers the RSA floor to the RFC 8301 MUST of 1024 bits | none | 0 alloc | P2 | 2 | 0.5 |
 | `DkimSigner::sign` | parses the header block (bounded at 64 KiB); streams the body through the body canonicalizer into SHA-256; builds `h=` from present headers plus oversigned names; hashes the selected headers bottom-up per RFC 6376 5.4.2, then the signature header with empty `b=`; signs; folds; returns the complete header line with CRLF | `MissingFrom`, `HeaderBlockTooLarge`, `MalformedMessage`, `Signing` | Ed25519: 25 µs plus hashing; RSA-2048: 1.5 ms plus hashing **[est.]**; body hashing at SHA-256 speed (about 1.5 GB/s with SHA-NI **[est.]**) | P0 | 2 | 0.5 |
 | `DkimSigner::sign_into` | appends to a caller buffer | as `sign` | 0 alloc with capacity | P2 | 3 | 0.5 |
 | `BodyCanonicalizer`, `HeaderCanonicalizer` | streaming canonicalizers, correct at every split point; `no_std` | none | relaxed body at least 2 GB/s before hashing **[est.]** | P1 | 3 | 0.5 |
@@ -749,7 +747,7 @@ pub trait Observer: Send + Sync { fn event(&self, event: &ObservedEvent<'_>); }
     Connected { peer: core::net::SocketAddr }, Secure { protocol: TlsProtocol },
     Reply { stage: Stage, code: ReplyCode, enhanced: Option<EnhancedCode> },
     Delivered { message_id: &'a str, accepted: usize, rejected: usize, elapsed: Duration },
-    Failed { stage: Stage, disposition: Disposition, possibly_delivered: bool },
+    Failed { stage: Option<Stage>, disposition: Disposition, possibly_delivered: bool },
     SecurityEvent { kind: SecurityEventKind },
 }
 ```
@@ -757,7 +755,7 @@ pub trait Observer: Send + Sync { fn event(&self, event: &ObservedEvent<'_>); }
 | Item | Behaviour | Errors | Cost | Grade | Tier | Ver |
 |---|---|---|---|---|---|---|
 | `Observer`, `ObservedEvent` | never receives secrets or bodies; reply text excluded (codes only) | none | one virtual call per event | P2 | 3 | 0.5 |
-| `SecurityEventKind` | `StartTlsMissing`, `StartTlsInjection`, `CertificateRejected`, `MalformedReply`, `ReplyBudgetExceeded`, for bouncer-io or the error core | none | none | P2 | 3 | 0.5 |
+| `SecurityEventKind` | `StartTlsMissing`, `StartTlsInjection`, `CertificateRejected`, `MalformedReply`, `ReplyBudgetExceeded`, `AuthExchange`, `PlaintextRefused`, `Other`, for bouncer-io or the error core | none | none | P2 | 3 | 0.5 |
 
 ### 8.12 Errors
 
@@ -1046,3 +1044,13 @@ Each change is recorded in `dev/PLAN.md` section 19.
 | 0.4.0 | `ErrorKind::{Tls, Throttled, AuthUnavailable, AuthFailed, Sasl, Payload}`; `ConfigError::{TooManyMechanisms, InsecureNotAllowed}` | none |
 | 0.4.0 | Test support: `TestTls`, `TestServerBuilder::{starttls, implicit_tls, tls_name, tls_engine, auth}`, `TestServer::server_builder`, `ReceivedMessage::{rcpt_parameters, secure, chunked, user}`, `Fault::RejectCertificate`, transcripts take `C: <RAW n>` | D-059 |
 | 0.4.0 | Fixed: `Address` equality compares the whole address; `MessageBuilder::date_unix` is honoured | D-062 |
+| 0.5.0 | No `DkimSigner::allow_rsa_1024`: crypt-io refuses RSA under 2048 bits; `KeyTooSmall` reports the size. New: `DkimKey::rsa_bits`, `DkimSigner::{domain, selector, key}`, `DKIM_RSA_MIN_BITS`, `DKIM_RSA_MAX_BITS`, `Canonicalization::name`, `DkimAlgorithm::name`; `identity` takes `&Address` | D-066 |
+| 0.5.0 | The canonicalizers build without the `dkim` feature (`no_std`); `HeaderCanonicalizer::new(mode)` and `canonicalize(field, &mut Vec<u8>)`; `BodyCanonicalizer::{new, update, finish}` with an output closure | D-067 |
+| 0.5.0 | New: `PreparedMessage::sign(self, signers, now_unix)` signs raw input (FR-53); `Message::prepare_signed` is `prepare` then `sign`; `ServerBuilder::dkim` (at most 4, `Config(TooManyDkimSigners)`) | D-068 |
+| 0.5.0 | `Credentials::{OAuth2, Custom}`, `Credentials::oauth2`; `MechanismName::{XOAuth2, ScramSha256, Other}`; the default allowlist is `[ScramSha256 (feature scram), Plain, Login, XOAuth2, Other]` filtered by credential kind; `Auth::scram_nonce`; `SaslError::{InvalidServerMessage, ServerNonceMismatch, IterationsOutOfRange, ServerSignatureMismatch, ServerError, NonAsciiCredential, NonceMissing, ResponseTooLong, InvalidMechanismName, Custom}` | D-072, D-073 |
+| 0.5.0 | `Error::auth_detail` gives the XOAUTH2 error status (the sketched `AuthFailed { reply, detail }` is `AuthFailed` with `Error::reply` and `Error::auth_detail`) | D-074 |
+| 0.5.0 | `Mechanism`, `Step`, and `CustomMechanism::{new, name}` (a factory; names checked) for `Credentials::Custom`; `verify_success` gets `None` (SMTP carries no success data) | D-075 |
+| 0.5.0 | `ServerBuilder::observer`; `Event::Reply` and `SessionConfig::reply_events` (opt-in); `ObservedEvent::Failed.stage` is `Option<Stage>`; `SecurityEventKind::{AuthExchange, PlaintextRefused, Other}` | D-076 |
+| 0.5.0 | `Pool::{new, wait_limit, send, send_prepared, idle, server}`; `ErrorKind::PoolExhausted`; `ConfigError::PoolSize` | D-077 |
+| 0.5.0 | `Attachment::from_source` (feature `std`), `Attachment::{len, is_empty, is_streamed}`, `BodySource` returning `SourceError`, `ReadSource`; `ErrorKind::Source(SourceError)` | D-078 |
+| 0.5.0 | Test support: `TestServerBuilder::oauth2`, SCRAM-SHA-256 in `TestServer` with the `scram` feature, `Fault::BadScramSignature`, transcripts take `C: <EMPTY>` | none |

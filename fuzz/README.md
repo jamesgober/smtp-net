@@ -8,4 +8,5 @@ cargo +nightly fuzz run reply -- -max_total_time=3600
 ```
 
 Targets: `reply`, `ehlo`, `session_server_bytes`, `address`, `content_type`,
-`header_value`, `raw_message`, `transcript`, `prepared_decode`.
+`header_value`, `raw_message`, `transcript`, `prepared_decode`, `dkim`, `sasl`. The
+`dkim` target builds AWS-LC (C) through crypt-io; it needs a C compiler.

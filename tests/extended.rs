@@ -225,7 +225,13 @@ fn test_auth_plain_over_starttls_and_redacted_transcript() {
         .auth("mailer@example.com", "s3cr3t-pass")
         .start()
         .unwrap();
-    smtp_net::send(&server.server(), &msg("a@example.org")).unwrap();
+    let plain = server
+        .server_builder()
+        .mechanisms(&[MechanismName::Plain])
+        .unwrap()
+        .build()
+        .unwrap();
+    smtp_net::send(&plain, &msg("a@example.org")).unwrap();
     let got = &server.received()[0];
     assert_eq!(got.user.as_deref(), Some("mailer@example.com"));
     let t = server.transcript();
@@ -422,11 +428,15 @@ fn test_hourly_limit_throttles_and_refunds() {
     assert!(e.retry_after().unwrap() > Duration::from_secs(3000));
     assert_eq!(server.received().len(), 1);
 
-    // A send that fails before anything was accepted gives its allowance back.
-    let refused = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
+    // A send that fails before anything was accepted gives its allowance
+    // back. (A closed port could be taken by a parallel test's server.)
+    let busy = TestServer::builder()
+        .fault(Fault::ReplyAt {
+            stage: Stage::Mail,
+            reply: "451 4.3.0 try later",
+        })
+        .start()
+        .unwrap();
     let limit = std::sync::Arc::new(HourlyLimit::messages(1));
     struct Shared(std::sync::Arc<HourlyLimit>);
     impl SendGate for Shared {
@@ -437,8 +447,8 @@ fn test_hourly_limit_throttles_and_refunds() {
             self.0.refund(n, t)
         }
     }
-    let down = Server::builder("127.0.0.1", Security::PlaintextLoopback)
-        .port(refused)
+    let down = busy
+        .server_builder()
         .gate(Shared(limit.clone()))
         .build()
         .unwrap();

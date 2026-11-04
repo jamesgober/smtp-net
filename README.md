@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: extended (<code>0.4.0</code>).</strong> Message building, the sans-IO session, submission to the local mail server, and STARTTLS and implicit TLS relays with AUTH work and are tested, with job payloads, pacing, CHUNKING, and DSN. DKIM, XOAUTH2, and SCRAM arrive in <code>0.5.0</code>. The full API is in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: feature complete (<code>0.5.0</code>).</strong> Message building, the sans-IO session, submission to the local mail server, STARTTLS and implicit TLS relays, AUTH (SCRAM-SHA-256, PLAIN, LOGIN, XOAUTH2), DKIM signing with Ed25519 and RSA, job payloads, pacing, a connection pool, CHUNKING, and DSN work and are tested. <code>0.6.0</code> measures and tunes performance. The full API is in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -40,13 +40,19 @@
 
 ```toml
 [dependencies]
-smtp-net = "0.4"
+smtp-net = "0.5"
 ```
 
 The default features include TLS through tls-net (rustls). For submission to a mail server on the same machine only, without building rustls:
 
 ```toml
-smtp-net = { version = "0.4", default-features = false, features = ["client"] }
+smtp-net = { version = "0.5", default-features = false, features = ["client"] }
+```
+
+With DKIM signing and SCRAM-SHA-256:
+
+```toml
+smtp-net = { version = "0.5", features = ["dkim", "scram"] }
 ```
 
 ## Quick start
@@ -73,10 +79,39 @@ let report = smtp_net::send(&server, &msg)?;
 assert!(report.was_secure());
 ```
 
+DKIM: sign every message a server sends, with Ed25519 and RSA under two selectors; `DkimKey::dns_record()` gives the TXT record to publish (see [`docs/DELIVERABILITY.md`](./docs/DELIVERABILITY.md) for SPF, DKIM, and DMARC):
+
+```rust
+let rsa = smtp_net::DkimKey::rsa_from_pem(&std::fs::read_to_string("dkim-rsa.pem")?)?;
+let ed = smtp_net::DkimKey::ed25519_from_pkcs8_pem(&std::fs::read_to_string("dkim-ed25519.pem")?)?;
+let server = smtp_net::Server::starttls("mail.example.com")
+    .login("no-reply@example.com", password)       // SCRAM-SHA-256 when offered, else PLAIN
+    .to_builder()
+    .dkim(smtp_net::DkimSigner::new("example.com", "rsa2026", rsa)?)
+    .dkim(smtp_net::DkimSigner::new("example.com", "ed2026", ed)?)
+    .build()?;
+```
+
+OAuth 2.0 (Gmail, Microsoft 365): pass the access token; getting and refreshing it is the caller's job, and `Error::auth_detail()` gives the server's status (`"401"` for an expired token):
+
+```rust
+let server = smtp_net::Server::starttls("smtp.gmail.com")
+    .to_builder()
+    .credentials(smtp_net::Credentials::oauth2("no-reply@example.com", access_token))
+    .build()?;
+```
+
+Many threads, a few connections: `Pool` reuses connections and replaces ones that failed or sat idle:
+
+```rust
+let pool = std::sync::Arc::new(smtp_net::Pool::new(server, 4)?);
+pool.send(&msg)?;                                   // from any thread
+```
+
 For a job system, build once in the request handler and send the stored payload from the worker; retries send the same bytes and `Message-ID`:
 
 ```rust
-let payload = msg.prepare()?.encode();                        // stored with the job
+let payload = msg.prepare_signed(&signers, now_unix)?.encode(); // stored with the job
 let prepared = smtp_net::PreparedMessage::decode(&payload)?;  // a damaged payload is refused
 smtp_net::send_prepared(&server, &prepared)?;
 ```
@@ -115,9 +150,13 @@ The protocol core is a sans-IO `Session` (bytes in, bytes out, events and deadli
 | `std` | yes | OS random source, system clock, `std::error::Error`, `IoSink` |
 | `client` | yes | the blocking driver over net-io: `send`, `send_local`, `send_prepared`, `Client`, `Server` |
 | `tls` | yes | STARTTLS and implicit TLS with tls-net (rustls, Mozilla roots or a private CA) |
+| `dkim` | no | DKIM signing with Ed25519-SHA256 and RSA-SHA256 through crypt-io (AWS-LC; needs a C compiler) |
+| `scram` | no | SCRAM-SHA-256 (pure Rust, `no_std`); first in the default mechanism list when on |
 | `testing` | no | `TestServer` (loopback SMTP server with fault injection, AUTH, BDAT, TLS), `ScriptedServer`, `Transcript` |
 
-Without default features the core (addresses, messages, the session) is `no_std` with `alloc`.
+Without default features the core (addresses, messages, the session, the DKIM canonicalizers) is `no_std` with `alloc`.
+
+How the crate fits together is in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
 
 ## Scope
 

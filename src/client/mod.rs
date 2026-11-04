@@ -1,5 +1,8 @@
 //! The blocking driver over net-io (PLAN 7.12).
 
+mod observe;
+mod pool;
+mod slots;
 mod tls;
 
 use std::{
@@ -12,6 +15,8 @@ use std::{
 };
 
 use net_io::{ConnectOptions, Limits, MinRate, NetError, TcpConnection};
+pub use observe::{ObservedEvent, Observer, SecurityEventKind};
+pub use pool::Pool;
 use tls::{Read, TlsLink};
 pub use tls::{TlsConnector, TlsSetupError};
 
@@ -96,23 +101,74 @@ pub struct Server {
     tls: Option<Arc<dyn TlsConnector>>,
     insecure: bool,
     gate: Option<Arc<dyn SendGate>>,
+    observer: Option<Arc<dyn Observer>>,
+    #[cfg(feature = "dkim")]
+    dkim: Vec<crate::DkimSigner>,
 }
+
+/// Most DKIM signers on one server (an RSA and an Ed25519 pair, twice
+/// during a key rotation).
+#[cfg(feature = "dkim")]
+const MAX_DKIM_SIGNERS: usize = 4;
 
 impl core::fmt::Debug for Server {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Server")
-            .field("host", &self.host)
+        let mut d = f.debug_struct("Server");
+        d.field("host", &self.host)
             .field("port", &self.port)
             .field("security", &self.security)
             .field("auth", &self.auth)
             .field("tls_connector", &self.tls.is_some())
             .field("insecure", &self.insecure)
             .field("gate", &self.gate.is_some())
-            .finish()
+            .field("observer", &self.observer.is_some());
+        #[cfg(feature = "dkim")]
+        d.field("dkim", &self.dkim);
+        d.finish()
     }
 }
 
 impl Server {
+    fn notify(&self, event: &ObservedEvent<'_>) {
+        if let Some(o) = &self.observer {
+            o.event(event);
+        }
+    }
+
+    /// Tells the observer how a send ended.
+    fn observe(&self, message: &PreparedMessage, result: &Result<Report, Error>) {
+        if self.observer.is_none() {
+            return;
+        }
+        match result {
+            Ok(r) => self.notify(&ObservedEvent::Delivered {
+                message_id: message.message_id().unwrap_or(""),
+                accepted: r.accepted.len(),
+                rejected: r.rejected.len(),
+                elapsed: r.elapsed,
+            }),
+            Err(e) => {
+                self.notify(&ObservedEvent::Failed {
+                    stage: e.stage(),
+                    disposition: e.disposition(),
+                    possibly_delivered: e.possibly_delivered(),
+                });
+                if let Some(kind) = SecurityEventKind::of(e) {
+                    self.notify(&ObservedEvent::SecurityEvent { kind });
+                }
+            }
+        }
+    }
+
+    /// Serializes `message`, signed by the server's DKIM signers if it has any (O-23).
+    fn prepare(&self, message: &Message) -> Result<PreparedMessage, Error> {
+        #[cfg(feature = "dkim")]
+        if !self.dkim.is_empty() {
+            return message.prepare_signed(&self.dkim, now_unix_ms() / 1000);
+        }
+        message.prepare()
+    }
+
     fn base(host: &str, security: Security) -> Server {
         Server {
             host: String::from(host),
@@ -136,6 +192,9 @@ impl Server {
             },
             insecure: false,
             gate: None,
+            observer: None,
+            #[cfg(feature = "dkim")]
+            dkim: Vec::new(),
         }
     }
 
@@ -298,6 +357,13 @@ impl ServerBuilder {
         self
     }
 
+    /// An observer for structured events (connections, TLS, reply codes,
+    /// outcomes); it never sees secrets, bodies, or reply text.
+    pub fn observer(mut self, observer: impl Observer + 'static) -> Self {
+        self.server.observer = Some(Arc::new(observer));
+        self
+    }
+
     /// A pacing gate, asked before connecting and before each transaction.
     pub fn gate(mut self, gate: impl SendGate + 'static) -> Self {
         self.server.gate = Some(Arc::new(gate));
@@ -319,6 +385,16 @@ impl ServerBuilder {
     /// The policy for refused recipients (default `Any`).
     pub fn recipient_policy(mut self, policy: RecipientPolicy) -> Self {
         self.server.recipient_policy = policy;
+        self
+    }
+
+    /// A DKIM signer applied by [`send`] and [`Client::send`] to every
+    /// message built here; repeat for several signatures (at most 4).
+    /// [`send_prepared`] never signs: sign before storing the payload
+    /// ([`Message::prepare_signed`]).
+    #[cfg(feature = "dkim")]
+    pub fn dkim(mut self, signer: crate::DkimSigner) -> Self {
+        self.server.dkim.push(signer);
         self
     }
 
@@ -354,6 +430,10 @@ impl ServerBuilder {
         }
         if s.insecure && !loopback && !self.insecure_remote {
             return Err(ConfigError::InsecureNotAllowed.into());
+        }
+        #[cfg(feature = "dkim")]
+        if s.dkim.len() > MAX_DKIM_SIGNERS {
+            return Err(ConfigError::TooManyDkimSigners.into());
         }
         if let Some(c) = self.credentials {
             s.auth = Some(Auth::new(c));
@@ -464,7 +544,7 @@ fn refund_on(server: &Server, message: &PreparedMessage, e: &Error) {
 /// # Ok::<(), smtp_net::Error>(())
 /// ```
 pub fn send(server: &Server, message: &Message) -> Result<Report, Error> {
-    send_prepared(server, &message.prepare()?)
+    send_prepared(server, &server.prepare(message)?)
 }
 
 /// Sends already prepared bytes (the job path): never re-serializes or
@@ -498,6 +578,7 @@ pub fn send_prepared(server: &Server, message: &PreparedMessage) -> Result<Repor
     if let Err(e) = &result {
         refund_on(server, message, e);
     }
+    server.observe(message, &result);
     result
 }
 
@@ -629,6 +710,9 @@ impl Client {
         let options = ConnectOptions::new().timeout(t.connect).limits(limits);
         let tcp = TcpConnection::connect_host(&server.host, server.port, options)
             .map_err(|e| Error::new(ErrorKind::Connect(net_kind(e))).at(Stage::Connect))?;
+        server.notify(&ObservedEvent::Connected {
+            peer: tcp.peer_addr(),
+        });
         let peer_is_loopback = tcp.peer_addr().ip().is_loopback();
         let security = match server.security {
             Security::PlaintextLoopback if peer_is_loopback => {
@@ -652,6 +736,7 @@ impl Client {
             pipelining: server.pipelining,
             chunking: server.chunking,
             recipient_policy: server.recipient_policy,
+            reply_events: server.observer.is_some(),
             ..SessionConfig::default()
         };
         let session = Session::new(config, Millis(0))?;
@@ -776,6 +861,9 @@ impl Client {
         match link.handshake(&mut conn.tcp, deadline, &mut early) {
             Ok(info) => {
                 conn.tls = Some(link);
+                self.server.notify(&ObservedEvent::Secure {
+                    protocol: info.protocol,
+                });
                 let now = self.now();
                 self.session.tls_established(info, now)?;
                 if !early.is_empty() {
@@ -796,13 +884,31 @@ impl Client {
         }
     }
 
+    /// The next session event; reply events go to the observer.
+    fn poll(&mut self) -> Option<Event> {
+        loop {
+            match self.session.poll_event()? {
+                Event::Reply {
+                    stage,
+                    code,
+                    enhanced,
+                } => self.server.notify(&ObservedEvent::Reply {
+                    stage,
+                    code,
+                    enhanced,
+                }),
+                other => return Some(other),
+            }
+        }
+    }
+
     fn until_ready(&mut self) -> Result<(), Error> {
         if self.session.state() == SessionState::NeedTls {
             self.start_tls()?;
         }
         loop {
             self.flush()?;
-            while let Some(event) = self.session.poll_event() {
+            while let Some(event) = self.poll() {
                 match event {
                     Event::Ready { .. } => return Ok(()),
                     Event::Closed { error } => {
@@ -830,7 +936,7 @@ impl Client {
     ///
     /// Every send error; see [`send`].
     pub fn send(&mut self, message: &Message) -> Result<Report, Error> {
-        let prepared = message.prepare()?;
+        let prepared = self.server.prepare(message)?;
         self.send_prepared(&prepared)
     }
 
@@ -849,6 +955,7 @@ impl Client {
         if let Err(e) = &result {
             refund_on(&self.server, message, e);
         }
+        self.server.observe(message, &result);
         result
     }
 
@@ -975,7 +1082,7 @@ impl Client {
                 }
             }
             self.flush()?;
-            while let Some(event) = self.session.poll_event() {
+            while let Some(event) = self.poll() {
                 match event {
                     Event::RecipientAccepted { index } => {
                         if let Some(a) = envelope.recipients().get(index) {
@@ -1039,7 +1146,7 @@ impl Client {
         while self.session.wants_read() {
             self.read()?;
         }
-        while let Some(e) = self.session.poll_event() {
+        while let Some(e) = self.poll() {
             if let Event::Closed { error: Some(e) } = e {
                 return Err(e);
             }

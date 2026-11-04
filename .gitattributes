@@ -3,6 +3,7 @@
 # checks source out with CRLF, and `cargo fmt --all -- --check` fails because
 # `rustfmt.toml` pins `newline_style = "Unix"`.
 * text=auto eol=lf
+*.der binary
 
 # Keep development-only paths out of `git archive` source tarballs.
 /.dev             export-ignore

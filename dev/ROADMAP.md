@@ -47,13 +47,16 @@ Depends on: net-io (TLS seam, published). For the external relay check: tls-net 
 - [x] Feature `tls` with tls-net 0.3's connector (default, D-051); real TLS tests with fixture certificates on every platform; CI interop against Mailpit with real STARTTLS and implicit TLS, verified against a private CA (D-064). A public relay (Gmail, Microsoft 365) needs James's credentials: part of the 0.8 field test.
 - [x] Job-contract test against a stub of task-io's handler contract until task-io publishes (D-065).
 
-## v0.5.0 - Feature complete
+## v0.5.0 - Feature complete - DONE
 Exit: every P0, P1, P2 item present (or its move recorded here with a reason); DKIM passes at Gmail and Outlook.com (`Authentication-Results: dkim=pass` for both algorithms where the receiver supports Ed25519); RFC 6376 and RFC 8463 vectors pass; T-19 to T-22, T-29, T-31 pass.
-Depends on: crypt-io 1.3 with `sign-ed25519`, `sign-rsa`, `kdf-pbkdf2` (published 2026-11-04; its RSA keys start at 2048 bits, so `allow_rsa_1024` has nothing to allow and is decided at 0.5); key-vault optional.
-- [ ] DKIM (API 8.7): Ed25519-SHA256, RSA-SHA256, relaxed and simple, oversigning, several signatures, DNS records, raw input; `Message::prepare_signed`, `ServerBuilder::dkim`.
-- [ ] XOAUTH2 (D-007); SCRAM-SHA-256; the `Mechanism` trait.
-- [ ] `Pool` (loom model); `Observer`; `Attachment::from_source`, `BodySource`.
-- [ ] `docs/DELIVERABILITY.md`, `docs/ARCHITECTURE.md`.
+Depends on: crypt-io 1.3 with `sign-ed25519`, `sign-rsa`, `kdf-pbkdf2` (published 2026-11-04); key-vault optional (not used: keys load from the seed or PKCS#8 bytes a vault hands over).
+- [x] DKIM (API 8.7): Ed25519-SHA256, RSA-SHA256, relaxed and simple, oversigning, several signatures, DNS records, raw input; `Message::prepare_signed`, `PreparedMessage::sign`, `ServerBuilder::dkim`. RFC 8463 Appendix A reproduced byte for byte; every signature checked by dkimpy in CI (D-070).
+- [x] `allow_rsa_1024`: not offered; crypt-io starts RSA at 2048 bits (D-066).
+- [x] XOAUTH2 (D-074); SCRAM-SHA-256 with the RFC 7677 exchange as a vector (D-073); the `Mechanism` trait (D-075).
+- [x] `Pool` with loom models (D-077); `Observer` (D-076); `Attachment::from_source`, `BodySource`, `ReadSource` (D-078).
+- [x] `docs/DELIVERABILITY.md`, `docs/ARCHITECTURE.md`.
+- [x] T-19 (no `l=`), T-20 (oversigning, checked by dkimpy), T-21 (key sizes), T-22 (no key in `Debug` or errors), T-29 (constant-time SCRAM check, both paths tested), T-31 (`cargo audit` and `cargo deny` pass with no ignores).
+- Moved to v0.8.0: "DKIM passes at Gmail and Outlook.com" needs a sending domain with the keys in its DNS; it runs with the field test (D-070). Reason: James's domain and DNS.
 
 ## v0.6.0 - Optimisation
 Exit: every target in PLAN 11.1 met, or the miss recorded with the measured number and the reason; `docs/PERFORMANCE.md` published.
@@ -69,6 +72,8 @@ Exit: 1 hour per fuzz target with no finding open; 24-hour soak passes (NFR-14);
 Exit: the first site sends verification and reset mail through task-io and smtp-net in production for two weeks with every failure classified correctly; interop matrix (Exim, Postfix, Mailpit, Microsoft 365, Gmail) green.
 Depends on: task-io in production and the first site live (James).
 - [ ] Field test on the cPanel host's Exim on `127.0.0.1` (moved from 0.3, D-033), Microsoft 365 and Gmail submission; O-21 (what cPanel counts) and O-24 (`Auto-Submitted`) checked.
+- [ ] DKIM at public receivers (moved from 0.5, D-070): `Authentication-Results: dkim=pass` at Gmail and Outlook.com for RSA, and for Ed25519 where the receiver verifies it, from a domain with both keys published.
+- [ ] XOAUTH2 against Gmail and Microsoft 365 with real tokens.
 - [ ] `docs/PLATFORM-NOTES.md`.
 
 ## v0.9.x - Beta and the pre-1.0 polish pass

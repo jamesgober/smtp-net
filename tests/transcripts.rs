@@ -3,7 +3,8 @@
 //!
 //! Header comments in each file configure the run:
 //! `# config:` (`loopback`, `remote-plain`, `starttls`, `implicit`, `policy-all`,
-//! `no-pipelining`), `# envelope:` (recipients), `# raw: 8bit`, `# messages:`
+//! `no-pipelining`, `no-chunking`, `auth`, `auth-login`, `xoauth2`, `scram`
+//! (RFC 7677's example; skipped without the `scram` feature)), `# envelope:` (recipients), `# raw: 8bit`, `# messages:`
 //! (how many copies to send), `# expect:` (`ok`, `temp`, or `perm` per
 //! message), and `# closed:` (`none`, or `temp`/`perm` with `possibly` and
 //! `security`).
@@ -33,7 +34,8 @@ fn header<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
-fn load(path: &Path) -> Case {
+/// The case, or `None` when it needs a feature this build does not have.
+fn load(path: &Path) -> Option<Case> {
     let text = fs::read_to_string(path).unwrap();
     let mut config = SessionConfig::default();
     for word in header(&text, "config:")
@@ -63,6 +65,24 @@ fn load(path: &Path) -> Case {
                         .mechanisms(MechanismList::new(&[MechanismName::Login]).unwrap()),
                 );
             }
+            "xoauth2" => {
+                config.auth = Some(Auth::new(Credentials::oauth2(
+                    "someuser@example.com",
+                    "ya29.vF9dft4qmTc2Nvb3RlckBhdHRhdmlzdGEuY29tCg",
+                )));
+            }
+            #[cfg(feature = "scram")]
+            "scram" => {
+                // RFC 7677 section 3.
+                config.auth = Some(
+                    Auth::new(Credentials::password("user", "pencil"))
+                        .mechanisms(MechanismList::new(&[MechanismName::ScramSha256]).unwrap())
+                        .scram_nonce("rOprNGfwEbeRWgbNEkqO")
+                        .unwrap(),
+                );
+            }
+            #[cfg(not(feature = "scram"))]
+            "scram" => return None,
             other => panic!("{}: unknown config {other}", path.display()),
         }
     }
@@ -120,14 +140,14 @@ fn load(path: &Path) -> Case {
             .map(String::from)
             .collect::<Vec<_>>()
     };
-    Case {
+    Some(Case {
         name: path.file_name().unwrap().to_string_lossy().into_owned(),
         expect: words("expect:"),
         closed: words("closed:"),
         text,
         config,
         messages,
-    }
+    })
 }
 
 fn check(case: &Case, split: usize) {
@@ -191,7 +211,9 @@ fn test_every_transcript_whole_and_split() {
     paths.sort();
     assert!(paths.len() >= 30, "transcripts missing");
     for path in paths {
-        let case = load(&path);
+        let Some(case) = load(&path) else {
+            continue;
+        };
         check(&case, usize::MAX);
         for split in 1..=16 {
             check(&case, split);

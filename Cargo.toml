@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "smtp-net"
-version = "0.4.0"
+version = "0.5.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -59,6 +59,13 @@ client = ["std", "dep:net-io"]
 tls = ["client", "dep:tls-net"]
 # ScriptedServer, TestServer, Fault: test support for this crate's users.
 testing = ["client"]
+# DKIM signing: Ed25519-SHA256 and RSA-SHA256 through crypt-io (AWS-LC
+# behind it, the same backend tls-net uses). The canonicalizers are always
+# built; only the keys and the signer need this feature.
+# SCRAM-SHA-256 (RFC 7677): PBKDF2, HMAC-SHA-256, and SHA-256 through
+# crypt-io (pure Rust). First in the default mechanism list when on.
+scram = ["crypt-io/hash-sha2", "crypt-io/mac-hmac", "crypt-io/kdf-pbkdf2"]
+dkim = ["std", "crypt-io/sign-ed25519", "crypt-io/sign-rsa", "crypt-io/hash-sha2"]
 
 
 # DEPENDENCIES
@@ -69,12 +76,12 @@ testing = ["client"]
 parse-net = { version = "0.9", default-features = false, features = ["alloc"] }
 # OS CSPRNG for Message-ID and MIME boundaries. First party, no dependencies.
 mod-rand = { version = "1", default-features = false, features = ["tier3"], optional = true }
-# Wipes credentials on drop (Zeroizing). Only the `zeroize` feature: the
-# audited-cryptography exception, nothing else (dev/PLAN.md D-050).
-crypt-io = { version = "1.2", default-features = false, features = ["zeroize"] }
+# Wipes credentials on drop (Zeroizing); with `dkim`, Ed25519 and RSA
+# signing and SHA-256. The audited-cryptography exception (dev/PLAN.md D-050).
+crypt-io = { version = "1.3", default-features = false, features = ["zeroize"] }
 # TLS: rustls through tls-net (the accepted exception), Mozilla roots,
 # aws-lc-rs provider, the net-io seam.
-tls-net = { version = "0.3", default-features = false, features = ["aws-lc", "webpki-roots", "net-io"], optional = true }
+tls-net = { version = "0.5", default-features = false, features = ["aws-lc", "webpki-roots", "net-io"], optional = true }
 # Outbound TCP with deadlines, and the sans-IO TLS seam. First party, no dependencies.
 net-io = { version = "0.6", default-features = false, optional = true }
 
@@ -84,7 +91,7 @@ net-io = { version = "0.6", default-features = false, optional = true }
 [dev-dependencies]
 # The tls_real test builds net-io TLS sessions for the test server.
 net-io = { version = "0.6", default-features = false }
-tls-net = { version = "0.3", default-features = false, features = ["aws-lc", "webpki-roots", "net-io"] }
+tls-net = { version = "0.5", default-features = false, features = ["aws-lc", "webpki-roots", "net-io"] }
 # Property tests only; never a runtime dependency.
 proptest = { version = "1", default-features = false, features = ["std"] }
 
@@ -101,6 +108,14 @@ required-features = ["testing"]
 name = "prepared_job"
 required-features = ["testing"]
 
+[[example]]
+name = "dkim_dns_record"
+required-features = ["dkim"]
+
+[[example]]
+name = "send_with_dkim"
+required-features = ["testing", "dkim"]
+
 [[test]]
 name = "interop"
 required-features = ["client"]
@@ -116,6 +131,18 @@ required-features = ["testing"]
 [[test]]
 name = "extended"
 required-features = ["testing"]
+
+[[test]]
+name = "auth"
+required-features = ["testing"]
+
+[[test]]
+name = "pool"
+required-features = ["testing"]
+
+[[test]]
+name = "dkim"
+required-features = ["testing", "dkim"]
 
 [[test]]
 name = "tls_real"
