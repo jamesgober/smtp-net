@@ -1,0 +1,22 @@
+# FR-42: 452 4.5.3 defers the recipient to a further transaction; the first is delivered.
+# config: loopback
+# envelope: b@example.org, c@example.org
+# expect: ok
+# closed: none
+S: 220 mx.example.com ESMTP
+C: EHLO [127.0.0.1]
+S: 250-mx.example.com
+S: 250-PIPELINING
+S: 250 ENHANCEDSTATUSCODES
+C: MAIL FROM:<a@example.com>
+C: RCPT TO:<b@example.org>
+C: RCPT TO:<c@example.org>
+C: DATA
+S: 250 2.1.0 ok
+S: 250 2.1.5 ok
+S: 452 4.5.3 too many recipients
+S: 354 go
+C: <BODY>
+S: 250 2.0.0 queued
+C: QUIT
+S: 221 bye

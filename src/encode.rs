@@ -135,6 +135,98 @@ pub(crate) fn base32(bytes: &[u8], out: &mut [u8]) -> usize {
     n
 }
 
+/// Decodes strict base64 (standard alphabet, padded, no whitespace) into
+/// `out`, appending. Used for AUTH challenges; budgets are the caller's.
+pub(crate) fn base64_decode(input: &[u8], out: &mut alloc::vec::Vec<u8>) -> Result<(), ()> {
+    if input.len() % 4 != 0 {
+        return Err(());
+    }
+    let val = |c: u8| -> Result<u32, ()> {
+        match c {
+            b'A'..=b'Z' => Ok(u32::from(c - b'A')),
+            b'a'..=b'z' => Ok(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Ok(u32::from(c - b'0') + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(()),
+        }
+    };
+    let quads = input.len() / 4;
+    for (i, q) in input.chunks(4).enumerate() {
+        let last = i + 1 == quads;
+        let (a, b, c, d) = (
+            q.first().copied().unwrap_or(0),
+            q.get(1).copied().unwrap_or(0),
+            q.get(2).copied().unwrap_or(0),
+            q.get(3).copied().unwrap_or(0),
+        );
+        let pad = match (c, d) {
+            (b'=', b'=') if last => 2,
+            (_, b'=') if last => 1,
+            _ => 0,
+        };
+        if pad < 2 && c == b'=' {
+            return Err(());
+        }
+        let n = (val(a)? << 18)
+            | (val(b)? << 12)
+            | (if pad == 2 { 0 } else { val(c)? << 6 })
+            | (if pad >= 1 { 0 } else { val(d)? });
+        // Non-canonical padding bits are refused: one text, one meaning.
+        if (pad == 2 && n & 0xffff != 0) || (pad == 1 && n & 0xff != 0) {
+            return Err(());
+        }
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad == 0 {
+            out.push(n as u8);
+        }
+    }
+    Ok(())
+}
+
+/// Encodes `input` as one unbroken base64 string, appended to `out`.
+pub(crate) fn base64_append(input: &[u8], out: &mut alloc::vec::Vec<u8>) {
+    let mut buf = [0u8; MIME_LINE_LENGTH];
+    for line in input.chunks(B64_LINE_INPUT) {
+        let n = base64_line(line, &mut buf);
+        out.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+    }
+}
+
+/// CRC-32C (Castagnoli, reflected polynomial 0x82F63B78), table-driven (D-028).
+pub(crate) fn crc32c(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        let i = usize::from((crc as u8) ^ b);
+        crc = (crc >> 8) ^ CRC32C_TABLE.get(i).copied().unwrap_or(0);
+    }
+    !crc
+}
+
+#[allow(clippy::indexing_slicing)] // const evaluation: the index is below 256
+const CRC32C_TABLE: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0x82F6_3B78
+            } else {
+                c >> 1
+            };
+            k += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+};
+
 /// Streaming state for [`quoted_printable_encode`].
 ///
 /// Holds what the encoder cannot decide yet: whitespace that must be encoded
@@ -448,6 +540,44 @@ mod tests {
             }
             assert!(!out.ends_with(b"\r\n"));
         }
+    }
+
+    #[test]
+    fn test_base64_decode_strict() {
+        let mut out = Vec::new();
+        base64_decode(b"Zm9vYmFy", &mut out).unwrap();
+        assert_eq!(out, b"foobar");
+        out.clear();
+        base64_decode(b"Zm8=", &mut out).unwrap();
+        assert_eq!(out, b"fo");
+        out.clear();
+        base64_decode(b"", &mut out).unwrap();
+        assert!(out.is_empty());
+        for bad in [
+            &b"Zm8"[..],
+            b"Zm=8",
+            b"Z===",
+            b"Zm9v YmFy",
+            b"Zm9=",
+            b"Zh==",
+            b"=Zm9",
+            b"Zm8=Zm8=",
+        ] {
+            assert!(base64_decode(bad, &mut Vec::new()).is_err(), "{bad:?}");
+        }
+        let mut enc = Vec::new();
+        base64_append(&[0u8, 1, 2, 250, 251, 252, 253], &mut enc);
+        let mut back = Vec::new();
+        base64_decode(&enc, &mut back).unwrap();
+        assert_eq!(back, [0u8, 1, 2, 250, 251, 252, 253]);
+    }
+
+    #[test]
+    fn test_crc32c_known_vectors() {
+        assert_eq!(crc32c(b""), 0);
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+        assert_eq!(crc32c(&[0u8; 32]), 0x8A91_36AA);
+        assert_eq!(crc32c(&[0xffu8; 32]), 0x62A8_AB43);
     }
 
     #[test]

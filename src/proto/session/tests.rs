@@ -277,9 +277,123 @@ impl Session {
             caps: self.caps.clone(),
             secure: self.secure,
             tls_protocol: self.tls_protocol,
+            exchange: self.exchange.clone(),
+            authenticated: self.authenticated,
+            secret_out: self.secret_out,
             txn: self.txn.clone(),
             body_deadline: self.body_deadline,
             group: self.group,
         }
     }
+}
+
+fn chunking_ready() -> Session {
+    ready(b"250-mx\r\n250-PIPELINING\r\n250 CHUNKING\r\n")
+}
+
+#[test]
+fn test_bdat_one_write_and_exact_size() {
+    let mut s = chunking_ready();
+    s.begin(&envelope(1), BodyFlags::default(), 6, Millis(3))
+        .unwrap();
+    assert!(matches!(s.poll_event(), Some(Event::BodyWanted)));
+    assert_eq!(s.state(), SessionState::Body);
+    assert_eq!(
+        s.body(b".x\r\n.\r", Millis(4)).unwrap(),
+        6,
+        "no dot-stuffing in BDAT"
+    );
+    s.end_body(Millis(5)).unwrap_err();
+}
+
+#[test]
+fn test_bdat_size_mismatch_refused() {
+    let mut s = chunking_ready();
+    s.begin(&envelope(1), BodyFlags::default(), 4, Millis(3))
+        .unwrap();
+    let e = s.body(b"12345", Millis(4)).unwrap_err();
+    assert!(matches!(
+        e.kind(),
+        ErrorKind::Build(BuildError::LengthMismatch {
+            declared: 4,
+            actual: 5
+        })
+    ));
+    let mut s = chunking_ready();
+    s.begin(&envelope(1), BodyFlags::default(), 4, Millis(3))
+        .unwrap();
+    s.body(b"12", Millis(4)).unwrap();
+    let e = s.end_body(Millis(5)).unwrap_err();
+    assert!(matches!(
+        e.kind(),
+        ErrorKind::Build(BuildError::LengthMismatch {
+            declared: 4,
+            actual: 2
+        })
+    ));
+}
+
+#[test]
+fn test_bdat_last_adds_crlf_when_body_lacks_it() {
+    let mut s = chunking_ready();
+    s.begin(&envelope(1), BodyFlags::default(), 3, Millis(3))
+        .unwrap();
+    s.body(b"abc", Millis(4)).unwrap();
+    s.end_body(Millis(5)).unwrap();
+    let wire = drain(&mut s);
+    assert!(
+        wire.ends_with(b"abcBDAT 2 LAST\r\n\r\n"),
+        "{}",
+        String::from_utf8_lossy(&wire)
+    );
+}
+
+#[test]
+fn test_large_bdat_waits_for_rcpt_replies() {
+    let mut s = chunking_ready();
+    s.begin(&envelope(1), BodyFlags::default(), 200_000, Millis(3))
+        .unwrap();
+    let first = drain(&mut s);
+    assert!(
+        !first.windows(4).any(|w| w == b"BDAT"),
+        "the chunk waits for MAIL and RCPT replies"
+    );
+    s.receive(b"250 ok\r\n250 ok\r\n", Millis(4)).unwrap();
+    assert!(drain(&mut s).starts_with(b"BDAT 200000"));
+}
+
+#[test]
+fn test_auth_refused_over_unverified_plaintext() {
+    use crate::proto::{Auth, Credentials};
+    let config = SessionConfig {
+        security: SessionSecurity::Plaintext {
+            peer_is_loopback: false,
+        },
+        auth: Some(Auth::new(Credentials::password("u", "p"))),
+        ..SessionConfig::default()
+    };
+    let e = Session::new(config, Millis(0)).unwrap_err();
+    assert!(matches!(
+        e.kind(),
+        ErrorKind::Config(crate::error::ConfigError::AuthWithPlaintextRemote)
+    ));
+}
+
+#[test]
+fn test_auth_output_wiped_after_transmit() {
+    use crate::proto::{Auth, Credentials};
+    let config = SessionConfig {
+        auth: Some(Auth::new(Credentials::password("u", "secret"))),
+        ..loopback()
+    };
+    let mut s = Session::new(config, Millis(0)).unwrap();
+    s.receive(b"220 x\r\n", Millis(1)).unwrap();
+    drain(&mut s);
+    s.receive(b"250-x\r\n250 AUTH PLAIN\r\n", Millis(2))
+        .unwrap();
+    assert!(s.transmit().starts_with(b"AUTH PLAIN "));
+    let n = s.transmit().len();
+    s.transmitted(n);
+    assert!(s.out.iter().all(|&b| b == 0) || s.out.is_empty());
+    assert!(!s.secret_out);
 }

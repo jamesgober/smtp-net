@@ -91,13 +91,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # NFR-11: smtp-net, parse-net, mod-rand, net-io, and nothing else
-          # (crypt-io and tls-net join with their features in later versions).
-          allowed='^(smtp-net|parse-net|mod-rand|net-io) '
-          tree=$(cargo tree -e normal --all-features --prefix none | sort -u)
-          echo "$tree"
-          if printf '%s\n' "$tree" | grep -Ev "$allowed" | grep -q .; then
-            echo "a crate outside the first-party list is in the runtime tree"
+          # NFR-11: smtp-net depends only on first-party crates; third-party
+          # code arrives only through crypt-io (audited cryptography) and
+          # tls-net (rustls), the two accepted exceptions.
+          direct=$(cargo tree -e normal --all-features --depth 1 --prefix none | tail -n +2 | sort -u)
+          echo "$direct"
+          if printf '%s\n' "$direct" | grep -Ev '^(parse-net|mod-rand|net-io|crypt-io|tls-net) ' | grep -q .; then
+            echo "a direct runtime dependency outside the first-party list"
+            exit 1
+          fi
+          # The no_std core: first-party plus crypt-io's zeroize and subtle.
+          core=$(cargo tree -e normal --no-default-features --prefix none | sort -u)
+          echo "$core"
+          if printf '%s\n' "$core" | grep -Ev '^(smtp-net|parse-net|crypt-io|zeroize|subtle) ' | grep -q .; then
+            echo "the no_std core pulled something unexpected"
             exit 1
           fi
 
@@ -171,6 +178,17 @@ jobs:
           for id in $(grep -o 'SENT [^ ]*' mailpit.log | cut -d' ' -f2); do
             grep -q "$id" mailpit.json || { echo "missing $id"; cat mailpit.json; exit 1; }
           done
+      - name: Start Mailpit with TLS (STARTTLS and implicit TLS, the fixture certificate)
+        run: |
+          for mode in starttls:1587 tls:1465; do
+            name=${mode%%:*}; port=${mode##*:}
+            docker run -d --name "mp-$name" -p "$port:1025" -v "$PWD/tests/fixtures:/certs:ro" axllent/mailpit               --smtp-tls-cert /certs/localhost.pem --smtp-tls-key /certs/localhost.key               --smtp-require-"$name" --smtp-auth-accept-any
+          done
+          sleep 3
+      - name: Send over real TLS with verification
+        run: |
+          SMTP_NET_INTEROP_STARTTLS_PORT=1587 SMTP_NET_INTEROP_IMPLICIT_PORT=1465             cargo test --test interop test_interop_tls -- --nocapture | tee tls.log
+          test "$(grep -c '^SENT ' tls.log)" -eq 2
       - name: Send every shape to Exim
         run: SMTP_NET_INTEROP_PORT=25 SMTP_NET_INTEROP_TO="$USER@localhost" cargo test --test interop -- --nocapture --test-threads=1 | tee exim.log
       - name: Exim delivered every message

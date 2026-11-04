@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "smtp-net"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -47,13 +47,16 @@ path = "src/lib.rs"
 # FEATURE FLAGS
 # #################################
 [features]
-default = ["std", "client"]
+default = ["std", "client", "tls"]
 # OS random source (mod-rand), the system clock for Date, std::error::Error,
 # IoSink. Without it the core (addresses, messages, the session) is no_std
 # with alloc; randomness and time are passed in.
 std = ["dep:mod-rand"]
 # The blocking driver over net-io: send, send_local, Client.
 client = ["std", "dep:net-io"]
+# STARTTLS and implicit TLS with tls-net (rustls, verification always on) as
+# the default engine (dev/PLAN.md D-025, D-051).
+tls = ["client", "dep:tls-net"]
 # ScriptedServer, TestServer, Fault: test support for this crate's users.
 testing = ["client"]
 
@@ -66,6 +69,12 @@ testing = ["client"]
 parse-net = { version = "0.9", default-features = false, features = ["alloc"] }
 # OS CSPRNG for Message-ID and MIME boundaries. First party, no dependencies.
 mod-rand = { version = "1", default-features = false, features = ["tier3"], optional = true }
+# Wipes credentials on drop (Zeroizing). Only the `zeroize` feature: the
+# audited-cryptography exception, nothing else (dev/PLAN.md D-050).
+crypt-io = { version = "1.2", default-features = false, features = ["zeroize"] }
+# TLS: rustls through tls-net (the accepted exception), Mozilla roots,
+# aws-lc-rs provider, the net-io seam.
+tls-net = { version = "0.3", default-features = false, features = ["aws-lc", "webpki-roots", "net-io"], optional = true }
 # Outbound TCP with deadlines, and the sans-IO TLS seam. First party, no dependencies.
 net-io = { version = "0.6", default-features = false, optional = true }
 
@@ -73,6 +82,9 @@ net-io = { version = "0.6", default-features = false, optional = true }
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
+# The tls_real test builds net-io TLS sessions for the test server.
+net-io = { version = "0.6", default-features = false }
+tls-net = { version = "0.3", default-features = false, features = ["aws-lc", "webpki-roots", "net-io"] }
 # Property tests only; never a runtime dependency.
 proptest = { version = "1", default-features = false, features = ["std"] }
 
@@ -83,6 +95,10 @@ required-features = ["client"]
 
 [[example]]
 name = "sans_io_driver"
+required-features = ["testing"]
+
+[[example]]
+name = "prepared_job"
 required-features = ["testing"]
 
 [[test]]
@@ -96,6 +112,22 @@ required-features = ["testing"]
 [[test]]
 name = "driver"
 required-features = ["testing"]
+
+[[test]]
+name = "extended"
+required-features = ["testing"]
+
+[[test]]
+name = "tls_real"
+required-features = ["testing", "tls"]
+
+
+# loom models for HourlyLimit: RUSTFLAGS="--cfg smtp_net_loom" cargo test --release --lib gate
+[target.'cfg(smtp_net_loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(smtp_net_loom)'] }
 
 
 # RELEASE PROFILE

@@ -1,0 +1,13 @@
+# The second EHLO no longer offers AUTH: no AUTH is possible.
+# config: starttls auth
+# expect:
+# closed: perm
+S: 220 mx.example.com ESMTP
+C: EHLO [127.0.0.1]
+S: 250-mx.example.com
+S: 250-AUTH PLAIN
+S: 250 STARTTLS
+C: STARTTLS
+S: 220 ready
+C: EHLO [127.0.0.1]
+S: 250 mx.example.com

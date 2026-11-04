@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: core (<code>0.3.0</code>).</strong> Message building, the sans-IO session, and submission to a mail server on the same machine work and are tested. STARTTLS and implicit TLS relays with AUTH arrive in <code>0.4.0</code>, DKIM in <code>0.5.0</code>. The full API is in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: extended (<code>0.4.0</code>).</strong> Message building, the sans-IO session, submission to the local mail server, and STARTTLS and implicit TLS relays with AUTH work and are tested, with job payloads, pacing, CHUNKING, and DSN. DKIM, XOAUTH2, and SCRAM arrive in <code>0.5.0</code>. The full API is in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -40,7 +40,13 @@
 
 ```toml
 [dependencies]
-smtp-net = "0.3"
+smtp-net = "0.4"
+```
+
+The default features include TLS through tls-net (rustls). For submission to a mail server on the same machine only, without building rustls:
+
+```toml
+smtp-net = { version = "0.4", default-features = false, features = ["client"] }
 ```
 
 ## Quick start
@@ -56,6 +62,23 @@ let msg = smtp_net::Message::text(
 )?;
 let report = smtp_net::send_local(&msg)?;
 println!("accepted as {}", report.message_id());
+```
+
+Text plus HTML through a relay with STARTTLS on 587 and AUTH (certificate verification always on):
+
+```rust
+let msg = smtp_net::Message::html(from, to, "Reset your password", html, text)?;
+let server = smtp_net::Server::starttls("mail.example.com").login("no-reply@example.com", password);
+let report = smtp_net::send(&server, &msg)?;
+assert!(report.was_secure());
+```
+
+For a job system, build once in the request handler and send the stored payload from the worker; retries send the same bytes and `Message-ID`:
+
+```rust
+let payload = msg.prepare()?.encode();                        // stored with the job
+let prepared = smtp_net::PreparedMessage::decode(&payload)?;  // a damaged payload is refused
+smtp_net::send_prepared(&server, &prepared)?;
 ```
 
 Text plus HTML, attachments, and inline images use the builder; every setter refuses CR, LF, and other control characters instead of stripping them:
@@ -90,8 +113,9 @@ The protocol core is a sans-IO `Session` (bytes in, bytes out, events and deadli
 | Feature | Default | What it adds |
 |---|---|---|
 | `std` | yes | OS random source, system clock, `std::error::Error`, `IoSink` |
-| `client` | yes | the blocking driver over net-io: `send`, `send_local`, `Client`, `Server` |
-| `testing` | no | `TestServer` (loopback SMTP server with fault injection), `ScriptedServer`, `Transcript` |
+| `client` | yes | the blocking driver over net-io: `send`, `send_local`, `send_prepared`, `Client`, `Server` |
+| `tls` | yes | STARTTLS and implicit TLS with tls-net (rustls, Mozilla roots or a private CA) |
+| `testing` | no | `TestServer` (loopback SMTP server with fault injection, AUTH, BDAT, TLS), `ScriptedServer`, `Transcript` |
 
 Without default features the core (addresses, messages, the session) is `no_std` with `alloc`.
 

@@ -22,6 +22,22 @@ pub(crate) fn reply_error(stage: Stage, reply: Reply) -> Error {
         .with_reply(reply)
 }
 
+/// The error for a refused AUTH (PLAN 7.7): `454` temporary; `432` (password
+/// transition needed) permanent, since an operator must act; any other `4yz`
+/// temporary; everything else permanent.
+pub(crate) fn auth_error(reply: Reply) -> Error {
+    let code = reply.code().get();
+    let disposition = if code == 432 || !reply.code().is_transient() {
+        Disposition::Permanent
+    } else {
+        Disposition::Temporary
+    };
+    Error::new(ErrorKind::AuthFailed)
+        .at(Stage::Auth)
+        .with_disposition(disposition)
+        .with_reply(reply)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

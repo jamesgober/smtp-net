@@ -6,7 +6,7 @@ use core::fmt;
 
 use crate::{
     address::Address,
-    error::{BuildError, Error},
+    error::{BuildError, Error, PayloadError},
 };
 
 /// Default most recipients in an envelope (RFC 5321 4.5.3.1.8).
@@ -28,6 +28,182 @@ const DEFAULT_MAX_RECIPIENTS: u16 = 100;
 pub struct Envelope {
     from: Option<Address>,
     recipients: Vec<Address>,
+    dsn: Option<Dsn>,
+}
+
+/// What a delivery status notification returns (RFC 3461 4.3).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DsnReturn {
+    /// The whole message (`RET=FULL`).
+    Full,
+    /// The headers only (`RET=HDRS`).
+    Headers,
+}
+
+/// When notifications are wanted (RFC 3461 4.1): never, or any of success,
+/// failure, delay.
+///
+/// # Examples
+///
+/// ```
+/// use smtp_net::DsnNotify;
+/// let n = DsnNotify::FAILURE | DsnNotify::DELAY;
+/// assert!(n.failure() && n.delay() && !n.success());
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DsnNotify(u8);
+
+impl DsnNotify {
+    /// `NOTIFY=NEVER`.
+    pub const NEVER: DsnNotify = DsnNotify(0);
+    /// Notify on success.
+    pub const SUCCESS: DsnNotify = DsnNotify(1);
+    /// Notify on failure.
+    pub const FAILURE: DsnNotify = DsnNotify(2);
+    /// Notify on delay.
+    pub const DELAY: DsnNotify = DsnNotify(4);
+
+    /// True for success notifications.
+    #[must_use]
+    pub const fn success(self) -> bool {
+        self.0 & 1 != 0
+    }
+
+    /// True for failure notifications.
+    #[must_use]
+    pub const fn failure(self) -> bool {
+        self.0 & 2 != 0
+    }
+
+    /// True for delay notifications.
+    #[must_use]
+    pub const fn delay(self) -> bool {
+        self.0 & 4 != 0
+    }
+
+    pub(crate) const fn bits(self) -> u8 {
+        self.0
+    }
+}
+
+impl core::ops::BitOr for DsnNotify {
+    type Output = DsnNotify;
+    fn bitor(self, rhs: DsnNotify) -> DsnNotify {
+        DsnNotify(self.0 | rhs.0)
+    }
+}
+
+/// Whether DSN parameters are required or sent only when offered.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DsnPolicy {
+    /// Send the parameters when the server offers DSN, omit them otherwise.
+    #[default]
+    IfSupported,
+    /// Refuse to send (permanent `ExtensionRequired(Dsn)`) when DSN is not offered.
+    Required,
+}
+
+/// RFC 3461 delivery status notification parameters.
+///
+/// # Examples
+///
+/// ```
+/// use smtp_net::{Dsn, DsnNotify, DsnReturn};
+/// let dsn = Dsn::new(DsnNotify::FAILURE | DsnNotify::DELAY).ret(DsnReturn::Headers).envelope_id("order-1234")?;
+/// assert_eq!(dsn.envelope_id_value(), Some("order-1234"));
+/// assert!(Dsn::new(DsnNotify::NEVER).envelope_id(&"x".repeat(101)).is_err());
+/// # Ok::<(), smtp_net::Error>(())
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dsn {
+    ret: Option<DsnReturn>,
+    envelope_id: Option<String>,
+    notify: DsnNotify,
+    policy: DsnPolicy,
+}
+
+/// Longest ENVID, in characters (RFC 3461 4.4).
+const MAX_ENVID: usize = 100;
+
+impl Dsn {
+    /// DSN parameters with `notify` on every recipient, no `RET`, no `ENVID`,
+    /// policy `IfSupported`.
+    #[must_use]
+    pub fn new(notify: DsnNotify) -> Dsn {
+        Dsn {
+            ret: None,
+            envelope_id: None,
+            notify,
+            policy: DsnPolicy::IfSupported,
+        }
+    }
+
+    /// Sets `RET`.
+    #[must_use]
+    pub fn ret(mut self, ret: DsnReturn) -> Dsn {
+        self.ret = Some(ret);
+        self
+    }
+
+    /// Sets `ENVID`: printable ASCII, at most 100 characters (xtext-encoded on the wire).
+    ///
+    /// # Errors
+    ///
+    /// `Build(InvalidDsn)`.
+    pub fn envelope_id(mut self, id: &str) -> Result<Dsn, Error> {
+        if id.is_empty() || id.len() > MAX_ENVID || !id.bytes().all(|b| (32..127).contains(&b)) {
+            return Err(BuildError::InvalidDsn.into());
+        }
+        self.envelope_id = Some(String::from(id));
+        Ok(self)
+    }
+
+    /// Makes DSN required.
+    #[must_use]
+    pub fn required(mut self) -> Dsn {
+        self.policy = DsnPolicy::Required;
+        self
+    }
+
+    /// The `RET` value.
+    #[must_use]
+    pub fn return_content(&self) -> Option<DsnReturn> {
+        self.ret
+    }
+
+    /// The `ENVID` value.
+    #[must_use]
+    pub fn envelope_id_value(&self) -> Option<&str> {
+        self.envelope_id.as_deref()
+    }
+
+    /// The `NOTIFY` value.
+    #[must_use]
+    pub fn notify(&self) -> DsnNotify {
+        self.notify
+    }
+
+    /// The policy.
+    #[must_use]
+    pub fn policy(&self) -> DsnPolicy {
+        self.policy
+    }
+}
+
+/// Appends `value` as RFC 3461 xtext: `+XX` for `+`, `=`, and octets outside 33 to 126.
+pub(crate) fn xtext(value: &[u8], out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in value {
+        if (33..=126).contains(&b) && b != b'+' && b != b'=' {
+            out.push(b);
+        } else {
+            out.push(b'+');
+            out.push(HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0'));
+            out.push(HEX.get(usize::from(b & 15)).copied().unwrap_or(b'0'));
+        }
+    }
 }
 
 impl Envelope {
@@ -58,7 +234,11 @@ impl Envelope {
         if recipients.len() > usize::from(limit) {
             return Err(BuildError::TooManyRecipients { limit }.into());
         }
-        Ok(Envelope { from, recipients })
+        Ok(Envelope {
+            from,
+            recipients,
+            dsn: None,
+        })
     }
 
     /// The reverse-path; `None` is the null sender `<>`.
@@ -80,6 +260,43 @@ impl Envelope {
         self
     }
 
+    /// The null reverse-path `MAIL FROM:<>`, for bounces and auto-replies
+    /// (never derived from a message).
+    ///
+    /// # Errors
+    ///
+    /// `Build(NoRecipients)`, `Build(TooManyRecipients)`.
+    pub fn null_sender(to: &[Address]) -> Result<Envelope, Error> {
+        Envelope::with_limit(None, to, DEFAULT_MAX_RECIPIENTS)
+    }
+
+    /// Adds DSN parameters (RFC 3461).
+    #[must_use]
+    pub fn dsn(mut self, dsn: Dsn) -> Envelope {
+        self.dsn = Some(dsn);
+        self
+    }
+
+    /// The DSN parameters, when set.
+    #[must_use]
+    pub fn dsn_parameters(&self) -> Option<&Dsn> {
+        self.dsn.as_ref()
+    }
+
+    /// A copy with only the recipients at `indices` (a further transaction
+    /// for recipients the server deferred).
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    pub(crate) fn subset(&self, indices: &[usize]) -> Envelope {
+        Envelope {
+            from: self.from.clone(),
+            recipients: indices
+                .iter()
+                .filter_map(|&i| self.recipients.get(i).cloned())
+                .collect(),
+            dsn: self.dsn.clone(),
+        }
+    }
+
     /// True when an envelope address is not ASCII (needs SMTPUTF8).
     #[must_use]
     pub fn needs_smtputf8(&self) -> bool {
@@ -93,6 +310,7 @@ impl fmt::Debug for Envelope {
         f.debug_struct("Envelope")
             .field("from", &self.from)
             .field("recipients", &self.recipients)
+            .field("dsn", &self.dsn)
             .finish()
     }
 }
@@ -245,6 +463,258 @@ impl PreparedMessage {
     }
 }
 
+/// Magic at the start of every job payload.
+const MAGIC: &[u8; 8] = b"SMTPNET1";
+/// The payload format this version writes and reads.
+const FORMAT_VERSION: u8 = 1;
+/// Largest message accepted from a payload (64 MiB) **[budget]**.
+const MAX_PAYLOAD_MESSAGE: usize = 64 * 1024 * 1024;
+/// Longest address field in a payload (an SMTP path is at most 256 octets).
+const MAX_PAYLOAD_ADDRESS: usize = 256;
+
+const FLAG_NULL_SENDER: u8 = 1;
+const FLAG_DSN: u8 = 2;
+
+impl PreparedMessage {
+    /// The job payload: `SMTPNET1`, a version byte, flags, the envelope as
+    /// length-prefixed fields, the message bytes, and a CRC-32C trailer.
+    /// Deterministic: the same message gives the same payload.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use smtp_net::{Address, Envelope, PreparedMessage};
+    /// let env = Envelope::new(Address::parse("a@example.com")?, &[Address::parse("b@example.org")?])?;
+    /// let p = PreparedMessage::from_raw(env, b"From: a@example.com\r\n\r\nhi\r\n".to_vec())?;
+    /// let payload = p.encode();
+    /// assert_eq!(PreparedMessage::decode(&payload)?, p);
+    /// let mut bad = payload.clone();
+    /// bad[20] ^= 1;
+    /// assert!(PreparedMessage::decode(&bad).is_err());
+    /// # Ok::<(), smtp_net::Error>(())
+    /// ```
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let env = &self.envelope;
+        let mut n = MAGIC.len() + 2 + 2 + 2 + 4 + 4 + self.bytes.len();
+        n += env.from.as_ref().map_or(0, |a| a.as_str().len());
+        n += env
+            .recipients
+            .iter()
+            .map(|a| 2 + a.as_str().len())
+            .sum::<usize>();
+        n += env
+            .dsn
+            .as_ref()
+            .map_or(0, |d| 4 + d.envelope_id.as_ref().map_or(0, String::len));
+        let mut out = Vec::with_capacity(n);
+        out.extend_from_slice(MAGIC);
+        out.push(FORMAT_VERSION);
+        let mut flags = 0u8;
+        if env.from.is_none() {
+            flags |= FLAG_NULL_SENDER;
+        }
+        if env.dsn.is_some() {
+            flags |= FLAG_DSN;
+        }
+        out.push(flags);
+        put_short(
+            &mut out,
+            env.from
+                .as_ref()
+                .map_or(&b""[..], |a| a.as_str().as_bytes()),
+        );
+        // Envelopes hold at most u16::MAX recipients (MessageLimits is u16).
+        out.extend_from_slice(
+            &u16::try_from(env.recipients.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
+        for a in env.recipients.iter().take(usize::from(u16::MAX)) {
+            put_short(&mut out, a.as_str().as_bytes());
+        }
+        if let Some(d) = &env.dsn {
+            out.push(match d.ret {
+                None => 0,
+                Some(DsnReturn::Full) => 1,
+                Some(DsnReturn::Headers) => 2,
+            });
+            out.push(d.notify.bits());
+            out.push(u8::from(d.policy == DsnPolicy::Required));
+            let id = d.envelope_id.as_deref().unwrap_or("").as_bytes();
+            out.push(u8::try_from(id.len()).unwrap_or(0));
+            out.extend_from_slice(
+                id.get(..usize::from(u8::try_from(id.len()).unwrap_or(0)))
+                    .unwrap_or(&[]),
+            );
+        }
+        out.extend_from_slice(
+            &u32::try_from(self.bytes.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(&self.bytes);
+        let crc = crate::encode::crc32c(&out);
+        out.extend_from_slice(&crc.to_be_bytes());
+        out
+    }
+
+    /// Reads a job payload back. Checks the magic and version, then the
+    /// CRC-32C over everything before it, then every length against its
+    /// budget before allocating, then validates the addresses and the
+    /// message bytes again (as [`from_raw`](PreparedMessage::from_raw)
+    /// does). A damaged payload is refused, never sent (T-33).
+    ///
+    /// # Errors
+    ///
+    /// `Payload(Corrupt)`, `Payload(UnknownVersion)`, `Payload(TooLarge)`,
+    /// `Payload(Truncated)`, address and raw-message errors.
+    pub fn decode(payload: &[u8]) -> Result<PreparedMessage, Error> {
+        if payload.len() < MAGIC.len() + 2 + 4 {
+            return Err(PayloadError::Truncated.into());
+        }
+        if payload.get(..MAGIC.len()) != Some(&MAGIC[..]) {
+            return Err(PayloadError::Corrupt.into());
+        }
+        let version = payload.get(MAGIC.len()).copied().unwrap_or(0);
+        if version != FORMAT_VERSION {
+            return Err(PayloadError::UnknownVersion { version }.into());
+        }
+        let (body, trailer) = payload.split_at(payload.len() - 4);
+        let mut crc = [0u8; 4];
+        crc.copy_from_slice(trailer);
+        if crate::encode::crc32c(body) != u32::from_be_bytes(crc) {
+            return Err(PayloadError::Corrupt.into());
+        }
+        let mut r = Reader {
+            b: body,
+            at: MAGIC.len() + 1,
+        };
+        let flags = r.byte()?;
+        if flags & !(FLAG_NULL_SENDER | FLAG_DSN) != 0 {
+            return Err(PayloadError::Corrupt.into());
+        }
+        let from_raw = r.short(MAX_PAYLOAD_ADDRESS)?;
+        let from = if flags & FLAG_NULL_SENDER != 0 {
+            if !from_raw.is_empty() {
+                return Err(PayloadError::Corrupt.into());
+            }
+            None
+        } else {
+            Some(address_of(from_raw)?)
+        };
+        let count = usize::from(u16::from_be_bytes([r.byte()?, r.byte()?]));
+        // Each recipient needs at least 3 bytes: refuse a count the rest cannot hold.
+        if count.saturating_mul(3) > r.left() {
+            return Err(PayloadError::TooLarge.into());
+        }
+        let mut recipients = Vec::with_capacity(count);
+        for _ in 0..count {
+            recipients.push(address_of(r.short(MAX_PAYLOAD_ADDRESS)?)?);
+        }
+        let dsn = if flags & FLAG_DSN != 0 {
+            let ret = match r.byte()? {
+                0 => None,
+                1 => Some(DsnReturn::Full),
+                2 => Some(DsnReturn::Headers),
+                _ => return Err(PayloadError::Corrupt.into()),
+            };
+            let notify = r.byte()?;
+            if notify & !7 != 0 {
+                return Err(PayloadError::Corrupt.into());
+            }
+            let policy = match r.byte()? {
+                0 => DsnPolicy::IfSupported,
+                1 => DsnPolicy::Required,
+                _ => return Err(PayloadError::Corrupt.into()),
+            };
+            let id_len = usize::from(r.byte()?);
+            let id = r.take(id_len)?;
+            let mut d = Dsn {
+                ret,
+                envelope_id: None,
+                notify: DsnNotify(notify),
+                policy,
+            };
+            if !id.is_empty() {
+                let id = core::str::from_utf8(id).map_err(|_| PayloadError::Corrupt)?;
+                d = d.envelope_id(id)?;
+            }
+            Some(d)
+        } else {
+            None
+        };
+        let len = r.word()?;
+        if len > MAX_PAYLOAD_MESSAGE {
+            return Err(PayloadError::TooLarge.into());
+        }
+        if len != r.left() {
+            return Err(if len > r.left() {
+                PayloadError::Truncated
+            } else {
+                PayloadError::Corrupt
+            }
+            .into());
+        }
+        let bytes = r.take(len)?.to_vec();
+        let mut envelope = Envelope::with_limit(from, &recipients, u16::MAX)?;
+        envelope.dsn = dsn;
+        if envelope.recipients.len() != recipients.len() {
+            return Err(PayloadError::Corrupt.into());
+        }
+        PreparedMessage::from_raw(envelope, bytes)
+    }
+}
+
+fn put_short(out: &mut Vec<u8>, b: &[u8]) {
+    let n = u16::try_from(b.len()).unwrap_or(u16::MAX);
+    out.extend_from_slice(&n.to_be_bytes());
+    out.extend_from_slice(b.get(..usize::from(n)).unwrap_or(&[]));
+}
+
+fn address_of(b: &[u8]) -> Result<Address, Error> {
+    let s = core::str::from_utf8(b).map_err(|_| PayloadError::Corrupt)?;
+    // Literals were accepted when the envelope was made, if the caller allowed them.
+    Ok(Address::parse_allowing_literal(s)?)
+}
+
+struct Reader<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl Reader<'_> {
+    fn left(&self) -> usize {
+        self.b.len().saturating_sub(self.at)
+    }
+
+    fn take(&mut self, n: usize) -> Result<&[u8], Error> {
+        let end = self.at.checked_add(n).ok_or(PayloadError::TooLarge)?;
+        let s = self.b.get(self.at..end).ok_or(PayloadError::Truncated)?;
+        self.at = end;
+        Ok(s)
+    }
+
+    fn byte(&mut self) -> Result<u8, Error> {
+        Ok(self.take(1)?.first().copied().unwrap_or(0))
+    }
+
+    fn short(&mut self, max: usize) -> Result<&[u8], Error> {
+        let n = usize::from(u16::from_be_bytes([self.byte()?, self.byte()?]));
+        if n > max {
+            return Err(PayloadError::TooLarge.into());
+        }
+        self.take(n)
+    }
+
+    fn word(&mut self) -> Result<usize, Error> {
+        let b = self.take(4)?;
+        let mut w = [0u8; 4];
+        w.copy_from_slice(b);
+        usize::try_from(u32::from_be_bytes(w)).map_err(|_| PayloadError::TooLarge.into())
+    }
+}
+
 impl fmt::Debug for PreparedMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PreparedMessage")
@@ -348,5 +818,122 @@ mod tests {
             .unwrap()
             .return_path(Address::parse("bounce@example.com").unwrap());
         assert_eq!(e.from().unwrap().as_str(), "bounce@example.com");
+    }
+
+    fn sample() -> PreparedMessage {
+        let to = [
+            Address::parse("b@example.org").unwrap(),
+            Address::parse("c@example.org").unwrap(),
+        ];
+        let env = Envelope::new(Address::parse("a@example.com").unwrap(), &to)
+            .unwrap()
+            .dsn(
+                Dsn::new(DsnNotify::FAILURE)
+                    .ret(DsnReturn::Full)
+                    .envelope_id("x")
+                    .unwrap(),
+            );
+        PreparedMessage::from_raw(
+            env,
+            b"From: a@example.com\r\nMessage-ID: <m.1@example.com>\r\n\r\nhi\r\n".to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_payload_round_trip_is_identity_and_deterministic() {
+        let p = sample();
+        let a = p.encode();
+        assert_eq!(a, p.encode());
+        assert_eq!(PreparedMessage::decode(&a).unwrap(), p);
+        let null = PreparedMessage::from_raw(
+            Envelope::null_sender(&[Address::parse("b@example.org").unwrap()]).unwrap(),
+            b"From: x@y\r\n\r\n".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(PreparedMessage::decode(&null.encode()).unwrap(), null);
+    }
+
+    #[test]
+    fn test_payload_every_bit_flip_refused() {
+        // T-33: a damaged job payload is refused, never sent.
+        let payload = sample().encode();
+        for byte in 0..payload.len() {
+            for bit in 0..8 {
+                let mut bad = payload.clone();
+                bad[byte] ^= 1 << bit;
+                assert!(
+                    PreparedMessage::decode(&bad).is_err(),
+                    "byte {byte} bit {bit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_payload_truncated_at_every_byte_and_bad_headers() {
+        let payload = sample().encode();
+        for n in 0..payload.len() {
+            assert!(
+                PreparedMessage::decode(&payload[..n]).is_err(),
+                "truncated at {n}"
+            );
+        }
+        assert!(matches!(
+            PreparedMessage::decode(b"").unwrap_err().kind(),
+            crate::ErrorKind::Payload(PayloadError::Truncated)
+        ));
+        let mut wrong_magic = payload.clone();
+        wrong_magic[0] = b'X';
+        assert!(matches!(
+            PreparedMessage::decode(&wrong_magic).unwrap_err().kind(),
+            crate::ErrorKind::Payload(PayloadError::Corrupt)
+        ));
+        let mut v2 = payload.clone();
+        v2[8] = 2;
+        assert!(matches!(
+            PreparedMessage::decode(&v2).unwrap_err().kind(),
+            crate::ErrorKind::Payload(PayloadError::UnknownVersion { version: 2 })
+        ));
+    }
+
+    #[test]
+    fn test_payload_oversized_lengths_refused_before_allocation() {
+        // A recipient count the payload cannot hold, with a valid checksum.
+        let mut body = MAGIC.to_vec();
+        body.push(FORMAT_VERSION);
+        body.push(0);
+        put_short(&mut body, b"a@example.com");
+        body.extend_from_slice(&u16::MAX.to_be_bytes());
+        let crc = crate::encode::crc32c(&body);
+        body.extend_from_slice(&crc.to_be_bytes());
+        assert!(matches!(
+            PreparedMessage::decode(&body).unwrap_err().kind(),
+            crate::ErrorKind::Payload(PayloadError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn test_xtext_encoding() {
+        let mut out = Vec::new();
+        xtext(b"a+b=c d\x01~", &mut out);
+        assert_eq!(out, b"a+2Bb+3Dc+20d+01~");
+    }
+
+    #[test]
+    fn test_dsn_envelope_id_rules() {
+        assert!(Dsn::new(DsnNotify::NEVER).envelope_id("").is_err());
+        assert!(
+            Dsn::new(DsnNotify::NEVER)
+                .envelope_id(&"x".repeat(100))
+                .is_ok()
+        );
+        assert!(
+            Dsn::new(DsnNotify::NEVER)
+                .envelope_id(&"x".repeat(101))
+                .is_err()
+        );
+        assert!(Dsn::new(DsnNotify::NEVER).envelope_id("caf\u{e9}").is_err());
+        assert!(Dsn::new(DsnNotify::NEVER).envelope_id("a\r\nb").is_err());
     }
 }

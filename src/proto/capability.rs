@@ -169,7 +169,7 @@ impl Capabilities {
     }
 
     /// The AUTH mechanism names offered, uppercase, in the server's order.
-    pub fn auth_mechanism_names(&self) -> impl Iterator<Item = &[u8]> + '_ {
+    pub fn auth_mechanism_names(&self) -> impl Iterator<Item = &[u8]> + Clone + '_ {
         self.mechanisms.iter().map(Vec::as_slice)
     }
 

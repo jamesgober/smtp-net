@@ -8,4 +8,4 @@ cargo +nightly fuzz run reply -- -max_total_time=3600
 ```
 
 Targets: `reply`, `ehlo`, `session_server_bytes`, `address`, `content_type`,
-`header_value`, `raw_message`, `transcript`.
+`header_value`, `raw_message`, `transcript`, `prepared_decode`.

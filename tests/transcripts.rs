@@ -11,8 +11,9 @@
 use std::{fs, path::Path};
 
 use smtp_net::{
-    Address, Envelope, Millis, PreparedMessage, RecipientPolicy, ScriptedServer, Session,
-    SessionConfig, SessionSecurity, Transcript,
+    Address, Auth, Credentials, Dsn, DsnNotify, DsnReturn, Envelope, MechanismList, MechanismName,
+    Millis, PreparedMessage, RecipientPolicy, ScriptedServer, Session, SessionConfig,
+    SessionSecurity, Transcript,
 };
 
 struct Case {
@@ -54,6 +55,14 @@ fn load(path: &Path) -> Case {
             "implicit" => config.security = SessionSecurity::ImplicitTls,
             "policy-all" => config.recipient_policy = RecipientPolicy::All,
             "no-pipelining" => config.pipelining = false,
+            "no-chunking" => config.chunking = false,
+            "auth" => config.auth = Some(Auth::new(Credentials::password("user", "pass"))),
+            "auth-login" => {
+                config.auth = Some(
+                    Auth::new(Credentials::password("user", "pass"))
+                        .mechanisms(MechanismList::new(&[MechanismName::Login]).unwrap()),
+                );
+            }
             other => panic!("{}: unknown config {other}", path.display()),
         }
     }
@@ -62,7 +71,38 @@ fn load(path: &Path) -> Case {
         .split(',')
         .map(|r| Address::parse(r.trim()).unwrap())
         .collect();
-    let envelope = Envelope::new(Address::parse("a@example.com").unwrap(), &recipients).unwrap();
+    let mut envelope = if header(&text, "from:") == Some("<>") {
+        Envelope::null_sender(&recipients).unwrap()
+    } else {
+        Envelope::new(Address::parse("a@example.com").unwrap(), &recipients).unwrap()
+    };
+    if let Some(spec) = header(&text, "dsn:") {
+        let mut words = spec.split_whitespace();
+        let notify = words
+            .next()
+            .unwrap_or("never")
+            .split(',')
+            .fold(DsnNotify::NEVER, |n, w| match w {
+                "success" => n | DsnNotify::SUCCESS,
+                "failure" => n | DsnNotify::FAILURE,
+                "delay" => n | DsnNotify::DELAY,
+                _ => n,
+            });
+        let mut dsn = Dsn::new(notify);
+        for w in words {
+            match w {
+                "hdrs" => dsn = dsn.ret(DsnReturn::Headers),
+                "full" => dsn = dsn.ret(DsnReturn::Full),
+                "required" => dsn = dsn.required(),
+                other => {
+                    dsn = dsn
+                        .envelope_id(other.strip_prefix("envid=").unwrap())
+                        .unwrap()
+                }
+            }
+        }
+        envelope = envelope.dsn(dsn);
+    }
     let body: &[u8] = if header(&text, "raw:") == Some("8bit") {
         b"caf\xc3\xa9\r\n"
     } else {

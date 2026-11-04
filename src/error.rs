@@ -419,6 +419,11 @@ pub enum ConfigError {
     BufferTooSmall,
     /// STARTTLS or implicit TLS without a TLS engine (D-025); nothing was sent.
     TlsConnectorMissing,
+    /// A mechanism allowlist that is empty or longer than 8.
+    TooManyMechanisms,
+    /// Certificate verification turned off for a host that is not loopback,
+    /// without `allow_insecure_remote(true)` (D-024).
+    InsecureNotAllowed,
     /// A session configured to authenticate over plaintext to a peer not
     /// confirmed to be loopback (T-8).
     AuthWithPlaintextRemote,
@@ -433,6 +438,10 @@ impl fmt::Display for ConfigError {
                 "plaintext submission is allowed only to 127.0.0.0/8, ::1, or localhost; use STARTTLS (port 587) or implicit TLS (port 465) for other hosts"
             }
             ConfigError::BufferTooSmall => "the output buffer is smaller than the longest SMTP command (512 octets)",
+            ConfigError::TooManyMechanisms => "the AUTH mechanism list must hold 1 to 8 mechanisms",
+            ConfigError::InsecureNotAllowed => {
+                "certificate verification can be turned off only for a loopback host, or with allow_insecure_remote(true)"
+            }
             ConfigError::TlsConnectorMissing => {
                 "STARTTLS and implicit TLS need a TLS engine, which this build does not have; nothing was sent"
             }
@@ -505,6 +514,75 @@ impl fmt::Display for ProtocolError {
                 "the server's EHLO reply has a capability line that is not valid"
             }
         })
+    }
+}
+
+/// How a TLS handshake or TLS stream failed.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TlsFailure {
+    /// Certificate verification failed, the name did not match, or the
+    /// version was refused (T-11): permanent, retrying cannot pass.
+    CertificateRejected,
+    /// The peer does not speak TLS (implicit TLS to a plaintext port): permanent.
+    ProtocolMismatch,
+    /// The handshake failed on I/O or timed out: temporary.
+    Handshake,
+    /// The peer ended the TLS stream without close_notify: temporary.
+    Closed,
+    /// The engine could not build a session: permanent.
+    Setup,
+}
+
+impl fmt::Display for TlsFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            TlsFailure::CertificateRejected => {
+                "the server's certificate was refused (verification failed, wrong name, or TLS version); nothing was sent"
+            }
+            TlsFailure::ProtocolMismatch => {
+                "the server did not answer TLS; if it expects STARTTLS, use port 587 and Security::StartTls"
+            }
+            TlsFailure::Handshake => "the TLS handshake failed or timed out",
+            TlsFailure::Closed => "the server ended the TLS stream without closing it",
+            TlsFailure::Setup => "the TLS engine could not start a session",
+        })
+    }
+}
+
+/// A job payload could not be decoded (T-33).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PayloadError {
+    /// The magic, a length, or the checksum is wrong: the payload was
+    /// damaged or is not an smtp-net payload.
+    Corrupt,
+    /// The payload was written by a version of smtp-net this one cannot read.
+    UnknownVersion {
+        /// The version byte.
+        version: u8,
+    },
+    /// A length field is over its budget.
+    TooLarge,
+    /// The payload ends before its fields do.
+    Truncated,
+}
+
+impl fmt::Display for PayloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PayloadError::Corrupt => {
+                f.write_str("the job payload is damaged (checksum or structure); it was not sent")
+            }
+            PayloadError::UnknownVersion { version } => write!(
+                f,
+                "the job payload has format version {version}, which this smtp-net cannot read; upgrade the worker"
+            ),
+            PayloadError::TooLarge => {
+                f.write_str("a length in the job payload is over its budget; it was not sent")
+            }
+            PayloadError::Truncated => f.write_str("the job payload is truncated; it was not sent"),
+        }
     }
 }
 
@@ -595,6 +673,8 @@ pub enum ErrorKind {
     Random,
     /// A serialization sink refused bytes.
     Sink(SinkError),
+    /// A job payload could not be decoded.
+    Payload(PayloadError),
     /// The TCP connection could not be opened.
     #[cfg(feature = "std")]
     Connect(std::io::ErrorKind),
@@ -609,6 +689,16 @@ pub enum ErrorKind {
     StartTlsUnavailable,
     /// Plaintext bytes followed the server's `220` to STARTTLS (T-6).
     StartTlsInjection,
+    /// The TLS handshake or stream failed.
+    Tls(TlsFailure),
+    /// A pacing gate refused; see [`Error::retry_after`].
+    Throttled,
+    /// The server offers no mechanism from the allowlist (T-10); nothing was sent.
+    AuthUnavailable,
+    /// The server refused the credentials; see [`Error::reply`].
+    AuthFailed,
+    /// The SASL exchange was refused on the client side.
+    Sasl(crate::proto::SaslError),
     /// The server broke the protocol.
     Protocol(ProtocolError),
     /// The server refused; see [`Error::reply`].
@@ -640,6 +730,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Usage(e) => fmt::Display::fmt(e, f),
             ErrorKind::Random => f.write_str("the operating system's random source failed; retry later"),
             ErrorKind::Sink(e) => fmt::Display::fmt(e, f),
+            ErrorKind::Payload(e) => fmt::Display::fmt(e, f),
             #[cfg(feature = "std")]
             ErrorKind::Connect(kind) => write!(
                 f,
@@ -657,6 +748,13 @@ impl fmt::Display for ErrorKind {
             ErrorKind::StartTlsInjection => f.write_str(
                 "the server sent plaintext after agreeing to STARTTLS, which is how a response-injection attack looks; the connection was closed",
             ),
+            ErrorKind::Tls(e) => fmt::Display::fmt(e, f),
+            ErrorKind::Throttled => f.write_str("the send gate is at its limit; nothing was sent, retry after the given time"),
+            ErrorKind::AuthUnavailable => f.write_str(
+                "the server offers none of the allowed AUTH mechanisms; nothing was sent. Check the server's AUTH line or the allowlist",
+            ),
+            ErrorKind::AuthFailed => f.write_str("the server refused the credentials"),
+            ErrorKind::Sasl(e) => fmt::Display::fmt(e, f),
             ErrorKind::Protocol(e) => fmt::Display::fmt(e, f),
             ErrorKind::Rejected => f.write_str("the mail server refused the command"),
             ErrorKind::AllRecipientsRejected => f.write_str("the mail server refused every recipient"),
@@ -746,6 +844,12 @@ impl Error {
         self
     }
 
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    pub(crate) fn with_retry_after(mut self, d: Duration) -> Error {
+        self.inner.retry_after = Some(d);
+        self
+    }
+
     pub(crate) fn with_recipients(mut self, recipients: Vec<RecipientFailure>) -> Error {
         self.inner.recipients = recipients;
         self
@@ -820,7 +924,12 @@ impl Error {
 fn default_disposition(kind: &ErrorKind) -> (Disposition, bool) {
     use Disposition::{Permanent, Temporary};
     match kind {
-        ErrorKind::Random | ErrorKind::Timeout | ErrorKind::ConnectionClosed => (Temporary, false),
+        ErrorKind::Random
+        | ErrorKind::Timeout
+        | ErrorKind::ConnectionClosed
+        | ErrorKind::Throttled => (Temporary, false),
+        ErrorKind::Tls(TlsFailure::Handshake | TlsFailure::Closed) => (Temporary, false),
+        ErrorKind::Tls(TlsFailure::CertificateRejected) => (Permanent, true),
         #[cfg(feature = "std")]
         ErrorKind::Connect(_) | ErrorKind::Io(_) => (Temporary, false),
         ErrorKind::Sink(SinkError::Full) => (Permanent, false),
@@ -829,6 +938,10 @@ fn default_disposition(kind: &ErrorKind) -> (Disposition, bool) {
         ErrorKind::Protocol(_) => (Temporary, true),
         ErrorKind::PlaintextRefused => (Permanent, true),
         ErrorKind::StartTlsUnavailable | ErrorKind::StartTlsInjection => (Temporary, true),
+        // A NUL in a credential is the caller's input; a bad challenge or an
+        // endless exchange is the server's misbehaviour.
+        ErrorKind::Sasl(crate::proto::SaslError::InvalidCredential) => (Permanent, false),
+        ErrorKind::Sasl(_) => (Temporary, true),
         _ => (Permanent, false),
     }
 }
@@ -859,6 +972,9 @@ impl fmt::Display for Error {
         fmt::Display::fmt(&self.inner.kind, f)?;
         if let Some(stage) = self.inner.stage {
             write!(f, " (at {stage})")?;
+            if stage == Stage::Greeting && self.inner.kind == ErrorKind::Timeout {
+                f.write_str("; if the server expects TLS from the first byte (port 465), use Security::ImplicitTls")?;
+            }
         }
         if let Some(reply) = &self.inner.reply {
             write!(f, ": {}", reply.text_lossy())?;
@@ -872,6 +988,15 @@ impl fmt::Display for Error {
 
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
+
+impl From<crate::proto::SaslError> for Error {
+    fn from(e: crate::proto::SaslError) -> Error {
+        Error::new(ErrorKind::Sasl(e))
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for crate::proto::SaslError {}
 
 macro_rules! from_nested {
     ($($t:ident => $v:ident),*) => {$(
@@ -891,7 +1016,8 @@ from_nested!(
     ConfigError => Config,
     UsageError => Usage,
     ProtocolError => Protocol,
-    SinkError => Sink
+    SinkError => Sink,
+    PayloadError => Payload
 );
 
 #[cfg(test)]

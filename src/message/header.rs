@@ -37,6 +37,9 @@ const RESERVED: &[&str] = &[
     "received",
     "in-reply-to",
     "references",
+    "list-unsubscribe",
+    "list-unsubscribe-post",
+    "auto-submitted",
 ];
 
 /// The single injection gate: refuses CR, LF, NUL, every other C0 control

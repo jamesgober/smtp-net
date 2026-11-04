@@ -121,7 +121,7 @@ impl ContentType {
             .map(|(_, v)| v.as_str())
     }
 
-    fn is_text(&self) -> bool {
+    pub(crate) fn is_text(&self) -> bool {
         self.essence.starts_with("text/")
     }
 }
@@ -305,9 +305,25 @@ impl Multipart {
     }
 }
 
-/// A part of the built tree.
+/// A MIME part, for callers that build the tree themselves (Tier 3,
+/// [`MessageBuilder::body`](crate::MessageBuilder::body)). Every
+/// constructor validates its input; depth, count, and size are checked when
+/// the message is built.
+///
+/// # Examples
+///
+/// ```
+/// use smtp_net::{Multipart, Part, TransferEncoding};
+/// let tree = Part::multipart(Multipart::Alternative, vec![
+///     Part::text("text/plain", "plain")?,
+///     Part::text("text/x-markdown", "**rich**")?.transfer_encoding(TransferEncoding::QuotedPrintable)?,
+/// ]);
+/// assert!(Part::text("text/plain", "caf\u{e9}")?.transfer_encoding(TransferEncoding::SevenBit).is_err());
+/// # let _ = tree;
+/// # Ok::<(), smtp_net::Error>(())
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Part {
+pub struct Part {
     pub(crate) content_type: ContentType,
     /// `Content-Disposition` value and parameters.
     pub(crate) disposition: Option<(&'static str, Vec<(String, String)>)>,
@@ -335,7 +351,104 @@ pub(crate) enum Body {
 }
 
 impl Part {
-    pub(crate) fn text(essence: &str, text: String, allow_8bit: bool) -> Part {
+    /// A text part (`content_type` must be `text/*`; `charset=utf-8` is
+    /// added). LF and CRLF line endings are accepted; a bare CR is refused.
+    /// The transfer encoding is chosen as for the builder's text (7-bit clean).
+    ///
+    /// # Errors
+    ///
+    /// `Header(InvalidContentType)`, `Build(BareCarriageReturn)`.
+    pub fn text(content_type: &str, text: &str) -> Result<Part, Error> {
+        let mut ct = ContentType::parse(content_type)?;
+        if !ct.is_text() {
+            return Err(HeaderError::InvalidContentType.into());
+        }
+        let mut normalized = String::with_capacity(text.len());
+        let bytes = text.as_bytes();
+        let mut start = 0;
+        let mut i = 0;
+        while let Some(&b) = bytes.get(i) {
+            if b == b'\r' {
+                if bytes.get(i + 1) != Some(&b'\n') {
+                    return Err(crate::error::BuildError::BareCarriageReturn {
+                        position: i as u64,
+                    }
+                    .into());
+                }
+                normalized.push_str(text.get(start..i).unwrap_or(""));
+                start = i + 1;
+            }
+            i += 1;
+        }
+        normalized.push_str(text.get(start..).unwrap_or(""));
+        ct.params.retain(|(n, _)| n != "charset");
+        ct.params
+            .insert(0, (String::from("charset"), String::from("utf-8")));
+        let encoding = choose_text_encoding(&normalized, false);
+        Ok(Part {
+            content_type: ct,
+            disposition: None,
+            content_id: None,
+            body: Body::Text {
+                text: normalized,
+                encoding,
+            },
+            head: Vec::new(),
+        })
+    }
+
+    /// A binary part, always base64.
+    ///
+    /// # Errors
+    ///
+    /// `Header(InvalidContentType)`.
+    pub fn binary(content_type: &str, bytes: Vec<u8>) -> Result<Part, Error> {
+        let content_type = ContentType::parse(content_type)?;
+        Ok(Part {
+            content_type,
+            disposition: None,
+            content_id: None,
+            body: Body::Bytes(bytes),
+            head: Vec::new(),
+        })
+    }
+
+    /// Forces the transfer encoding, refused when the content does not fit
+    /// (`SevenBit` with non-ASCII, `8bit` or `7bit` with a line over 998
+    /// octets, anything but `Base64` for binary content, any encoding on a
+    /// multipart).
+    ///
+    /// # Errors
+    ///
+    /// `Build(EncodingMismatch)`.
+    pub fn transfer_encoding(mut self, encoding: TransferEncoding) -> Result<Part, Error> {
+        let mismatch = || Error::from(crate::error::BuildError::EncodingMismatch);
+        match &mut self.body {
+            Body::Text {
+                text,
+                encoding: current,
+            } => {
+                let natural = choose_text_encoding(text, true);
+                let fits = match encoding {
+                    TransferEncoding::SevenBit => natural == TransferEncoding::SevenBit,
+                    TransferEncoding::EightBit => matches!(
+                        natural,
+                        TransferEncoding::SevenBit | TransferEncoding::EightBit
+                    ),
+                    TransferEncoding::QuotedPrintable | TransferEncoding::Base64 => true,
+                };
+                if !fits {
+                    return Err(mismatch());
+                }
+                *current = encoding;
+            }
+            Body::Bytes(_) if encoding == TransferEncoding::Base64 => {}
+            _ => return Err(mismatch()),
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn text_body(essence: &str, text: String, allow_8bit: bool) -> Part {
         let encoding = choose_text_encoding(&text, allow_8bit);
         let content_type = ContentType {
             essence: String::from(essence),
@@ -350,7 +463,9 @@ impl Part {
         }
     }
 
-    pub(crate) fn attachment(a: Attachment) -> Part {
+    /// The part an [`Attachment`] becomes (`Content-Disposition: attachment`).
+    #[must_use]
+    pub fn from_attachment(a: Attachment) -> Part {
         let mut content_type = a.content_type;
         content_type.params.retain(|(n, _)| n != "name");
         content_type
@@ -365,7 +480,9 @@ impl Part {
         }
     }
 
-    pub(crate) fn inline(i: Inline) -> Part {
+    /// The part an [`Inline`] becomes (`Content-Disposition: inline`, `Content-ID`).
+    #[must_use]
+    pub fn from_inline(i: Inline) -> Part {
         let body = if i.content_type.is_text() {
             match String::from_utf8(i.bytes) {
                 Ok(t) => {
@@ -387,7 +504,9 @@ impl Part {
         }
     }
 
-    pub(crate) fn multipart(kind: Multipart, parts: Vec<Part>) -> Part {
+    /// A multipart of `kind` holding `parts` in order; its boundary is drawn at build.
+    #[must_use]
+    pub fn multipart(kind: Multipart, parts: Vec<Part>) -> Part {
         let content_type = ContentType {
             essence: String::from(kind.essence()),
             params: Vec::new(),

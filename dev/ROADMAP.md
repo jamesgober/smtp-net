@@ -32,23 +32,24 @@ Depends on: parse-net 0.9 (published), net-io 0.5 (published), mod-rand 1.0 (pub
 - [x] Counting-allocator tests for the 0.3 "0 alloc" items that hold (body path, replies, encoders, header gate, `write_to`); first benchmarks (build, encode, proto). Moved to 0.6 with measured numbers (D-047): build allocations (97, target 8), the envelope copy in `begin`, the owned reply in `Delivered`.
 - [x] CI: `no_std` core build, interop job (Mailpit, Exim).
 
-## v0.4.0 - Extended
+## v0.4.0 - Extended (DONE, 2026-11-04)
 Exit: STARTTLS and implicit TLS run end to end against `TestServer` through the `TlsConnector` seam; T-5 to T-11, T-32, T-33 attack tests pass; a task-io integration test (or a stub of task-io's documented handler contract while task-io is unpublished) retries a temporary failure and dead-letters a permanent one.
 Depends on: net-io (TLS seam, published). For the external relay check: tls-net with a client `TlsSession` and certificate verification.
-- [ ] STARTTLS and implicit TLS through the `TlsConnector` seam (D-025, D-026); the session's TLS states; the response-injection check.
-- [ ] AUTH PLAIN and LOGIN; `Secret`; `Credentials`, `MechanismList`.
-- [ ] `Server` builders, `ServerBuilder` (API 8.8) except `Pool`, `dkim`, `observer`.
-- [ ] Connection reuse with the idle and per-connection limits; transparent reconnect.
-- [ ] CHUNKING (BDAT), DSN, SMTPUTF8 and EAI addresses, too-many-recipients deferral.
-- [ ] `SendGate`, `HourlyLimit` (loom model).
-- [ ] `PreparedMessage::encode` and `decode` (CRC-32C), `send_prepared`.
-- [ ] List-Unsubscribe, Auto-Submitted, `allow_8bit`, `date_unix_with_offset`, `Part`/`Body` Tier 3 tree, `Envelope::null_sender`, `Session::noop`.
-- [ ] `TestServer` with a TLS engine.
-- [ ] Feature `tls` with tls-net's connector, and delivery through an external relay on 587 and 465 with certificate verification: **waits for tls-net to publish a client `TlsSession`.** If tls-net is not published when the rest of 0.4 is done, 0.4.0 ships the seam and its tests, and the `tls` feature plus the relay check land in the first release after tls-net publishes (recorded here as the reason; D-025).
+- [x] STARTTLS and implicit TLS through the `TlsConnector` seam (D-025, D-026); the session's TLS states; the response-injection check.
+- [x] AUTH PLAIN and LOGIN; `Secret`; `Credentials`, `MechanismList`.
+- [x] `Server` builders, `ServerBuilder` (API 8.8) except `Pool`, `dkim`, `observer`.
+- [x] Connection reuse with the idle and per-connection limits; transparent reconnect.
+- [x] CHUNKING (BDAT), DSN, SMTPUTF8 and EAI addresses, too-many-recipients deferral.
+- [x] `SendGate`, `HourlyLimit` (loom model).
+- [x] `PreparedMessage::encode` and `decode` (CRC-32C), `send_prepared`.
+- [x] List-Unsubscribe, Auto-Submitted, `allow_8bit`, `date_unix_with_offset`, `Part`/`Body` Tier 3 tree, `Envelope::null_sender`, `Session::noop`.
+- [x] `TestServer` with a TLS engine.
+- [x] Feature `tls` with tls-net 0.3's connector (default, D-051); real TLS tests with fixture certificates on every platform; CI interop against Mailpit with real STARTTLS and implicit TLS, verified against a private CA (D-064). A public relay (Gmail, Microsoft 365) needs James's credentials: part of the 0.8 field test.
+- [x] Job-contract test against a stub of task-io's handler contract until task-io publishes (D-065).
 
 ## v0.5.0 - Feature complete
 Exit: every P0, P1, P2 item present (or its move recorded here with a reason); DKIM passes at Gmail and Outlook.com (`Authentication-Results: dkim=pass` for both algorithms where the receiver supports Ed25519); RFC 6376 and RFC 8463 vectors pass; T-19 to T-22, T-29, T-31 pass.
-Depends on: a crypt-io release with `sign-ed25519`, `sign-rsa`, `kdf-pbkdf2` (PLAN 3.4, D-006); key-vault optional.
+Depends on: crypt-io 1.3 with `sign-ed25519`, `sign-rsa`, `kdf-pbkdf2` (published 2026-11-04; its RSA keys start at 2048 bits, so `allow_rsa_1024` has nothing to allow and is decided at 0.5); key-vault optional.
 - [ ] DKIM (API 8.7): Ed25519-SHA256, RSA-SHA256, relaxed and simple, oversigning, several signatures, DNS records, raw input; `Message::prepare_signed`, `ServerBuilder::dkim`.
 - [ ] XOAUTH2 (D-007); SCRAM-SHA-256; the `Mechanism` trait.
 - [ ] `Pool` (loom model); `Observer`; `Attachment::from_source`, `BodySource`.
