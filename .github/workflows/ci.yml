@@ -115,12 +115,14 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # The prebuilt cargo-fuzz is a musl binary and would default to the
+      # musl target, where the sanitizer cannot link: name the target.
       - name: Build every target
-        run: cargo fuzz build
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu
       - name: Thirty seconds per target
         run: |
           for t in $(cargo fuzz list); do
-            cargo fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=2048
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$t" -- -max_total_time=30 -rss_limit_mb=2048
           done
 
   benches:
@@ -173,7 +175,10 @@ jobs:
         run: SMTP_NET_INTEROP_PORT=25 SMTP_NET_INTEROP_TO="$USER@localhost" cargo test --test interop -- --nocapture --test-threads=1 | tee exim.log
       - name: Exim delivered every message
         run: |
-          sleep 2
+          # Exim queues some messages of a busy connection for its next queue
+          # run; force one so every accepted message reaches the mailbox.
+          sudo exim4 -qff
+          sleep 3
           sudo cat /var/mail/"$USER" > exim.mbox || true
           for id in $(grep -o 'SENT [^ ]*' exim.log | cut -d' ' -f2); do
             grep -q "$id" exim.mbox || { echo "missing $id"; sudo tail -n 50 /var/log/exim4/mainlog; exit 1; }
