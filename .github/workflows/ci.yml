@@ -194,13 +194,20 @@ jobs:
       - name: Exim delivered every message
         run: |
           # Exim queues some messages of a busy connection for its next queue
-          # run; force one so every accepted message reaches the mailbox.
-          sudo exim4 -qff
-          sleep 3
-          sudo cat /var/mail/"$USER" > exim.mbox || true
-          for id in $(grep -o 'SENT [^ ]*' exim.log | cut -d' ' -f2); do
-            grep -q "$id" exim.mbox || { echo "missing $id"; sudo tail -n 50 /var/log/exim4/mainlog; exit 1; }
+          # run; force one, and wait up to 30 s for deliveries still in
+          # progress (a locked spool file is being delivered by another process).
+          ids=$(grep -o 'SENT [^ ]*' exim.log | cut -d' ' -f2)
+          for attempt in $(seq 1 15); do
+            sudo exim4 -qff
+            sleep 2
+            sudo cat /var/mail/"$USER" > exim.mbox || true
+            missing=""
+            for id in $ids; do grep -q "$id" exim.mbox || missing="$missing $id"; done
+            [ -z "$missing" ] && exit 0
           done
+          echo "missing:$missing"
+          sudo tail -n 50 /var/log/exim4/mainlog
+          exit 1
 
   package:
     name: Package
