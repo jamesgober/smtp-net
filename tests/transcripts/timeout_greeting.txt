@@ -1,0 +1,4 @@
+# config: loopback
+# expect:
+# closed: temp
+S: <TIMEOUT>

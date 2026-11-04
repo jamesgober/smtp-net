@@ -1,0 +1,10 @@
+# The message is larger than SIZE: refused before MAIL, nothing sent.
+# config: loopback
+# expect: perm
+# closed: none
+S: 220 mx.example.com ESMTP
+C: EHLO [127.0.0.1]
+S: 250-mx.example.com
+S: 250 SIZE 10
+C: QUIT
+S: 221 bye

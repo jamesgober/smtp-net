@@ -1,0 +1,32 @@
+[package]
+name = "smtp-net-bench"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "Benchmarks for smtp-net's hot paths (dev/PLAN.md 11.2)"
+
+# Kept out of smtp-net's own dependency tree: criterion is a dependency of
+# this crate only, so it never reaches smtp-net's dev-dependencies or its
+# MSRV job. Competitor comparisons live in smtp-net-bench (D-035).
+[dependencies]
+smtp-net = { path = ".." }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "build"
+harness = false
+
+[[bench]]
+name = "encode"
+harness = false
+
+[[bench]]
+name = "proto"
+harness = false
+
+# Keeps this crate out of any parent workspace.
+[workspace]
+members = ["."]
+
+[profile.bench]
+debug = true

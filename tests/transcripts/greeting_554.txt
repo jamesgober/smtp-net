@@ -1,0 +1,4 @@
+# config: loopback
+# expect:
+# closed: perm
+S: 554 no SMTP service here

@@ -1,0 +1,18 @@
+# config: loopback
+# expect: ok
+# closed: none
+S: 220 old.example.com SMTP
+C: EHLO [127.0.0.1]
+S: 502 command not implemented
+C: HELO [127.0.0.1]
+S: 250 old.example.com
+C: MAIL FROM:<a@example.com>
+S: 250 ok
+C: RCPT TO:<b@example.org>
+S: 250 ok
+C: DATA
+S: 354 go ahead
+C: <BODY>
+S: 250 queued
+C: QUIT
+S: 221 bye

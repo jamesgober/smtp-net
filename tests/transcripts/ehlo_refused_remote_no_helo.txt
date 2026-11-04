@@ -1,0 +1,7 @@
+# HELO fallback only on verified loopback plaintext.
+# config: remote-plain
+# expect:
+# closed: perm
+S: 220 old.example.com SMTP
+C: EHLO [127.0.0.1]
+S: 500 syntax error
