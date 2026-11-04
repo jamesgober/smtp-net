@@ -29,19 +29,25 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: design lock (<code>0.2.0</code>).</strong> The public API is written down in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, and the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. No functional code yet: <code>0.3.0</code> is the first release that sends mail.
+        <strong>Status: core (<code>0.3.0</code>).</strong> Message building, the sans-IO session, and submission to a mail server on the same machine work and are tested. STARTTLS and implicit TLS relays with AUTH arrive in <code>0.4.0</code>, DKIM in <code>0.5.0</code>. The full API is in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
 <hr>
 <br>
 
-## Planned API
+## Install
 
-The simple path is one call. This is the contract from the design lock; it ships in `0.3.0` (local submission) and `0.4.0` (TLS relays).
+```toml
+[dependencies]
+smtp-net = "0.3"
+```
+
+## Quick start
+
+Send a plain-text email through the mail server on this machine (for example cPanel's Exim on `127.0.0.1:25`):
 
 ```rust
-// Send a plain-text email through the local mail server (for example Exim on 127.0.0.1:25).
 let msg = smtp_net::Message::text(
     "Example <no-reply@example.com>",
     "user@example.org",
@@ -50,14 +56,44 @@ let msg = smtp_net::Message::text(
 )?;
 let report = smtp_net::send_local(&msg)?;
 println!("accepted as {}", report.message_id());
-
-// Text plus HTML through a remote relay with STARTTLS on 587 and AUTH.
-let msg = smtp_net::Message::html(from, to, "Reset your password", html, text)?;
-let server = smtp_net::Server::starttls("mail.example.com").login("no-reply@example.com", password);
-smtp_net::send(&server, &msg)?;
 ```
 
-Every error says whether it is **temporary** (retry later) or **permanent** (do not retry), and whether the message was **possibly delivered**, so a job system can retry, dead-letter, or flag a possible duplicate without reading SMTP reply codes.
+Text plus HTML, attachments, and inline images use the builder; every setter refuses CR, LF, and other control characters instead of stripping them:
+
+```rust
+let msg = smtp_net::Message::builder()
+    .from("Billing <billing@example.com>")?
+    .to("customer@example.org")?
+    .bcc("archive@example.com")?            // envelope only, never written into the message
+    .subject("Your receipt")?
+    .text("Thank you for your order.")?
+    .html("<p>Thank you for your order.</p>")?
+    .attachment(smtp_net::Attachment::new("receipt.pdf", "application/pdf", pdf_bytes)?)?
+    .build()?;
+```
+
+Every error says whether it is **temporary** (retry later) or **permanent** (do not retry), and whether the message was **possibly delivered** (the connection was lost after the end of the data), so a job system can retry, dead-letter, or flag a possible duplicate without reading SMTP reply codes:
+
+```rust
+match smtp_net::send_local(&msg) {
+    Ok(report) => log_sent(report.message_id()),
+    Err(e) if e.possibly_delivered() => flag_possible_duplicate(&e),
+    Err(e) if e.is_temporary() => retry_later(&e),
+    Err(e) => dead_letter(&e),
+}
+```
+
+The protocol core is a sans-IO `Session` (bytes in, bytes out, events and deadlines out), so it runs under any transport; see [`examples/sans_io_driver.rs`](./examples/sans_io_driver.rs).
+
+## Features
+
+| Feature | Default | What it adds |
+|---|---|---|
+| `std` | yes | OS random source, system clock, `std::error::Error`, `IoSink` |
+| `client` | yes | the blocking driver over net-io: `send`, `send_local`, `Client`, `Server` |
+| `testing` | no | `TestServer` (loopback SMTP server with fault injection), `ScriptedServer`, `Transcript` |
+
+Without default features the core (addresses, messages, the session) is `no_std` with `alloc`.
 
 ## Scope
 

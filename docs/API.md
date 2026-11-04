@@ -26,6 +26,7 @@
 - [8.13 Test support (feature `testing`)](#813-test-support-feature-testing)
 - [8.14 Constants](#814-constants)
 - [8.15 Examples by use case](#815-examples-by-use-case)
+- [8.16 Changes since the design lock](#816-changes-since-the-design-lock)
 
 ### 8.1 Conventions
 
@@ -1021,3 +1022,20 @@ loop {
     }
 }
 ```
+
+### 8.16 Changes since the design lock
+
+Each change is recorded in `dev/PLAN.md` section 19.
+
+| Version | Change | Decision |
+|---|---|---|
+| 0.3.0 | `Session::tls_established`, `TlsInfo`, `TlsProtocol`, and the session's STARTTLS and implicit TLS states ship in 0.3 (listed 0.4); the driver's TLS stays 0.4 | D-037 |
+| 0.3.0 | New: `Session::connection_lost(&mut self, cause: ErrorKind) -> Error` (Tier 3, P0): the driver reports EOF or a transport failure; the session closes and returns the classified error | D-038 |
+| 0.3.0 | New: `Address::parse_allowing_literal(input: &str) -> Result<Address, AddressError>` (Tier 2, P3); `Domain::is_literal`, `Address::same_mailbox`, `Capabilities::auth_mechanism_names`, `Capabilities::unknown_count`, `Reply::line_count`, `Session::tls_protocol`, `Headers::len`, `Headers::is_empty`, `ContentType::essence`, `ContentType::parameter`, `Attachment::file_name`, `Attachment::bytes`, `Inline::content_id`, `Envelope::needs_smtputf8`, `Server::host`, `Server::port`, `Server::security`, `Server::timeouts`, `BodyFlags::new`, `TlsInfo::new`, `TlsProtocol::from_wire`, `Millis::after`, `Stage::name`, `Extension::keyword` (inspection helpers) | D-039 |
+| 0.3.0 | `encode_word` returns `Result<(), HeaderError>` (a control character is refused) | D-015 |
+| 0.3.0 | `Message::prepare`, the `PreparedMessage` accessors, `MessageBuilder::allow_8bit`, `Session::noop` ship in 0.3 | D-042 |
+| 0.3.0 | Attachment `name=` uses RFC 2231 like `filename=` | D-040 |
+| 0.3.0 | Out-of-grammar EHLO keywords are kept as unknown, not `MalformedCapability` | D-041 |
+| 0.3.0 | `ConfigError::TlsConnectorMissing` and `ConfigError::BufferTooSmall` are listed; `UsageError` is `WrongState { state }` or `Closed`; `ErrorKind::StartTlsUnavailable` and `StartTlsInjection` ship with the session's TLS states | D-037, D-049 |
+| 0.3.0 | `Part`, `Body`, `Multipart` stay internal until `MessageBuilder::body` (0.4); `Multipart` is public as a name only | none (on schedule) |
+| 0.3.0 | Test support: `ScriptedServer::run(&self, session, messages: &[PreparedMessage]) -> Result<ScriptOutcome, ScriptMismatch>` (and `run_split`) drives the transactions itself; `ScriptOutcome`, `TestServer::connections`, `TestServerBuilder::{extensions, fault, refuse_ehlo, start}`, `Fault::CloseAfterMessages(n)` | D-048 |

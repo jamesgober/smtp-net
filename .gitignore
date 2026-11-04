@@ -4,6 +4,13 @@
 
 # Rust / Cargo
 /target/
+/benches/target/
+
+# Fuzzing (corpora live outside the repository)
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
 **/*.rs.bk
 
 # Editor & OS junk

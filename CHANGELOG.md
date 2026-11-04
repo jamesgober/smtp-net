@@ -13,6 +13,49 @@
 
 ---
 
+## [0.3.0] - 2026-11-04
+
+The core: messages, the sans-IO session, and local submission.
+
+### Added
+
+- Addresses: `Address`, `Mailbox`, `Domain` on parse-net's RFC 5322 grammar,
+  with the RFC 5321 path rules (lengths, LDH labels, no literals unless
+  asked for, no control characters anywhere).
+- Messages: `Message::text`, `Message::html`, and `MessageBuilder` for text,
+  HTML, attachments, and inline parts (mixed, related, alternative);
+  7bit, quoted-printable, or base64 per part, 7-bit output by default;
+  RFC 2047 subjects and display names; RFC 2231 file names; generated
+  `Message-ID` and `Date`; threading headers; `MessageLimits` budgets checked
+  before encoding; Bcc only in the envelope; `encoded_len`, `write_to`,
+  `to_bytes`, `prepare`.
+- The header gate `check_header_value`, `encode_word`, `fold_header`,
+  `base64_encode_lines`, `quoted_printable_encode`, and the `Sink` trait with
+  `CountingSink` and `IoSink`.
+- `Envelope` and `PreparedMessage::from_raw`, which refuses bare CR and bare
+  LF (SMTP smuggling), lines over 998 octets, and messages without a header
+  block or From.
+- The sans-IO `Session`: greeting, EHLO and the loopback HELO fallback,
+  STARTTLS states with the response-injection check, MAIL, RCPT, DATA with
+  streaming dot-stuffing, RSET, NOOP, QUIT; PIPELINING in groups of at most
+  4 KiB, SIZE, 8BITMIME, SMTPUTF8 checks; enhanced status codes; RFC 5321
+  stage deadlines; every failure classified temporary or permanent, with
+  `possibly_delivered` after the end of the data.
+- The blocking driver: `send`, `send_local`, `Client` (connection reuse,
+  idle and per-connection limits, one transparent reconnect), `Server`,
+  `Report`. Plaintext only to a verified loopback peer.
+- Test support (feature `testing`): `TestServer` with fault injection,
+  `ScriptedServer` and `Transcript`.
+- 39 conversation transcripts run whole and split into 1 to 16 octet
+  pieces; property tests; counting-allocator tests; eight fuzz targets; an
+  interop job against Mailpit and Exim; a `no_std` build job; benchmarks for
+  message building, encoders, and the session.
+
+### Changed
+
+- net-io 0.6 (0.5.0 was yanked).
+- `docs/API.md` section 8.16 lists the changes since the design lock.
+
 ## [0.2.0] - 2026-11-04
 
 The design lock. No functional code yet.
@@ -49,6 +92,7 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/smtp-net/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/smtp-net/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/smtp-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/smtp-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/smtp-net/releases/tag/v0.1.0

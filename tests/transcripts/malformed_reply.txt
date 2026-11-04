@@ -1,0 +1,6 @@
+# config: loopback
+# expect:
+# closed: temp security
+S: 220 mx.example.com ESMTP
+C: EHLO [127.0.0.1]
+S: 2x0 garbage

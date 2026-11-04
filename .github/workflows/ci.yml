@@ -17,6 +17,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }} / ${{ matrix.rust }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -44,15 +45,155 @@ jobs:
       - name: Test (no default features)
         run: cargo test --no-default-features
       - name: Build examples
-        run: cargo build --examples
+        run: cargo build --examples --all-features
+      - name: Doc (default features)
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
       - name: Doc (all features)
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+  no-std:
+    name: Bare metal (thumbv7em-none-eabi / ${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.85"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: thumbv7em-none-eabi
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: thumbv7em
+      # The core (addresses, messages, the session) needs only alloc
+      # (dev/PLAN.md NFR-10); a target without std proves it.
+      - name: Build (no default features)
+        run: cargo build --target thumbv7em-none-eabi --no-default-features
+      - name: Clippy (no default features)
+        run: cargo clippy --target thumbv7em-none-eabi --no-default-features -- -D warnings
+
+  dependencies:
+    name: No third-party runtime dependency
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Only first-party crates in the normal dependency tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          # NFR-11: smtp-net, parse-net, mod-rand, net-io, and nothing else
+          # (crypt-io and tls-net join with their features in later versions).
+          allowed='^(smtp-net|parse-net|mod-rand|net-io) '
+          tree=$(cargo tree -e normal --all-features --prefix none | sort -u)
+          echo "$tree"
+          if printf '%s\n' "$tree" | grep -Ev "$allowed" | grep -q .; then
+            echo "a crate outside the first-party list is in the runtime tree"
+            exit 1
+          fi
+
+  fuzz:
+    name: Fuzz targets build and smoke run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Build every target
+        run: cargo fuzz build
+      - name: Thirty seconds per target
+        run: |
+          for t in $(cargo fuzz list); do
+            cargo fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=2048
+          done
+
+  benches:
+    # The benchmark crate (benches/) is its own workspace with criterion as
+    # its dependency; building it keeps it compiling without adding anything
+    # to smtp-net's own builds.
+    name: Benchmarks build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: benches
+      - name: Build the benchmarks
+        working-directory: benches
+        run: cargo bench --no-run
+
+  interop:
+    # Real mail servers (dev/PLAN.md 12.8): Mailpit as a container, Exim (the
+    # MTA family cPanel runs) from the distribution, both on loopback.
+    name: Interop (Mailpit, Exim)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mailpit:
+        image: axllent/mailpit:latest
+        ports:
+          - 1025:1025
+          - 8025:8025
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Exim
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q exim4-daemon-light
+          sudo systemctl restart exim4 || sudo service exim4 restart
+      - name: Send every shape to Mailpit
+        run: SMTP_NET_INTEROP_PORT=1025 cargo test --test interop -- --nocapture --test-threads=1 | tee mailpit.log
+      - name: Mailpit received every message
+        run: |
+          curl -fsS http://127.0.0.1:8025/api/v1/messages > mailpit.json
+          for id in $(grep -o 'SENT [^ ]*' mailpit.log | cut -d' ' -f2); do
+            grep -q "$id" mailpit.json || { echo "missing $id"; cat mailpit.json; exit 1; }
+          done
+      - name: Send every shape to Exim
+        run: SMTP_NET_INTEROP_PORT=25 SMTP_NET_INTEROP_TO="$USER@localhost" cargo test --test interop -- --nocapture --test-threads=1 | tee exim.log
+      - name: Exim delivered every message
+        run: |
+          sleep 2
+          sudo cat /var/mail/"$USER" > exim.mbox || true
+          for id in $(grep -o 'SENT [^ ]*' exim.log | cut -d' ' -f2); do
+            grep -q "$id" exim.mbox || { echo "missing $id"; sudo tail -n 50 /var/log/exim4/mainlog; exit 1; }
+          done
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Package
+        run: cargo package
+
   security:
     name: Security (audit + deny)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

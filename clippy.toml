@@ -1,2 +1,6 @@
 avoid-breaking-exported-api = true
 msrv = "1.85"
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

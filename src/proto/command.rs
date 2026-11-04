@@ -1,0 +1,157 @@
+//! Command formatting from validated types (PLAN 10.2: no caller string is
+//! formatted into a command without its type's validation, and every line is
+//! scanned again before it is queued).
+
+use alloc::vec::Vec;
+use core::net::IpAddr;
+
+use crate::{
+    address::{Address, Domain},
+    error::{Error, ErrorKind, UsageError},
+};
+
+/// Longest command line, including CRLF (RFC 5321 4.5.3.1.4).
+pub const MAX_COMMAND_LINE: usize = 512;
+/// Longest text line, including CRLF (RFC 5321 4.5.3.1.6).
+pub const MAX_TEXT_LINE: usize = 1000;
+
+/// The EHLO argument.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientName {
+    /// A fully qualified domain name.
+    Domain(Domain),
+    /// An address literal, `[192.0.2.1]` or `[IPv6:2001:db8::1]` (D-011).
+    AddressLiteral(IpAddr),
+}
+
+impl Default for ClientName {
+    fn default() -> ClientName {
+        ClientName::AddressLiteral(IpAddr::V4(core::net::Ipv4Addr::LOCALHOST))
+    }
+}
+
+/// Appends one command line to `out`, checking it holds no CR or LF before
+/// its CRLF and fits in 512 octets (T-2).
+pub(crate) struct Line<'a> {
+    out: &'a mut Vec<u8>,
+    start: usize,
+}
+
+impl<'a> Line<'a> {
+    pub(crate) fn new(out: &'a mut Vec<u8>) -> Line<'a> {
+        let start = out.len();
+        Line { out, start }
+    }
+
+    pub(crate) fn put(&mut self, bytes: &[u8]) -> &mut Self {
+        self.out.extend_from_slice(bytes);
+        self
+    }
+
+    pub(crate) fn decimal(&mut self, mut n: u64) -> &mut Self {
+        let mut buf = [0u8; 20];
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            if let Some(d) = buf.get_mut(i) {
+                *d = b'0' + (n % 10) as u8;
+            }
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        self.out.extend_from_slice(buf.get(i..).unwrap_or(&[]));
+        self
+    }
+
+    pub(crate) fn client_name(&mut self, name: &ClientName) -> &mut Self {
+        match name {
+            ClientName::Domain(d) => self.put(d.as_str().as_bytes()),
+            ClientName::AddressLiteral(IpAddr::V4(a)) => {
+                self.put(b"[");
+                for (i, o) in a.octets().iter().enumerate() {
+                    if i > 0 {
+                        self.put(b".");
+                    }
+                    self.decimal(u64::from(*o));
+                }
+                self.put(b"]")
+            }
+            ClientName::AddressLiteral(IpAddr::V6(a)) => {
+                let mut s = alloc::string::String::new();
+                let _ = core::fmt::Write::write_fmt(&mut s, format_args!("[IPv6:{a}]"));
+                self.put(s.as_bytes())
+            }
+        }
+    }
+
+    pub(crate) fn path(&mut self, a: Option<&Address>) -> &mut Self {
+        self.put(b"<");
+        if let Some(a) = a {
+            self.put(a.as_str().as_bytes());
+        }
+        self.put(b">")
+    }
+
+    /// Ends the line with CRLF after the shadow check; on failure the line
+    /// is removed and nothing is queued.
+    pub(crate) fn end(self) -> Result<(), Error> {
+        let line = self.out.get(self.start..).unwrap_or(&[]);
+        let bad = line.iter().any(|&b| b == b'\r' || b == b'\n' || b == 0)
+            || line.len() + 2 > MAX_COMMAND_LINE;
+        if bad {
+            self.out.truncate(self.start);
+            return Err(Error::new(ErrorKind::Usage(UsageError::Closed))
+                .with_disposition(crate::Disposition::Permanent));
+        }
+        self.out.extend_from_slice(b"\r\n");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_name_literals() {
+        let mut out = Vec::new();
+        let mut l = Line::new(&mut out);
+        l.put(b"EHLO ").client_name(&ClientName::default());
+        l.end().unwrap();
+        assert_eq!(out, b"EHLO [127.0.0.1]\r\n");
+        let mut out = Vec::new();
+        let mut l = Line::new(&mut out);
+        l.put(b"EHLO ")
+            .client_name(&ClientName::AddressLiteral("2001:db8::1".parse().unwrap()));
+        l.end().unwrap();
+        assert_eq!(out, b"EHLO [IPv6:2001:db8::1]\r\n");
+    }
+
+    #[test]
+    fn test_line_shadow_check_refuses_embedded_crlf_and_overlength() {
+        let mut out = b"KEEP\r\n".to_vec();
+        let mut l = Line::new(&mut out);
+        l.put(b"MAIL FROM:<a@b>\r\nRCPT TO:<c@d>");
+        assert!(l.end().is_err());
+        assert_eq!(out, b"KEEP\r\n");
+        let mut l = Line::new(&mut out);
+        l.put(&[b'x'; 511]);
+        assert!(l.end().is_err());
+        let mut l = Line::new(&mut out);
+        l.put(&[b'x'; 510]);
+        assert!(l.end().is_ok());
+    }
+
+    #[test]
+    fn test_decimal_formatting() {
+        let mut out = Vec::new();
+        Line::new(&mut out)
+            .decimal(0)
+            .decimal(1234567890)
+            .decimal(u64::MAX);
+        assert_eq!(out, b"0123456789018446744073709551615");
+    }
+}

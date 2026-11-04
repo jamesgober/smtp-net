@@ -1,0 +1,285 @@
+use alloc::{format, vec::Vec};
+
+use super::*;
+use crate::address::Address;
+
+fn loopback() -> SessionConfig {
+    SessionConfig {
+        security: SessionSecurity::Plaintext {
+            peer_is_loopback: true,
+        },
+        ..SessionConfig::default()
+    }
+}
+
+fn drain(s: &mut Session) -> Vec<u8> {
+    let out = s.transmit().to_vec();
+    s.transmitted(out.len());
+    out
+}
+
+fn ready(caps: &[u8]) -> Session {
+    let mut s = Session::new(loopback(), Millis(0)).unwrap();
+    s.receive(b"220 mx ESMTP\r\n", Millis(1)).unwrap();
+    drain(&mut s);
+    s.receive(caps, Millis(2)).unwrap();
+    while s.poll_event().is_some() {}
+    assert_eq!(s.state(), SessionState::Ready);
+    s
+}
+
+fn envelope(n: usize) -> Envelope {
+    // Long local parts make 100 RCPT lines larger than one 4 KiB group.
+    let to: Vec<Address> = (0..n)
+        .map(|i| Address::parse(&format!("user{i}.{}@example.org", "x".repeat(50))).unwrap())
+        .collect();
+    Envelope::new(Address::parse("a@example.com").unwrap(), &to).unwrap()
+}
+
+#[test]
+fn test_session_output_capacity_minimum() {
+    let mut c = loopback();
+    c.output_capacity = 100;
+    assert!(Session::new(c, Millis(0)).is_err());
+}
+
+#[test]
+fn test_usage_errors_in_wrong_states() {
+    let mut s = Session::new(loopback(), Millis(0)).unwrap();
+    assert!(matches!(
+        s.begin(&envelope(1), BodyFlags::default(), 1, Millis(0))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Usage(_)
+    ));
+    assert!(s.body(b"x", Millis(0)).is_err());
+    assert!(s.end_body(Millis(0)).is_err());
+    assert!(
+        s.tls_established(TlsInfo::new(TlsProtocol::Tls13), Millis(0))
+            .is_err()
+    );
+    assert!(s.noop(Millis(0)).is_err());
+    let mut s = ready(b"250 mx\r\n");
+    s.begin(&envelope(1), BodyFlags::default(), 1, Millis(3))
+        .unwrap();
+    assert!(
+        s.begin(&envelope(1), BodyFlags::default(), 1, Millis(3))
+            .is_err(),
+        "begin twice"
+    );
+}
+
+#[test]
+fn test_empty_receive_is_a_no_op() {
+    let mut s = Session::new(loopback(), Millis(0)).unwrap();
+    assert_eq!(s.receive(b"", Millis(0)).unwrap(), 0);
+    assert_eq!(s.state(), SessionState::AwaitGreeting);
+}
+
+#[test]
+fn test_greeting_deadline_one_ms_before_and_after() {
+    let mut s = Session::new(loopback(), Millis(0)).unwrap();
+    let d = s.deadline().unwrap();
+    assert_eq!(d, Millis(300_000));
+    assert!(s.on_timeout(Millis(d.0 - 1)).is_ok());
+    let e = s.on_timeout(d).unwrap_err();
+    assert!(matches!(e.kind(), ErrorKind::Timeout));
+    assert_eq!(e.stage(), Some(Stage::Greeting));
+    assert_eq!(s.state(), SessionState::Closed);
+}
+
+#[test]
+fn test_no_output_after_starttls_until_tls_established() {
+    let mut c = loopback();
+    c.security = SessionSecurity::StartTlsRequired;
+    let mut s = Session::new(c, Millis(0)).unwrap();
+    s.receive(b"220 mx\r\n", Millis(1)).unwrap();
+    drain(&mut s);
+    s.receive(b"250-mx\r\n250 STARTTLS\r\n", Millis(2)).unwrap();
+    assert_eq!(drain(&mut s), b"STARTTLS\r\n");
+    s.receive(b"220 go\r\n", Millis(3)).unwrap();
+    assert_eq!(s.state(), SessionState::NeedTls);
+    assert!(s.transmit().is_empty(), "T-7: nothing queued before TLS");
+    assert!(!s.wants_read());
+    // Bytes arriving later in plaintext are an injection too.
+    let e = s.receive(b"250 OK\r\n", Millis(4)).unwrap_err();
+    assert!(matches!(e.kind(), ErrorKind::StartTlsInjection));
+    assert!(e.is_security_event() && e.is_temporary());
+}
+
+#[test]
+fn test_capabilities_discarded_after_tls() {
+    let mut c = loopback();
+    c.security = SessionSecurity::StartTlsRequired;
+    let mut s = Session::new(c, Millis(0)).unwrap();
+    s.receive(b"220 mx\r\n", Millis(1)).unwrap();
+    drain(&mut s);
+    s.receive(b"250-mx\r\n250-PIPELINING\r\n250 STARTTLS\r\n", Millis(2))
+        .unwrap();
+    drain(&mut s);
+    s.receive(b"220 go\r\n", Millis(3)).unwrap();
+    assert!(s.capabilities().is_some());
+    s.tls_established(TlsInfo::new(TlsProtocol::Tls12), Millis(4))
+        .unwrap();
+    assert!(s.capabilities().is_none());
+    assert!(s.is_secure());
+    assert_eq!(drain(&mut s), b"EHLO [127.0.0.1]\r\n");
+    // The second EHLO advertises STARTTLS again: it is never sent twice.
+    s.receive(b"250-mx\r\n250 STARTTLS\r\n", Millis(5)).unwrap();
+    assert!(s.transmit().is_empty());
+    assert_eq!(s.state(), SessionState::Ready);
+    assert!(!s.capabilities().unwrap().has(Extension::Pipelining));
+    assert_eq!(s.tls_protocol(), Some(TlsProtocol::Tls12));
+}
+
+#[test]
+fn test_pipelined_group_split_at_4k() {
+    let mut s = ready(b"250-mx\r\n250 PIPELINING\r\n");
+    s.begin(&envelope(100), BodyFlags::default(), 10, Millis(3))
+        .unwrap();
+    let first = drain(&mut s);
+    assert!(
+        first.len() <= GROUP_LIMIT + MAX_RCPT_LINE,
+        "{}",
+        first.len()
+    );
+    assert!(!first.ends_with(b"DATA\r\n"));
+    let rcpts = first.windows(4).filter(|w| w == b"RCPT").count();
+    assert!(rcpts < 100);
+    // Replies for the first group release the next one.
+    let mut replies = Vec::new();
+    replies.extend_from_slice(b"250 ok\r\n");
+    for _ in 0..rcpts {
+        replies.extend_from_slice(b"250 ok\r\n");
+    }
+    s.receive(&replies, Millis(4)).unwrap();
+    let second = drain(&mut s);
+    assert!(second.starts_with(b"RCPT TO:<user"));
+}
+
+const MAX_RCPT_LINE: usize = 64;
+
+#[test]
+fn test_body_dot_stuffed_and_possibly_delivered_after_terminator_written() {
+    let mut s = ready(b"250 mx\r\n");
+    s.begin(&envelope(1), BodyFlags::default(), 10, Millis(3))
+        .unwrap();
+    assert_eq!(drain(&mut s), b"MAIL FROM:<a@example.com>\r\n");
+    s.receive(b"250 ok\r\n", Millis(4)).unwrap();
+    drain(&mut s);
+    s.receive(b"250 ok\r\n", Millis(5)).unwrap();
+    assert_eq!(drain(&mut s), b"DATA\r\n");
+    s.receive(b"354 go\r\n", Millis(6)).unwrap();
+    while s.poll_event().is_some() {}
+    assert_eq!(s.state(), SessionState::Body);
+    assert_eq!(s.body(b".a\r\n", Millis(7)).unwrap(), 4);
+    s.end_body(Millis(8)).unwrap();
+    assert!(s.end_body(Millis(8)).is_err(), "end_body twice");
+    // Not yet transmitted: a lost connection is not possibly delivered.
+    let mut early = ready(b"250 mx\r\n");
+    early
+        .begin(&envelope(1), BodyFlags::default(), 10, Millis(3))
+        .unwrap();
+    let e = early.connection_lost(ErrorKind::ConnectionClosed);
+    assert!(!e.possibly_delivered());
+    let wire = s.transmit().to_vec();
+    assert_eq!(wire, b"..a\r\n.\r\n");
+    s.transmitted(wire.len() - 1);
+    let mut partial = s.clone_for_test();
+    let e = partial.connection_lost(ErrorKind::ConnectionClosed);
+    assert!(
+        !e.possibly_delivered(),
+        "the last byte of the terminator was not written"
+    );
+    s.transmitted(1);
+    let e = s.connection_lost(ErrorKind::ConnectionClosed);
+    assert!(e.possibly_delivered() && e.is_temporary());
+}
+
+#[test]
+fn test_body_bare_lf_refused_and_session_closed() {
+    let mut s = ready(b"250 mx\r\n");
+    s.begin(&envelope(1), BodyFlags::default(), 10, Millis(3))
+        .unwrap();
+    drain(&mut s);
+    s.receive(b"250 ok\r\n250 ok\r\n", Millis(4)).unwrap();
+    drain(&mut s);
+    s.receive(b"250 ok\r\n", Millis(4)).ok();
+    drain(&mut s);
+    s.receive(b"354 go\r\n", Millis(5)).ok();
+    if s.state() == SessionState::Body {
+        let e = s
+            .body(b"x\n.\nRCPT TO:<evil@x>\r\n", Millis(6))
+            .unwrap_err();
+        assert!(matches!(
+            e.kind(),
+            ErrorKind::Build(crate::error::BuildError::BareLineFeed { .. })
+        ));
+        assert!(e.is_permanent());
+        assert_eq!(s.state(), SessionState::Closed);
+    }
+}
+
+#[test]
+fn test_quit_closes_on_221() {
+    let mut s = ready(b"250 mx\r\n");
+    s.quit(Millis(3)).unwrap();
+    assert_eq!(drain(&mut s), b"QUIT\r\n");
+    s.receive(b"221 bye\r\n", Millis(4)).unwrap();
+    assert_eq!(s.state(), SessionState::Closed);
+    assert!(matches!(
+        s.poll_event(),
+        Some(Event::Closed { error: None })
+    ));
+    assert!(s.quit(Millis(5)).is_ok());
+}
+
+#[test]
+fn test_reset_and_noop_round_trips() {
+    let mut s = ready(b"250 mx\r\n");
+    s.noop(Millis(3)).unwrap();
+    assert_eq!(drain(&mut s), b"NOOP\r\n");
+    s.receive(b"250 ok\r\n", Millis(4)).unwrap();
+    s.reset(Millis(5)).unwrap();
+    assert_eq!(drain(&mut s), b"RSET\r\n");
+    s.receive(b"250 ok\r\n", Millis(6)).unwrap();
+    assert_eq!(s.state(), SessionState::Ready);
+}
+
+#[test]
+fn test_421_mid_pipeline_closes_temporary() {
+    let mut s = ready(b"250-mx\r\n250 PIPELINING\r\n");
+    s.begin(&envelope(2), BodyFlags::default(), 10, Millis(3))
+        .unwrap();
+    drain(&mut s);
+    let e = s
+        .receive(b"250 ok\r\n421 4.3.2 bye\r\n", Millis(4))
+        .unwrap_err();
+    assert!(e.is_temporary() && !e.possibly_delivered());
+    assert_eq!(e.stage(), Some(Stage::Rcpt));
+}
+
+#[test]
+fn test_session_is_send() {
+    fn send<T: Send>() {}
+    send::<Session>();
+}
+
+impl Session {
+    fn clone_for_test(&self) -> Session {
+        Session {
+            config: self.config.clone(),
+            state: self.state,
+            out: self.out.clone(),
+            parser: self.parser.clone(),
+            pending: self.pending.clone(),
+            events: self.events.clone(),
+            caps: self.caps.clone(),
+            secure: self.secure,
+            tls_protocol: self.tls_protocol,
+            txn: self.txn.clone(),
+            body_deadline: self.body_deadline,
+            group: self.group,
+        }
+    }
+}

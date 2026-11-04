@@ -1,0 +1,75 @@
+[package]
+name = "smtp-net-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.smtp-net]
+path = ".."
+features = ["testing"]
+
+# Keeps this crate out of any parent workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "reply"
+path = "fuzz_targets/reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ehlo"
+path = "fuzz_targets/ehlo.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_server_bytes"
+path = "fuzz_targets/session_server_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "address"
+path = "fuzz_targets/address.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "content_type"
+path = "fuzz_targets/content_type.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header_value"
+path = "fuzz_targets/header_value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "raw_message"
+path = "fuzz_targets/raw_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transcript"
+path = "fuzz_targets/transcript.rs"
+test = false
+doc = false
+bench = false

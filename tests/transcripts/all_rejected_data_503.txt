@@ -1,0 +1,20 @@
+# config: loopback
+# envelope: b@example.org, c@example.org
+# expect: temp
+# closed: none
+S: 220 mx.example.com ESMTP
+C: EHLO [127.0.0.1]
+S: 250-mx.example.com
+S: 250 PIPELINING
+C: MAIL FROM:<a@example.com>
+C: RCPT TO:<b@example.org>
+C: RCPT TO:<c@example.org>
+C: DATA
+S: 250 ok
+S: 550 no
+S: 451 try later
+S: 503 no valid recipients
+C: RSET
+S: 250 ok
+C: QUIT
+S: 221 bye

@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "smtp-net"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -14,6 +14,9 @@ license = "Apache-2.0 OR MIT"
 
 # Readme
 readme = "README.md"
+
+# The fuzz and benchmark crates are their own workspaces, never packaged.
+exclude = ["/fuzz", "/benches"]
 
 # Description
 description = "SMTP client for Rust: message submission over STARTTLS or implicit TLS, authentication, pipelining, MIME message building, DKIM signing, and a sans-IO core."
@@ -44,19 +47,55 @@ path = "src/lib.rs"
 # FEATURE FLAGS
 # #################################
 [features]
-default = []
+default = ["std", "client"]
+# OS random source (mod-rand), the system clock for Date, std::error::Error,
+# IoSink. Without it the core (addresses, messages, the session) is no_std
+# with alloc; randomness and time are passed in.
+std = ["dep:mod-rand"]
+# The blocking driver over net-io: send, send_local, Client.
+client = ["std", "dep:net-io"]
+# ScriptedServer, TestServer, Fault: test support for this crate's users.
+testing = ["client"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# None yet. Planned dependencies and the reason for each are listed in
-# dev/PLAN.md; each is added with the first code that needs it.
+# RFC 5322 addresses, header folding, RFC 2047 words, RFC 2231 parameters,
+# Message-ID, and dates (dev/PLAN.md D-014). First party, no dependencies.
+parse-net = { version = "0.9", default-features = false, features = ["alloc"] }
+# OS CSPRNG for Message-ID and MIME boundaries. First party, no dependencies.
+mod-rand = { version = "1", default-features = false, features = ["tier3"], optional = true }
+# Outbound TCP with deadlines, and the sans-IO TLS seam. First party, no dependencies.
+net-io = { version = "0.6", default-features = false, optional = true }
 
 
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
+# Property tests only; never a runtime dependency.
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+
+[[example]]
+name = "send_local"
+required-features = ["client"]
+
+[[example]]
+name = "sans_io_driver"
+required-features = ["testing"]
+
+[[test]]
+name = "interop"
+required-features = ["client"]
+
+[[test]]
+name = "transcripts"
+required-features = ["testing"]
+
+[[test]]
+name = "driver"
+required-features = ["testing"]
 
 
 # RELEASE PROFILE
