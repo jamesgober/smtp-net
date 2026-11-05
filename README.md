@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: feature complete (<code>0.5.0</code>).</strong> Message building, the sans-IO session, submission to the local mail server, STARTTLS and implicit TLS relays, AUTH (SCRAM-SHA-256, PLAIN, LOGIN, XOAUTH2), DKIM signing with Ed25519 and RSA, job payloads, pacing, a connection pool, CHUNKING, and DSN work and are tested. <code>0.6.0</code> measures and tunes performance. The full API is in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: feature complete (<code>0.5.1</code>).</strong> Message building, the sans-IO session, submission to the local mail server, STARTTLS and implicit TLS relays, AUTH (SCRAM-SHA-256, PLAIN, LOGIN, XOAUTH2), DKIM signing with Ed25519 and RSA, job payloads, pacing, a connection pool, CHUNKING, and DSN work and are tested. <code>0.6.0</code> measures and tunes performance. The full API is in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 

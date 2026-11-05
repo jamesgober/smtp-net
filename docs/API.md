@@ -283,7 +283,7 @@ impl Headers {
     pub fn get(&self, name: &str) -> Option<&str>;            // first instance, case-insensitive
     pub fn iter(&self) -> impl Iterator<Item = (&HeaderName, &str)>;
 }
-pub fn encode_word(text: &str, out: &mut String) -> Result<(), HeaderError>;   // RFC 2047, Q form for now (D-015)
+pub fn encode_word(text: &str, out: &mut String) -> Result<(), HeaderError>;   // RFC 2047, Q or B (D-082)
 pub fn fold_header(name: &str, value: &str, out: &mut Vec<u8>) -> Result<(), HeaderError>;
 pub fn base64_encode_lines(input: &[u8], out: &mut [u8]) -> Result<usize, Error>;   // 76-char lines
 pub fn quoted_printable_encode(input: &[u8], out: &mut [u8], state: &mut QpState) -> Result<usize, Error>;
@@ -293,7 +293,7 @@ pub fn check_header_value(field: &str, value: &str) -> Result<(), HeaderError>; 
 | Item | Behaviour | Errors | Cost | Grade | Tier | Ver |
 |---|---|---|---|---|---|---|
 | `Headers::get`, `iter` | read access for callers and for DKIM header selection | none | 0 alloc | P1 | 3 | 0.3 |
-| `encode_word` | RFC 2047 encoded words, `UTF-8` charset, at most 75 characters each, split only between UTF-8 scalar values; the Q form (the B form, shorter for mostly non-ASCII text, when parse-net offers it, D-015) | `HeaderError::ControlCharacter` | 0 alloc when `out` has capacity | P1 | 3 | 0.3 |
+| `encode_word` | RFC 2047 encoded words, `UTF-8` charset, at most 75 characters each, split only between UTF-8 scalar values; B when most octets are not ASCII and B is shorter, otherwise Q (D-082) | `HeaderError::ControlCharacter` | 0 alloc when `out` has capacity | P1 | 3 | 0.3 |
 | `fold_header` | folds at whitespace to 78 where possible; refuses if any line would exceed 998 | `HeaderError::LineTooLong` | 0 alloc with capacity | P1 | 3 | 0.3 |
 | `base64_encode_lines` | standard alphabet, padding, CRLF every 76 characters; streaming with a 3-byte carry in the serializer | `Error::BufferTooSmall` | at least 2 GB/s **[est.]**, 0 alloc | P1 | 3 | 0.3 |
 | `quoted_printable_encode`, `QpState` | RFC 2045 6.7 with the extra `.` and `From ` rules (7.9); streaming state across chunks | `Error::BufferTooSmall` | at least 800 MB/s **[est.]**, 0 alloc | P1 | 3 | 0.3 |
@@ -1054,3 +1054,4 @@ Each change is recorded in `dev/PLAN.md` section 19.
 | 0.5.0 | `Pool::{new, wait_limit, send, send_prepared, idle, server}`; `ErrorKind::PoolExhausted`; `ConfigError::PoolSize` | D-077 |
 | 0.5.0 | `Attachment::from_source` (feature `std`), `Attachment::{len, is_empty, is_streamed}`, `BodySource` returning `SourceError`, `ReadSource`; `ErrorKind::Source(SourceError)` | D-078 |
 | 0.5.0 | Test support: `TestServerBuilder::oauth2`, SCRAM-SHA-256 in `TestServer` with the `scram` feature, `Fault::BadScramSignature`, transcripts take `C: <EMPTY>` | none |
+| 0.5.1 | RFC 2047 words choose Q or B per header; parse-net 0.9.1 | D-082 |

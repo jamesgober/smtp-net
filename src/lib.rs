@@ -41,7 +41,7 @@
 //!
 //! ## Status
 //!
-//! `0.5.0`, feature complete: messages, the session, local submission,
+//! `0.5.1`, feature complete: messages, the session, local submission,
 //! STARTTLS and implicit TLS relays, AUTH (SCRAM-SHA-256, PLAIN, LOGIN,
 //! XOAUTH2, custom mechanisms), DKIM signing (Ed25519 and RSA), CHUNKING,
 //! DSN, pacing, job payloads, a connection pool, and an observer hook.
