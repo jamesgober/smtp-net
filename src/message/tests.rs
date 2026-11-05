@@ -577,11 +577,12 @@ fn test_subject_encoding_and_lookalike() {
         .unwrap();
     let s = bytes(&m);
     assert!(s.is_ascii());
+    // Mostly non-ASCII octets (the emoji is four): B, the shorter form (D-082).
     assert!(
         m.headers()
             .get("Subject")
             .unwrap()
-            .starts_with("=?UTF-8?Q?")
+            .starts_with("=?UTF-8?B?")
     );
     let m = base()
         .subject("=?utf-8?q?Bank_alert?=")

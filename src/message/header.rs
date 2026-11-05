@@ -2,12 +2,12 @@
 //!
 //! Every value that reaches the header block passes [`check_header_value`]
 //! first; there is no other way in (PLAN 10.2). Folding and RFC 2047 words
-//! come from parse-net (`mail::fold`, `mail::encode_words`).
+//! come from parse-net (`mail::fold`, `mail::encode_words`, `mail::encode_words_b`).
 
 use alloc::{string::String, vec::Vec};
 use core::fmt;
 
-use parse_net::{WriteError, mail, write};
+use parse_net::{CountSink, WriteError, mail, write};
 
 use crate::{address::Mailbox, error::HeaderError};
 
@@ -156,9 +156,10 @@ impl Headers {
     }
 }
 
-/// Appends `text` as RFC 2047 encoded words (`=?UTF-8?Q?...?=`, at most 75
-/// characters each, split only between characters, separated by CRLF SP) to
-/// `out`. Printable ASCII without `=?` is appended as it is.
+/// Appends `text` as RFC 2047 encoded words (`=?UTF-8?Q?...?=` or
+/// `=?UTF-8?B?...?=`, whichever is shorter; at most 75 characters each,
+/// split only between characters, separated by CRLF SP) to `out`. Printable
+/// ASCII without `=?` is appended as it is.
 ///
 /// # Errors
 ///
@@ -170,15 +171,41 @@ impl Headers {
 /// let mut out = String::new();
 /// smtp_net::encode_word("Caf\u{e9}", &mut out)?;
 /// assert_eq!(out, "=?UTF-8?Q?Caf=C3=A9?=");
+/// out.clear();
+/// smtp_net::encode_word("\u{4f1a}\u{8b70}\u{306e}\u{304a}\u{77e5}\u{3089}\u{305b}", &mut out)?;
+/// assert_eq!(out, "=?UTF-8?B?5Lya6K2w44Gu44GK55+l44KJ44Gb?=");
 /// # Ok::<(), smtp_net::HeaderError>(())
 /// ```
 pub fn encode_word(text: &str, out: &mut String) -> Result<(), HeaderError> {
     check_header_value("encoded word", text)?;
     let mut buf = Vec::new();
-    mail::encode_words(text, MAX_ENCODED_WORD, &mut buf)
-        .map_err(|e| map_write("encoded word", e))?;
+    encode_shorter(text, MAX_ENCODED_WORD, &mut buf).map_err(|e| map_write("encoded word", e))?;
     out.push_str(&String::from_utf8_lossy(&buf));
     Ok(())
+}
+
+/// RFC 2047 words: `B` when most of the text's octets are not ASCII and `B`
+/// comes out shorter (a Japanese or Russian subject), otherwise `Q`, which
+/// stays readable for mostly ASCII text such as `José` even where `B` would
+/// save an octet (D-082). The two forms are counted, not written twice.
+pub(crate) fn encode_shorter(
+    text: &str,
+    room_first_line: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), WriteError> {
+    let non_ascii = text.bytes().filter(|b| !b.is_ascii()).count();
+    if non_ascii * 2 <= text.len() {
+        return mail::encode_words(text, room_first_line, out);
+    }
+    let mut q = CountSink::new();
+    mail::encode_words(text, room_first_line, &mut q)?;
+    let mut b = CountSink::new();
+    mail::encode_words_b(text, room_first_line, &mut b)?;
+    if b.count() < q.count() {
+        mail::encode_words_b(text, room_first_line, out)
+    } else {
+        mail::encode_words(text, room_first_line, out)
+    }
 }
 
 /// Writes `Name: value` into `out`, folded at whitespace so lines stay within
@@ -250,7 +277,7 @@ pub(crate) fn write_mailbox(m: &Mailbox, out: &mut String, col: usize) {
         let room = RECOMMENDED_HEADER_LINE
             .saturating_sub(col)
             .max(MAX_ENCODED_WORD.min(16));
-        if mail::encode_words(name, room, &mut buf).is_ok() {
+        if encode_shorter(name, room, &mut buf).is_ok() {
             out.push_str(&String::from_utf8_lossy(&buf));
         }
     }
@@ -285,7 +312,7 @@ impl HeaderBlock {
             self.bytes.extend_from_slice(name.as_bytes());
             self.bytes.extend_from_slice(b": ");
             let room = RECOMMENDED_HEADER_LINE.saturating_sub(name.len() + 2);
-            mail::encode_words(text, room, &mut self.bytes).map_err(|e| map_write(field, e))?;
+            encode_shorter(text, room, &mut self.bytes).map_err(|e| map_write(field, e))?;
         }
         self.finish_line(name, start);
         Ok(())
@@ -473,6 +500,54 @@ mod tests {
             mb(Some("A&B"), "a@b.example").to_string(),
             "A&B <a@b.example>"
         );
+    }
+
+    #[test]
+    fn test_shorter_of_q_and_b_is_chosen() {
+        // Mostly non-ASCII: B. Mostly ASCII: Q. Both decode to the text.
+        let cases = [
+            (
+                "\u{4f1a}\u{8b70}\u{306e}\u{304a}\u{77e5}\u{3089}\u{305b}\u{3067}\u{3059}",
+                "B",
+            ),
+            (
+                "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}, \u{43c}\u{438}\u{440}",
+                "B",
+            ),
+            ("Caf\u{e9} au lait, ready at 9", "Q"),
+            ("Bank alert =? check", "Q"),
+        ];
+        for (text, form) in cases {
+            let mut b = HeaderBlock::default();
+            b.unstructured("Subject", "Subject", text).unwrap();
+            let v = b.headers.get("subject").unwrap();
+            assert!(
+                v.starts_with(&alloc::format!("=?UTF-8?{form}?")),
+                "{text}: {v}"
+            );
+            let (mut q, mut bb) = (CountSink::new(), CountSink::new());
+            mail::encode_words(text, 69, &mut q).unwrap();
+            mail::encode_words_b(text, 69, &mut bb).unwrap();
+            assert!(v.len() <= q.count().min(bb.count()) + 8, "{text}");
+            let mut out = [0u8; 512];
+            let decoded =
+                mail::decode_words(v.as_bytes(), &parse_net::Limits::DEFAULT, &mut out).unwrap();
+            assert_eq!(decoded, text);
+        }
+        // A long Japanese subject: B words, each at most 75, lines within 78.
+        let long = "\u{30a2}\u{30ab}\u{30a6}\u{30f3}\u{30c8}\u{306e}\u{78ba}\u{8a8d}".repeat(8);
+        let mut b = HeaderBlock::default();
+        b.unstructured("Subject", "Subject", &long).unwrap();
+        let s = core::str::from_utf8(&b.bytes).unwrap();
+        assert!(s.lines().all(|l| l.len() <= 78), "{s}");
+        assert!(
+            s.split_whitespace()
+                .filter(|w| w.starts_with("=?"))
+                .all(|w| w.starts_with("=?UTF-8?B?") && w.len() <= 75)
+        );
+        // Display names too.
+        let m = mb(Some("\u{5c71}\u{7530}\u{592a}\u{90ce}"), "taro@example.jp").to_string();
+        assert!(m.starts_with("=?UTF-8?B?"), "{m}");
     }
 
     #[test]

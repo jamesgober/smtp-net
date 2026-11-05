@@ -13,6 +13,16 @@
 
 ---
 
+## [0.5.1] - 2026-11-05
+
+### Changed
+
+- RFC 2047 encoded words (subjects, other unstructured headers, display
+  names, `encode_word`) use the B form when most of the text is not ASCII
+  and B is shorter, through parse-net 0.9.1's `encode_words_b`; a Japanese
+  subject is about 40% shorter. Mostly ASCII text keeps the Q form.
+- parse-net 0.9.1 is the minimum.
+
 ## [0.5.0] - 2026-11-04
 
 Feature complete: DKIM, SCRAM-SHA-256, XOAUTH2, the connection pool, the

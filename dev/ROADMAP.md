@@ -58,6 +58,9 @@ Depends on: crypt-io 1.3 with `sign-ed25519`, `sign-rsa`, `kdf-pbkdf2` (publishe
 - [x] T-19 (no `l=`), T-20 (oversigning, checked by dkimpy), T-21 (key sizes), T-22 (no key in `Debug` or errors), T-29 (constant-time SCRAM check, both paths tested), T-31 (`cargo audit` and `cargo deny` pass with no ignores).
 - Moved to v0.8.0: "DKIM passes at Gmail and Outlook.com" needs a sending domain with the keys in its DNS; it runs with the field test (D-070). Reason: James's domain and DNS.
 
+## v0.5.1 - RFC 2047 B form - DONE
+- [x] parse-net 0.9.1's `encode_words_b`: the B form for mostly non-ASCII headers when it is shorter (D-082, closes the D-015 gap).
+
 ## v0.6.0 - Optimisation
 Exit: every target in PLAN 11.1 met, or the miss recorded with the measured number and the reason; `docs/PERFORMANCE.md` published.
 - [ ] Benchmarks against lettre, mail-builder, and mail-send in `smtp-net-bench` (D-035).
@@ -78,7 +81,7 @@ Depends on: task-io in production and the first site live (James).
 
 ## v0.9.x - Beta and the pre-1.0 polish pass
 Exit: no API change request open; every review finding closed test-first; the 1.0 readiness note written and handed to James.
-- [ ] Revisit every accepted gap and every item this file moved (D-015 RFC 2047 B form, D-025 `tls` default, D-033 field test, IDNA and SASLprep gaps, any 0.6 target miss), and close or re-record each with its reason.
+- [ ] Revisit every accepted gap and every item this file moved (D-025 `tls` default, D-033 field test, IDNA and SASLprep gaps, any 0.6 target miss), and close or re-record each with its reason.
 - [ ] Re-tune performance against lettre and mail-builder on current versions; republish `docs/PERFORMANCE.md`.
 - [ ] Re-run the security and edge-case review (PLAN 10, 12.10) with an adversarial reader; every finding fixed test-first.
 - [ ] API freeze candidate; docs complete; `0.9.x` release candidates.
