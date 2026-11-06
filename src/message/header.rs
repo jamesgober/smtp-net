@@ -177,8 +177,12 @@ impl Headers {
         let line = line.strip_prefix(b" ").unwrap_or(line);
         // The block holds only ASCII and UTF-8 the crate wrote itself.
         let text = core::str::from_utf8(line).unwrap_or("");
-        for piece in text.split("\r\n") {
-            self.text.push_str(piece);
+        if text.contains('\r') {
+            for piece in text.split("\r\n") {
+                self.text.push_str(piece);
+            }
+        } else {
+            self.text.push_str(text);
         }
         self.list
             .push((HeaderName::of(name), start, self.text.len()));
@@ -315,24 +319,25 @@ pub(crate) fn write_mailbox(m: &Mailbox, out: &mut String, col: usize) {
     out.push('>');
 }
 
-/// Names the crate writes itself: kept as `&'static str`, not copied.
+/// Names the crate writes itself: kept as `&'static str`, not copied. The
+/// ones every message has come first.
 const WRITTEN: &[&str] = &[
     "Date",
     "From",
-    "Sender",
-    "Reply-To",
     "To",
-    "Cc",
     "Subject",
     "Message-ID",
+    "MIME-Version",
+    "Content-Type",
+    "Content-Transfer-Encoding",
+    "Sender",
+    "Reply-To",
+    "Cc",
     "In-Reply-To",
     "References",
     "List-Unsubscribe",
     "List-Unsubscribe-Post",
     "Auto-Submitted",
-    "MIME-Version",
-    "Content-Type",
-    "Content-Transfer-Encoding",
     "Content-ID",
     "Content-Disposition",
 ];
@@ -372,6 +377,17 @@ impl HeaderBlock {
             index: false,
             ..HeaderBlock::with_capacity(capacity)
         }
+    }
+
+    /// `Name: value` for a field the crate writes with a fixed, short,
+    /// printable value (`MIME-Version: 1.0`, `Content-Transfer-Encoding:
+    /// 7bit`): no folding or checks needed.
+    pub(crate) fn literal(&mut self, name: &str, value: &str) {
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(name.as_bytes());
+        self.bytes.extend_from_slice(b": ");
+        self.bytes.extend_from_slice(value.as_bytes());
+        self.finish_line(name, start);
     }
 
     /// `Name: <id>`, the id between angle brackets.

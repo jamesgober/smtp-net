@@ -883,7 +883,7 @@ impl MessageBuilder {
         for (name, value) in &self.custom {
             block.unstructured(name.as_str(), "header", value)?;
         }
-        block.folded("MIME-Version", "1.0")?;
+        block.literal("MIME-Version", "1.0");
         body.write_headers(&mut block)?;
 
         let encoded_len = block.bytes.len() as u64 + 2 + body.body_len();

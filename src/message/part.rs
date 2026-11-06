@@ -729,7 +729,7 @@ impl Part {
             .chain(boundary);
         block.with_params("Content-Type", &self.content_type.essence, params)?;
         if let Some(enc) = self.encoding() {
-            block.folded("Content-Transfer-Encoding", enc.name())?;
+            block.literal("Content-Transfer-Encoding", enc.name());
         }
         if let Some(id) = &self.content_id {
             let mut v = String::with_capacity(id.len() + 2);

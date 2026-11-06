@@ -93,6 +93,29 @@ fn pair(v: u32) -> [u8; 2] {
 /// must hold `4 * ceil(len / 3)` octets); returns the bytes written.
 pub(crate) fn base64_into(input: &[u8], out: &mut [u8]) -> usize {
     let mut n = 0;
+    // Six octets to eight characters per step: four pair lookups and one
+    // eight-octet copy.
+    let mut sixes = input.chunks_exact(6);
+    for (g, o) in (&mut sixes).zip(out.chunks_exact_mut(8)) {
+        let &[a, b, c, d, e, f] = g else {
+            continue;
+        };
+        let v = (u64::from(a) << 40)
+            | (u64::from(b) << 32)
+            | (u64::from(c) << 24)
+            | (u64::from(d) << 16)
+            | (u64::from(e) << 8)
+            | u64::from(f);
+        let [p0, p1] = pair((v >> 36) as u32);
+        let [p2, p3] = pair((v >> 24) as u32);
+        let [p4, p5] = pair((v >> 12) as u32);
+        let [p6, p7] = pair(v as u32);
+        o.copy_from_slice(&[p0, p1, p2, p3, p4, p5, p6, p7]);
+        n += 8;
+    }
+    let input = sixes.remainder();
+    let base = n;
+    let out = out.get_mut(base..).unwrap_or(&mut []);
     let mut groups = input.chunks_exact(3);
     let mut dst = out.chunks_exact_mut(4);
     for (g, o) in (&mut groups).zip(&mut dst) {
@@ -120,7 +143,7 @@ pub(crate) fn base64_into(input: &[u8], out: &mut [u8]) -> usize {
             },
             b'=',
         ];
-        if let Some(d) = out.get_mut(n..n + 4) {
+        if let Some(d) = out.get_mut(n - base..n - base + 4) {
             d.copy_from_slice(&chars);
         }
         n += 4;
