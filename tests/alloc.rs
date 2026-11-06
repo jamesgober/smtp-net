@@ -149,7 +149,10 @@ fn test_session_body_and_positive_replies_allocate_nothing() {
         &[Address::parse("b@example.org").unwrap()],
     )
     .unwrap();
-    s.begin(&env, BodyFlags::default(), 10, Millis(2)).unwrap();
+    // The envelope is shared, not copied (D-084): MAIL and RCPT are written
+    // into the preallocated output.
+    let (n, _) = count(|| s.begin(&env, BodyFlags::default(), 10, Millis(2)).unwrap());
+    assert_eq!(n, 0, "begin");
     s.transmitted(s.transmit().len());
     let (n, _) = count(|| {
         s.receive(b"250 ok\r\n250 ok\r\n354 go\r\n", Millis(3))

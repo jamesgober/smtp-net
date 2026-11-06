@@ -26,6 +26,13 @@ const DEFAULT_MAX_RECIPIENTS: u16 = 100;
 /// ```
 #[derive(Clone, PartialEq, Eq)]
 pub struct Envelope {
+    /// Shared: the session and each transaction clone the envelope, which
+    /// is then a reference-count increment, not a copy of every address.
+    data: alloc::sync::Arc<EnvelopeData>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct EnvelopeData {
     from: Option<Address>,
     recipients: Vec<Address>,
     dsn: Option<Dsn>,
@@ -244,28 +251,30 @@ impl Envelope {
             return Err(BuildError::TooManyRecipients { limit }.into());
         }
         Ok(Envelope {
-            from,
-            recipients,
-            dsn: None,
+            data: alloc::sync::Arc::new(EnvelopeData {
+                from,
+                recipients,
+                dsn: None,
+            }),
         })
     }
 
     /// The reverse-path; `None` is the null sender `<>`.
     #[must_use]
     pub fn from(&self) -> Option<&Address> {
-        self.from.as_ref()
+        self.data.from.as_ref()
     }
 
     /// The forward-paths, in order.
     #[must_use]
     pub fn recipients(&self) -> &[Address] {
-        &self.recipients
+        &self.data.recipients
     }
 
     /// Replaces the reverse-path: the address bounces go to, distinct from From.
     #[must_use]
     pub fn return_path(mut self, address: Address) -> Envelope {
-        self.from = Some(address);
+        alloc::sync::Arc::make_mut(&mut self.data).from = Some(address);
         self
     }
 
@@ -282,14 +291,14 @@ impl Envelope {
     /// Adds DSN parameters (RFC 3461).
     #[must_use]
     pub fn dsn(mut self, dsn: Dsn) -> Envelope {
-        self.dsn = Some(dsn);
+        alloc::sync::Arc::make_mut(&mut self.data).dsn = Some(dsn);
         self
     }
 
     /// The DSN parameters, when set.
     #[must_use]
     pub fn dsn_parameters(&self) -> Option<&Dsn> {
-        self.dsn.as_ref()
+        self.data.dsn.as_ref()
     }
 
     /// A copy with only the recipients at `indices` (a further transaction
@@ -297,29 +306,31 @@ impl Envelope {
     #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn subset(&self, indices: &[usize]) -> Envelope {
         Envelope {
-            from: self.from.clone(),
-            recipients: indices
-                .iter()
-                .filter_map(|&i| self.recipients.get(i).cloned())
-                .collect(),
-            dsn: self.dsn.clone(),
+            data: alloc::sync::Arc::new(EnvelopeData {
+                from: self.data.from.clone(),
+                recipients: indices
+                    .iter()
+                    .filter_map(|&i| self.data.recipients.get(i).cloned())
+                    .collect(),
+                dsn: self.data.dsn.clone(),
+            }),
         }
     }
 
     /// True when an envelope address is not ASCII (needs SMTPUTF8).
     #[must_use]
     pub fn needs_smtputf8(&self) -> bool {
-        self.from.as_ref().is_some_and(Address::needs_smtputf8)
-            || self.recipients.iter().any(Address::needs_smtputf8)
+        self.data.from.as_ref().is_some_and(Address::needs_smtputf8)
+            || self.data.recipients.iter().any(Address::needs_smtputf8)
     }
 }
 
 impl fmt::Debug for Envelope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Envelope")
-            .field("from", &self.from)
-            .field("recipients", &self.recipients)
-            .field("dsn", &self.dsn)
+            .field("from", &self.data.from)
+            .field("recipients", &self.data.recipients)
+            .field("dsn", &self.data.dsn)
             .finish()
     }
 }
@@ -548,13 +559,15 @@ impl PreparedMessage {
     pub fn encode(&self) -> Vec<u8> {
         let env = &self.envelope;
         let mut n = MAGIC.len() + 2 + 2 + 2 + 4 + 4 + self.bytes.len();
-        n += env.from.as_ref().map_or(0, |a| a.as_str().len());
+        n += env.data.from.as_ref().map_or(0, |a| a.as_str().len());
         n += env
+            .data
             .recipients
             .iter()
             .map(|a| 2 + a.as_str().len())
             .sum::<usize>();
         n += env
+            .data
             .dsn
             .as_ref()
             .map_or(0, |d| 4 + d.envelope_id.as_ref().map_or(0, String::len));
@@ -562,29 +575,30 @@ impl PreparedMessage {
         out.extend_from_slice(MAGIC);
         out.push(FORMAT_VERSION);
         let mut flags = 0u8;
-        if env.from.is_none() {
+        if env.data.from.is_none() {
             flags |= FLAG_NULL_SENDER;
         }
-        if env.dsn.is_some() {
+        if env.data.dsn.is_some() {
             flags |= FLAG_DSN;
         }
         out.push(flags);
         put_short(
             &mut out,
-            env.from
+            env.data
+                .from
                 .as_ref()
                 .map_or(&b""[..], |a| a.as_str().as_bytes()),
         );
         // Envelopes hold at most u16::MAX recipients (MessageLimits is u16).
         out.extend_from_slice(
-            &u16::try_from(env.recipients.len())
+            &u16::try_from(env.data.recipients.len())
                 .unwrap_or(u16::MAX)
                 .to_be_bytes(),
         );
-        for a in env.recipients.iter().take(usize::from(u16::MAX)) {
+        for a in env.data.recipients.iter().take(usize::from(u16::MAX)) {
             put_short(&mut out, a.as_str().as_bytes());
         }
-        if let Some(d) = &env.dsn {
+        if let Some(d) = &env.data.dsn {
             out.push(match d.ret {
                 None => 0,
                 Some(DsnReturn::Full) => 1,
@@ -709,8 +723,8 @@ impl PreparedMessage {
         }
         let bytes = r.take(len)?.to_vec();
         let mut envelope = Envelope::with_limit(from, &recipients, u16::MAX)?;
-        envelope.dsn = dsn;
-        if envelope.recipients.len() != recipients.len() {
+        alloc::sync::Arc::make_mut(&mut envelope.data).dsn = dsn;
+        if envelope.data.recipients.len() != recipients.len() {
             return Err(PayloadError::Corrupt.into());
         }
         PreparedMessage::from_raw(envelope, bytes)
