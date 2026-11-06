@@ -594,3 +594,30 @@ fn test_list_unsubscribe_and_auto_submitted_headers() {
         "reserved"
     );
 }
+
+#[test]
+fn test_round_trips_pipelining_and_chunking_save() {
+    // PLAN 11.3 item 1: one wait for MAIL, RCPT, and the body with
+    // PIPELINING and CHUNKING; one per command without them. Counted by the
+    // server, not timed, so a loaded machine cannot change the result.
+    let waits = |pipelining: bool, chunking: bool| {
+        let server = TestServer::builder()
+            .fault(Fault::RoundTrip(Duration::from_millis(30)))
+            .extensions(&["PIPELINING", "CHUNKING", "8BITMIME"])
+            .start()
+            .unwrap();
+        let s = server
+            .server_builder()
+            .pipelining(pipelining)
+            .chunking(chunking)
+            .build()
+            .unwrap();
+        smtp_net::send(&s, &msg("a@example.org")).unwrap();
+        server.client_waits()
+    };
+    // Greeting, EHLO, MAIL+RCPT+BDAT (the client then sends QUIT): three,
+    // against greeting, EHLO, MAIL, RCPT, DATA, end of data: six.
+    assert_eq!(waits(true, true), 3);
+    assert_eq!(waits(true, false), 4);
+    assert_eq!(waits(false, false), 6);
+}

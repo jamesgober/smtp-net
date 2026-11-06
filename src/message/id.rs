@@ -65,15 +65,53 @@ pub(crate) fn generate(random: &mut dyn RandomSource, domain: &str) -> Result<St
     Ok(id)
 }
 
+/// A MIME boundary: `=_` and 32 base32 characters, held inline (no
+/// allocation). Empty until drawn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Boundary {
+    bytes: [u8; 34],
+    len: u8,
+}
+
+impl Default for Boundary {
+    fn default() -> Boundary {
+        Boundary {
+            bytes: [0; 34],
+            len: 0,
+        }
+    }
+}
+
+impl core::ops::Deref for Boundary {
+    type Target = str;
+    fn deref(&self) -> &str {
+        core::str::from_utf8(self.bytes.get(..usize::from(self.len)).unwrap_or(&[])).unwrap_or("")
+    }
+}
+
+impl core::fmt::Display for Boundary {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self)
+    }
+}
+
+impl core::fmt::Debug for Boundary {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&**self, f)
+    }
+}
+
 /// `=_` and 32 base32 characters of 160 random bits.
-pub(crate) fn boundary(random: &mut dyn RandomSource) -> Result<String, Error> {
-    let mut bytes = [0u8; 20];
-    random.fill(&mut bytes)?;
-    let mut text = [0u8; 32];
-    let n = encode::base32(&bytes, &mut text);
-    let mut b = String::with_capacity(2 + n);
-    b.push_str("=_");
-    b.push_str(core::str::from_utf8(text.get(..n).unwrap_or(&[])).unwrap_or(""));
+pub(crate) fn boundary(random: &mut dyn RandomSource) -> Result<Boundary, Error> {
+    let mut raw = [0u8; 20];
+    random.fill(&mut raw)?;
+    let mut b = Boundary {
+        bytes: [0; 34],
+        len: 34,
+    };
+    let (prefix, text) = b.bytes.split_at_mut(2);
+    prefix.copy_from_slice(b"=_");
+    encode::base32(&raw, text);
     Ok(b)
 }
 

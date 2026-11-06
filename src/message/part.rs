@@ -1,7 +1,7 @@
 //! MIME parts: content types, attachments, inline parts, transfer-encoding
 //! choice, and streaming serialization.
 
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec, vec::Vec};
 use core::fmt;
 
 use parse_net::{Limits, class, mail};
@@ -120,8 +120,8 @@ const MAX_FILE_NAME: usize = 255;
 /// ```
 #[derive(Clone, PartialEq, Eq)]
 pub struct ContentType {
-    essence: String,
-    params: Vec<(String, String)>,
+    essence: Cow<'static, str>,
+    params: Vec<(Cow<'static, str>, Cow<'static, str>)>,
 }
 
 impl ContentType {
@@ -144,7 +144,7 @@ impl ContentType {
             return Err(HeaderError::InvalidContentType);
         }
         let mut ct = ContentType {
-            essence: essence.to_ascii_lowercase(),
+            essence: Cow::Owned(essence.to_ascii_lowercase()),
             params: Vec::new(),
         };
         let rest = input.get(semi..).unwrap_or("");
@@ -167,8 +167,10 @@ impl ContentType {
                 .decode_into(name, &mut buf)
                 .map_err(|_| HeaderError::InvalidContentType)?
                 .ok_or(HeaderError::InvalidContentType)?;
-            ct.params
-                .push((name.to_ascii_lowercase(), String::from(value)));
+            ct.params.push((
+                Cow::Owned(name.to_ascii_lowercase()),
+                Cow::Owned(String::from(value)),
+            ));
         }
         Ok(ct)
     }
@@ -190,8 +192,9 @@ impl ContentType {
         }
         check_header_value("Content-Type", value)?;
         let name = name.to_ascii_lowercase();
-        self.params.retain(|(n, _)| *n != name);
-        self.params.push((name, String::from(value)));
+        self.params.retain(|(n, _)| *n != name.as_str());
+        self.params
+            .push((Cow::Owned(name), Cow::Owned(String::from(value))));
         Ok(self)
     }
 
@@ -207,7 +210,7 @@ impl ContentType {
         self.params
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+            .map(|(_, v)| v.as_ref())
     }
 
     pub(crate) fn is_text(&self) -> bool {
@@ -493,7 +496,7 @@ pub(crate) enum Body {
     Source(Streamed),
     Multipart {
         kind: Multipart,
-        boundary: String,
+        boundary: super::id::Boundary,
         parts: Vec<Part>,
     },
 }
@@ -531,7 +534,7 @@ impl Part {
         normalized.push_str(text.get(start..).unwrap_or(""));
         ct.params.retain(|(n, _)| n != "charset");
         ct.params
-            .insert(0, (String::from("charset"), String::from("utf-8")));
+            .insert(0, (Cow::Borrowed("charset"), Cow::Borrowed("utf-8")));
         let encoding = choose_text_encoding(&normalized, false);
         Ok(Part {
             content_type: ct,
@@ -598,11 +601,11 @@ impl Part {
         Ok(self)
     }
 
-    pub(crate) fn text_body(essence: &str, text: String, allow_8bit: bool) -> Part {
+    pub(crate) fn text_body(essence: &'static str, text: String, allow_8bit: bool) -> Part {
         let encoding = choose_text_encoding(&text, allow_8bit);
         let content_type = ContentType {
-            essence: String::from(essence),
-            params: vec![(String::from("charset"), String::from("utf-8"))],
+            essence: Cow::Borrowed(essence),
+            params: vec![(Cow::Borrowed("charset"), Cow::Borrowed("utf-8"))],
         };
         Part {
             content_type,
@@ -620,7 +623,7 @@ impl Part {
         content_type.params.retain(|(n, _)| n != "name");
         content_type
             .params
-            .push((String::from("name"), a.file_name.clone()));
+            .push((Cow::Borrowed("name"), Cow::Owned(a.file_name.clone())));
         Part {
             content_type,
             disposition: Some(("attachment", vec![(String::from("filename"), a.file_name)])),
@@ -662,7 +665,7 @@ impl Part {
     #[must_use]
     pub fn multipart(kind: Multipart, parts: Vec<Part>) -> Part {
         let content_type = ContentType {
-            essence: String::from(kind.essence()),
+            essence: Cow::Borrowed(kind.essence()),
             params: Vec::new(),
         };
         Part {
@@ -671,7 +674,7 @@ impl Part {
             content_id: None,
             body: Body::Multipart {
                 kind,
-                boundary: String::new(),
+                boundary: super::id::Boundary::default(),
                 parts,
             },
             head: Vec::new(),
@@ -714,18 +717,19 @@ impl Part {
 
     /// Writes the content header fields (each ending CRLF) into `block`.
     pub(crate) fn write_headers(&self, block: &mut HeaderBlock) -> Result<(), HeaderError> {
-        let mut params: Vec<(&str, &str)> = self
+        let boundary = match &self.body {
+            Body::Multipart { boundary, .. } => Some(("boundary", &**boundary)),
+            _ => None,
+        };
+        let params = self
             .content_type
             .params
             .iter()
-            .map(|(n, v)| (n.as_str(), v.as_str()))
-            .collect();
-        if let Body::Multipart { boundary, .. } = &self.body {
-            params.push(("boundary", boundary.as_str()));
-        }
-        block.with_params("Content-Type", &self.content_type.essence, &params)?;
+            .map(|(n, v)| (n.as_ref(), v.as_ref()))
+            .chain(boundary);
+        block.with_params("Content-Type", &self.content_type.essence, params)?;
         if let Some(enc) = self.encoding() {
-            block.folded("Content-Transfer-Encoding", enc.name())?;
+            block.literal("Content-Transfer-Encoding", enc.name());
         }
         if let Some(id) = &self.content_id {
             let mut v = String::with_capacity(id.len() + 2);
@@ -735,37 +739,38 @@ impl Part {
             block.folded("Content-ID", &v)?;
         }
         if let Some((kind, params)) = &self.disposition {
-            let params: Vec<(&str, &str)> = params
-                .iter()
-                .map(|(n, v)| (n.as_str(), v.as_str()))
-                .collect();
-            block.with_params("Content-Disposition", kind, &params)?;
+            let params = params.iter().map(|(n, v)| (n.as_str(), v.as_str()));
+            block.with_params("Content-Disposition", kind, params)?;
         }
         Ok(())
     }
 
     /// Renders the header fields of every child part into its `head`.
-    pub(crate) fn render_children(&mut self) -> Result<(), HeaderError> {
+    /// Writes each child part's header bytes; `scratch` is shared by all.
+    pub(crate) fn render_children(&mut self, scratch: &mut Vec<u8>) -> Result<(), HeaderError> {
         if let Body::Multipart { parts, .. } = &mut self.body {
             for p in parts.iter_mut() {
-                let mut block = HeaderBlock::default();
-                p.write_headers(&mut block)?;
+                let mut block = HeaderBlock::unindexed(160);
+                block.scratch = core::mem::take(scratch);
+                let r = p.write_headers(&mut block);
+                *scratch = core::mem::take(&mut block.scratch);
+                r?;
                 p.head = block.bytes;
-                p.render_children()?;
+                p.render_children(scratch)?;
             }
         }
         Ok(())
     }
 
-    /// Visits every text body that is written without encoding.
-    pub(crate) fn plain_texts<'a>(&'a self, out: &mut Vec<&'a str>) {
+    /// True when `test` holds for a text body written without encoding.
+    pub(crate) fn any_plain_text(&self, test: &mut impl FnMut(&str) -> bool) -> bool {
         match &self.body {
             Body::Text {
                 text,
                 encoding: TransferEncoding::SevenBit | TransferEncoding::EightBit,
-            } => out.push(text),
-            Body::Multipart { parts, .. } => parts.iter().for_each(|p| p.plain_texts(out)),
-            _ => {}
+            } => test(text),
+            Body::Multipart { parts, .. } => parts.iter().any(|p| p.any_plain_text(test)),
+            _ => false,
         }
     }
 
@@ -821,21 +826,26 @@ impl HeaderBlock {
     /// `Name: essence; p1=v1; p2=v2`, folding before a parameter that would
     /// pass 78 columns; parameter values through parse-net's
     /// `write_mime_param` (RFC 2231 for non-ASCII or long values).
-    pub(crate) fn with_params(
+    pub(crate) fn with_params<'p>(
         &mut self,
         name: &str,
         essence: &str,
-        params: &[(&str, &str)],
+        params: impl IntoIterator<Item = (&'p str, &'p str)>,
     ) -> Result<(), HeaderError> {
         let start = self.bytes.len();
         self.bytes.extend_from_slice(name.as_bytes());
         self.bytes.extend_from_slice(b": ");
         self.bytes.extend_from_slice(essence.as_bytes());
         let mut col = name.len() + 2 + essence.len();
+        let mut p = core::mem::take(&mut self.scratch);
+        // One allocation rather than a doubling series for the first parameter.
+        p.reserve(128);
         for (pname, value) in params {
-            let mut p = Vec::new();
-            mail::write_mime_param(pname, value, &mut p)
-                .map_err(|_| HeaderError::InvalidContentType)?;
+            p.clear();
+            if mail::write_mime_param(pname, value, &mut p).is_err() {
+                self.scratch = p;
+                return Err(HeaderError::InvalidContentType);
+            }
             let first = p.iter().position(|&b| b == b'\r').unwrap_or(p.len());
             if col + first > RECOMMENDED_HEADER_LINE && p.starts_with(b"; ") {
                 self.bytes.extend_from_slice(b";\r\n ");
@@ -848,6 +858,7 @@ impl HeaderBlock {
                 _ => self.bytes.len() - start,
             };
         }
+        self.scratch = p;
         self.finish_line(name, start);
         Ok(())
     }
@@ -954,14 +965,14 @@ fn write_text<S: Sink>(
 }
 
 fn write_base64<S: Sink>(bytes: &[u8], sink: &mut S) -> Result<(), SinkError> {
-    let mut buf = [0u8; MIME_LINE_LENGTH];
-    let mut first = true;
-    for chunk in bytes.chunks(B64_LINE_INPUT) {
-        if !first {
+    // 32 lines per sink write: fewer calls, the same bytes.
+    const LINES: usize = 32;
+    let mut buf = [0u8; (MIME_LINE_LENGTH + 2) * LINES];
+    for (i, block) in bytes.chunks(B64_LINE_INPUT * LINES).enumerate() {
+        if i > 0 {
             sink.write(b"\r\n")?;
         }
-        first = false;
-        let n = encode::base64_line(chunk, &mut buf);
+        let n = encode::base64_lines_into(block, &mut buf);
         sink.write(buf.get(..n).unwrap_or(&[]))?;
     }
     Ok(())
@@ -1162,7 +1173,7 @@ mod tests {
         b.with_params(
             "Content-Disposition",
             "attachment",
-            &[(
+            [(
                 "filename",
                 "caf\u{e9} r\u{e9}sum\u{e9} with a long name.pdf",
             )],

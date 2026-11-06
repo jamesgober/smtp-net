@@ -16,25 +16,34 @@ struct Counting;
 std::thread_local! {
     /// Allocations made by this thread; other test threads cannot touch it.
     static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    /// Bytes this thread holds (allocated minus freed).
+    static LIVE: Cell<isize> = const { Cell::new(0) };
 }
 
 fn bump() {
     let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
 }
 
+fn live(delta: isize) {
+    let _ = LIVE.try_with(|c| c.set(c.get() + delta));
+}
+
 // SAFETY: forwards to the system allocator; only counts calls.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         bump();
+        live(layout.size() as isize);
         // SAFETY: same contract as the caller's.
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        live(-(layout.size() as isize));
         // SAFETY: same contract as the caller's.
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new: usize) -> *mut u8 {
         bump();
+        live(new as isize - layout.size() as isize);
         // SAFETY: same contract as the caller's.
         unsafe { System.realloc(ptr, layout, new) }
     }
@@ -120,9 +129,10 @@ fn test_text_plus_html_build_allocation_budget() {
             .build_with(&mut Counter(0), 1_700_000_000)
             .unwrap()
     });
-    // Measured 97 at 0.3.0; the target of PLAN 6 is at most 8 (ROADMAP 0.6).
-    // This bound only stops it from growing.
-    assert!(n <= 100, "{n} allocations");
+    // 97 at 0.3.0, 21 at 0.6.0 (D-083): five setters store their input, and
+    // the message owns its head, header index, parts, and id. The PLAN 11.1
+    // estimate of 8 is recorded as missed with that reason.
+    assert!(n <= 21, "{n} allocations");
     println!("text plus HTML build: {n} allocations");
 }
 
@@ -148,7 +158,10 @@ fn test_session_body_and_positive_replies_allocate_nothing() {
         &[Address::parse("b@example.org").unwrap()],
     )
     .unwrap();
-    s.begin(&env, BodyFlags::default(), 10, Millis(2)).unwrap();
+    // The envelope is shared, not copied (D-084): MAIL and RCPT are written
+    // into the preallocated output.
+    let (n, _) = count(|| s.begin(&env, BodyFlags::default(), 10, Millis(2)).unwrap());
+    assert_eq!(n, 0, "begin");
     s.transmitted(s.transmit().len());
     let (n, _) = count(|| {
         s.receive(b"250 ok\r\n250 ok\r\n354 go\r\n", Millis(3))
@@ -177,4 +190,30 @@ fn test_reply_parser_allocates_once_per_owned_reply() {
     let (n, r) = count(|| p.push(b"250-a\r\n250-b\r\n250 2.0.0 c\r\n").unwrap());
     assert!(r.1.is_some());
     assert!(n <= 1, "{n}");
+}
+
+#[test]
+fn test_session_memory() {
+    // PLAN 11.1: a ready session holding one transaction. The output buffer
+    // is SessionConfig::output_capacity (16 KiB by default); the rest is the
+    // reply buffer, capabilities, and the transaction (D-085).
+    let env = Envelope::new(
+        Address::parse("a@example.com").unwrap(),
+        &[Address::parse("b@example.org").unwrap()],
+    )
+    .unwrap();
+    let before = LIVE.with(Cell::get);
+    let mut s = ready();
+    s.begin(&env, BodyFlags::default(), 10, Millis(2)).unwrap();
+    let total = LIVE.with(Cell::get) - before;
+    println!("session memory: {total} bytes");
+    assert!(total <= 16 * 1024 + 3 * 1024, "{total} bytes");
+    let mut small = SessionConfig::default();
+    small.output_capacity = 4096;
+    let before = LIVE.with(Cell::get);
+    let session = Session::new(small, Millis(0)).unwrap();
+    let small_total = LIVE.with(Cell::get) - before;
+    println!("session with a 4 KiB output buffer: {small_total} bytes");
+    assert!(small_total <= 4096 + 3 * 1024, "{small_total} bytes");
+    drop(session);
 }

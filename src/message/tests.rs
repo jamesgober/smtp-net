@@ -2,6 +2,7 @@ use alloc::{format, string::String, vec, vec::Vec};
 
 use super::part::TransferEncoding;
 use super::*;
+use crate::address::Address;
 use crate::error::{AddressError, ErrorKind};
 
 /// A source that repeats a byte pattern, for deterministic output.
@@ -496,7 +497,7 @@ fn test_boundary_redrawn_when_content_contains_it() {
         )
         .unwrap();
     let ct = m.headers().get("Content-Type").unwrap();
-    assert!(!ct.contains(&colliding), "boundary must be redrawn");
+    assert!(!ct.contains(&*colliding), "boundary must be redrawn");
     let s = bytes(&m);
     check_wire_rules(&s);
 }

@@ -61,11 +61,15 @@ Depends on: crypt-io 1.3 with `sign-ed25519`, `sign-rsa`, `kdf-pbkdf2` (publishe
 ## v0.5.1 - RFC 2047 B form - DONE
 - [x] parse-net 0.9.1's `encode_words_b`: the B form for mostly non-ASCII headers when it is shorter (D-082, closes the D-015 gap).
 
-## v0.6.0 - Optimisation
+## v0.6.0 - Optimisation - DONE
 Exit: every target in PLAN 11.1 met, or the miss recorded with the measured number and the reason; `docs/PERFORMANCE.md` published.
-- [ ] Benchmarks against lettre, mail-builder, and mail-send in `smtp-net-bench` (D-035).
-- [ ] SWAR scanning; write coalescing; end-to-end send at 0, 1, 10 ms simulated round-trip time.
-- [ ] Allocation targets moved from 0.3 (D-047): a text plus HTML build at most 8 allocations (97 at 0.3.0); `Session::begin` without copying the envelope; `Event::Delivered` without an owned reply on the hot path; serialization straight into the session's body path for unsigned mail (PLAN 11.3 item 3).
+- [x] Benchmarks against lettre, mail-builder, mail-send, and mail-auth in `smtp-net-bench` (D-035, D-091).
+- [x] SWAR scanning (D-086); end-to-end send at 0, 1, 10 ms simulated round-trip time with `Fault::RoundTrip` (D-089): 25 µs, 3.8 ms, and 42 ms per message on a reused connection, against 70, 125, and 134 ms for lettre (round trips ran long under load for every client).
+- [x] Allocation targets moved from 0.3 (D-047): `Session::begin` allocates nothing (D-084); a text plus HTML build allocates 21 times (D-083); `Event::Delivered` keeps its owned reply (D-087); unsigned mail is not streamed from the tree (D-088).
+- Misses, recorded with numbers and reasons (D-093), re-measured on a quiet machine in the 0.9 pass:
+  - Build allocations: 21 against an estimate of 8 (D-083).
+  - Session memory: 19,176 bytes against 16 KiB, from the 16 KiB default output buffer; 6,888 bytes with a 4 KiB buffer (D-085).
+  - Under the release-day load (D-090), five rows came in short: quoted-printable 0.53 to 0.63 GB/s (0.91 in a quieter run; target 0.8), single-line reply 61 to 94 ns (50 in a quieter run; target 50), dot-stuffing 2.9 to 3.6 GB/s (about 6 in a quieter run; target 4), EHLO with capabilities 661 to 788 ns (target 400; the reply alone 249 ns in a quieter run), and relaxed body canonicalization 1.22 to 1.50 GB/s (target 2; no quiet run). Each is re-measured on a quiet machine in the 0.9 pass and, if still short, fixed there (D-093).
 
 ## v0.7.0 - Hardening
 Exit: 1 hour per fuzz target with no finding open; 24-hour soak passes (NFR-14); every row of PLAN 10.1 has a passing test.

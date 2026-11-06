@@ -26,6 +26,13 @@ const DEFAULT_MAX_RECIPIENTS: u16 = 100;
 /// ```
 #[derive(Clone, PartialEq, Eq)]
 pub struct Envelope {
+    /// Shared: the session and each transaction clone the envelope, which
+    /// is then a reference-count increment, not a copy of every address.
+    data: alloc::sync::Arc<EnvelopeData>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct EnvelopeData {
     from: Option<Address>,
     recipients: Vec<Address>,
     dsn: Option<Dsn>,
@@ -222,7 +229,16 @@ impl Envelope {
         to: &[Address],
         limit: u16,
     ) -> Result<Envelope, Error> {
-        if to.is_empty() {
+        Envelope::from_refs(from, to.iter(), limit)
+    }
+
+    /// Deduplicates `to` (by mailbox) while copying each address once.
+    pub(crate) fn from_refs<'a>(
+        from: Option<Address>,
+        to: impl ExactSizeIterator<Item = &'a Address>,
+        limit: u16,
+    ) -> Result<Envelope, Error> {
+        if to.len() == 0 {
             return Err(BuildError::NoRecipients.into());
         }
         let mut recipients: Vec<Address> = Vec::with_capacity(to.len());
@@ -235,28 +251,30 @@ impl Envelope {
             return Err(BuildError::TooManyRecipients { limit }.into());
         }
         Ok(Envelope {
-            from,
-            recipients,
-            dsn: None,
+            data: alloc::sync::Arc::new(EnvelopeData {
+                from,
+                recipients,
+                dsn: None,
+            }),
         })
     }
 
     /// The reverse-path; `None` is the null sender `<>`.
     #[must_use]
     pub fn from(&self) -> Option<&Address> {
-        self.from.as_ref()
+        self.data.from.as_ref()
     }
 
     /// The forward-paths, in order.
     #[must_use]
     pub fn recipients(&self) -> &[Address] {
-        &self.recipients
+        &self.data.recipients
     }
 
     /// Replaces the reverse-path: the address bounces go to, distinct from From.
     #[must_use]
     pub fn return_path(mut self, address: Address) -> Envelope {
-        self.from = Some(address);
+        alloc::sync::Arc::make_mut(&mut self.data).from = Some(address);
         self
     }
 
@@ -273,14 +291,14 @@ impl Envelope {
     /// Adds DSN parameters (RFC 3461).
     #[must_use]
     pub fn dsn(mut self, dsn: Dsn) -> Envelope {
-        self.dsn = Some(dsn);
+        alloc::sync::Arc::make_mut(&mut self.data).dsn = Some(dsn);
         self
     }
 
     /// The DSN parameters, when set.
     #[must_use]
     pub fn dsn_parameters(&self) -> Option<&Dsn> {
-        self.dsn.as_ref()
+        self.data.dsn.as_ref()
     }
 
     /// A copy with only the recipients at `indices` (a further transaction
@@ -288,29 +306,31 @@ impl Envelope {
     #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub(crate) fn subset(&self, indices: &[usize]) -> Envelope {
         Envelope {
-            from: self.from.clone(),
-            recipients: indices
-                .iter()
-                .filter_map(|&i| self.recipients.get(i).cloned())
-                .collect(),
-            dsn: self.dsn.clone(),
+            data: alloc::sync::Arc::new(EnvelopeData {
+                from: self.data.from.clone(),
+                recipients: indices
+                    .iter()
+                    .filter_map(|&i| self.data.recipients.get(i).cloned())
+                    .collect(),
+                dsn: self.data.dsn.clone(),
+            }),
         }
     }
 
     /// True when an envelope address is not ASCII (needs SMTPUTF8).
     #[must_use]
     pub fn needs_smtputf8(&self) -> bool {
-        self.from.as_ref().is_some_and(Address::needs_smtputf8)
-            || self.recipients.iter().any(Address::needs_smtputf8)
+        self.data.from.as_ref().is_some_and(Address::needs_smtputf8)
+            || self.data.recipients.iter().any(Address::needs_smtputf8)
     }
 }
 
 impl fmt::Debug for Envelope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Envelope")
-            .field("from", &self.from)
-            .field("recipients", &self.recipients)
-            .field("dsn", &self.dsn)
+            .field("from", &self.data.from)
+            .field("recipients", &self.data.recipients)
+            .field("dsn", &self.data.dsn)
             .finish()
     }
 }
@@ -374,44 +394,51 @@ impl PreparedMessage {
         let mut header_8bit = false;
         let b = &rfc5322;
         let mut i = 0usize;
-        while i < b.len() {
-            let c = b.get(i).copied().unwrap_or(0);
-            match c {
-                b'\r' => {
-                    if b.get(i + 1) != Some(&b'\n') {
-                        return Err(BuildError::BareCarriageReturn { position: i as u64 }.into());
-                    }
-                    let text = b.get(line_start..i).unwrap_or(&[]);
-                    if text.len() > 998 {
-                        return Err(BuildError::LineTooLong { line }.into());
-                    }
-                    if header_end.is_none() {
-                        if text.is_empty() {
-                            header_end = Some(i + 2);
-                        } else {
-                            if starts_with_name(text, b"from") {
-                                from = true;
-                            }
-                            if message_id.is_none() && starts_with_name(text, b"message-id") {
-                                message_id = extract_id(text);
-                            }
-                        }
-                    }
-                    line += 1;
-                    i += 2;
-                    line_start = i;
-                    continue;
+        // Line by line: the next CR or LF and the 8-bit check are word-at-a-
+        // time scans (PLAN 11.3 item 4).
+        while let Some(rest) = b.get(i..).filter(|r| !r.is_empty()) {
+            let k = crate::scan::find_line_end(rest).unwrap_or(rest.len());
+            let text = rest.get(..k).unwrap_or(&[]);
+            if !crate::scan::is_ascii(text) {
+                eight_bit = true;
+                if header_end.is_none() {
+                    header_8bit = true;
                 }
-                b'\n' => return Err(BuildError::BareLineFeed { position: i as u64 }.into()),
-                0x80..=0xff => {
-                    eight_bit = true;
-                    if header_end.is_none() {
-                        header_8bit = true;
-                    }
-                }
-                _ => {}
             }
-            i += 1;
+            match rest.get(k) {
+                None => break,
+                Some(b'\n') => {
+                    return Err(BuildError::BareLineFeed {
+                        position: (i + k) as u64,
+                    }
+                    .into());
+                }
+                Some(_) if rest.get(k + 1) != Some(&b'\n') => {
+                    return Err(BuildError::BareCarriageReturn {
+                        position: (i + k) as u64,
+                    }
+                    .into());
+                }
+                Some(_) => {}
+            }
+            if text.len() > 998 {
+                return Err(BuildError::LineTooLong { line }.into());
+            }
+            if header_end.is_none() {
+                if text.is_empty() {
+                    header_end = Some(i + k + 2);
+                } else {
+                    if starts_with_name(text, b"from") {
+                        from = true;
+                    }
+                    if message_id.is_none() && starts_with_name(text, b"message-id") {
+                        message_id = extract_id(text);
+                    }
+                }
+            }
+            line += 1;
+            i += k + 2;
+            line_start = i;
         }
         if b.len() - line_start > 998 {
             return Err(BuildError::LineTooLong { line }.into());
@@ -532,13 +559,15 @@ impl PreparedMessage {
     pub fn encode(&self) -> Vec<u8> {
         let env = &self.envelope;
         let mut n = MAGIC.len() + 2 + 2 + 2 + 4 + 4 + self.bytes.len();
-        n += env.from.as_ref().map_or(0, |a| a.as_str().len());
+        n += env.data.from.as_ref().map_or(0, |a| a.as_str().len());
         n += env
+            .data
             .recipients
             .iter()
             .map(|a| 2 + a.as_str().len())
             .sum::<usize>();
         n += env
+            .data
             .dsn
             .as_ref()
             .map_or(0, |d| 4 + d.envelope_id.as_ref().map_or(0, String::len));
@@ -546,29 +575,30 @@ impl PreparedMessage {
         out.extend_from_slice(MAGIC);
         out.push(FORMAT_VERSION);
         let mut flags = 0u8;
-        if env.from.is_none() {
+        if env.data.from.is_none() {
             flags |= FLAG_NULL_SENDER;
         }
-        if env.dsn.is_some() {
+        if env.data.dsn.is_some() {
             flags |= FLAG_DSN;
         }
         out.push(flags);
         put_short(
             &mut out,
-            env.from
+            env.data
+                .from
                 .as_ref()
                 .map_or(&b""[..], |a| a.as_str().as_bytes()),
         );
         // Envelopes hold at most u16::MAX recipients (MessageLimits is u16).
         out.extend_from_slice(
-            &u16::try_from(env.recipients.len())
+            &u16::try_from(env.data.recipients.len())
                 .unwrap_or(u16::MAX)
                 .to_be_bytes(),
         );
-        for a in env.recipients.iter().take(usize::from(u16::MAX)) {
+        for a in env.data.recipients.iter().take(usize::from(u16::MAX)) {
             put_short(&mut out, a.as_str().as_bytes());
         }
-        if let Some(d) = &env.dsn {
+        if let Some(d) = &env.data.dsn {
             out.push(match d.ret {
                 None => 0,
                 Some(DsnReturn::Full) => 1,
@@ -693,8 +723,8 @@ impl PreparedMessage {
         }
         let bytes = r.take(len)?.to_vec();
         let mut envelope = Envelope::with_limit(from, &recipients, u16::MAX)?;
-        envelope.dsn = dsn;
-        if envelope.recipients.len() != recipients.len() {
+        alloc::sync::Arc::make_mut(&mut envelope.data).dsn = dsn;
+        if envelope.data.recipients.len() != recipients.len() {
             return Err(PayloadError::Corrupt.into());
         }
         PreparedMessage::from_raw(envelope, bytes)

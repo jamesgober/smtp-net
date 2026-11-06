@@ -31,7 +31,10 @@ const MAX_SIZE: u64 = 1 << 53;
 pub struct Capabilities {
     flags: u32,
     size: Option<u64>,
-    mechanisms: Vec<Vec<u8>>,
+    /// AUTH mechanism names, uppercase, each followed by a space: one
+    /// allocation for the whole list.
+    mechanisms: Vec<u8>,
+    mechanism_count: usize,
     unknown: Vec<Vec<u8>>,
     unknown_count: usize,
 }
@@ -137,10 +140,16 @@ impl Capabilities {
             Some(Extension::Auth) => {
                 self.flags |= bit(Extension::Auth);
                 for name in params.split(|&b| b == b' ').filter(|n| !n.is_empty()) {
-                    if self.mechanisms.len() < MAX_MECHANISMS
-                        && !self.mechanisms.iter().any(|m| m.eq_ignore_ascii_case(name))
+                    if self.mechanism_count < MAX_MECHANISMS
+                        && !self
+                            .auth_mechanism_names()
+                            .any(|m| m.eq_ignore_ascii_case(name))
                     {
-                        self.mechanisms.push(name.to_ascii_uppercase());
+                        self.mechanisms.reserve(params.len() + 1);
+                        self.mechanisms
+                            .extend(name.iter().map(u8::to_ascii_uppercase));
+                        self.mechanisms.push(b' ');
+                        self.mechanism_count += 1;
                     }
                 }
             }
@@ -170,7 +179,9 @@ impl Capabilities {
 
     /// The AUTH mechanism names offered, uppercase, in the server's order.
     pub fn auth_mechanism_names(&self) -> impl Iterator<Item = &[u8]> + Clone + '_ {
-        self.mechanisms.iter().map(Vec::as_slice)
+        self.mechanisms
+            .split(|&b| b == b' ')
+            .filter(|n| !n.is_empty())
     }
 
     /// Unknown keyword lines kept (at most 32, each at most 64 octets).

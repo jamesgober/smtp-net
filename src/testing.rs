@@ -10,10 +10,11 @@ use std::{
     string::{String, ToString},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
     vec::Vec,
 };
 
@@ -722,6 +723,11 @@ pub enum Fault {
     /// SCRAM-SHA-256: send a server signature with one bit flipped, as a
     /// server that does not know the password would.
     BadScramSignature,
+    /// Simulate a network round trip: every reply reaches the client this
+    /// long after the server writes it, while the server goes on reading.
+    /// A client pays it once each time it waits for replies, however many
+    /// pipelined commands it sent, as on a real link.
+    RoundTrip(Duration),
 }
 
 /// A message as the [`TestServer`] received it.
@@ -751,6 +757,7 @@ struct Shared {
     received: Vec<ReceivedMessage>,
     transcript: String,
     connections: usize,
+    waits: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -875,6 +882,9 @@ impl TestServerBuilder {
                     break;
                 }
                 let Ok(stream) = stream else { continue };
+                // Replies go out as written: Nagle's algorithm with the
+                // peer's delayed ACK would add about 40 ms per exchange.
+                let _ = stream.set_nodelay(true);
                 let (s, c) = (Arc::clone(&s), Arc::clone(&c0));
                 thread::spawn(move || {
                     let _ = serve(stream, &c, &s);
@@ -1020,6 +1030,15 @@ impl TestServer {
     pub fn connections(&self) -> usize {
         self.shared.lock().map(|s| s.connections).unwrap_or(0)
     }
+
+    /// With [`Fault::RoundTrip`]: how many times a client, having been
+    /// sent replies, sent nothing more until every one had reached it, on
+    /// all connections so far. A pipelining client sends while replies are
+    /// still on their way, so this counts round trips without timing them.
+    #[must_use]
+    pub fn client_waits(&self) -> usize {
+        self.shared.lock().map(|s| s.waits).unwrap_or(0)
+    }
 }
 
 impl Drop for TestServer {
@@ -1042,7 +1061,11 @@ struct EngineLink {
 
 impl EngineLink {
     /// Steps the engine once over the buffered ciphertext.
-    fn step(&mut self, stream: &mut TcpStream, plain: &mut Vec<u8>) -> std::io::Result<EngineStep> {
+    fn step(
+        &mut self,
+        send: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+        plain: &mut Vec<u8>,
+    ) -> std::io::Result<EngineStep> {
         let filled = self.filled;
         let input = self.input.get_mut(..filled).unwrap_or(&mut []);
         let p = self
@@ -1067,7 +1090,7 @@ impl EngineLink {
             _ => EngineStep::Again,
         };
         if written > 0 {
-            stream.write_all(self.output.get(..written).unwrap_or(&[]))?;
+            send(self.output.get(..written).unwrap_or(&[]))?;
         }
         let consumed = consumed.min(filled);
         self.input.copy_within(consumed..filled, 0);
@@ -1109,6 +1132,74 @@ struct Conn<'a> {
     tls: bool,
     cfg: &'a TestServerBuilder,
     shared: &'a Mutex<Shared>,
+    /// `Fault::RoundTrip`: replies go out through a writer thread that
+    /// holds each one until its time.
+    delay: Option<DelayLine>,
+}
+
+/// Writes `bytes` to the client now, or queues them on the delay line so
+/// TLS records and plain replies keep their order.
+fn send_to(
+    stream: &mut TcpStream,
+    delay: Option<&mut DelayLine>,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let Some(d) = delay else {
+        return stream.write_all(bytes);
+    };
+    let Some(tx) = d.tx.as_ref() else {
+        return Err(std::io::ErrorKind::BrokenPipe.into());
+    };
+    d.pending.fetch_add(1, Ordering::SeqCst);
+    d.replied = true;
+    tx.send((Instant::now() + d.rtt, bytes.to_vec()))
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+}
+
+/// Bytes for the client, each held until `rtt` after it was written.
+struct DelayLine {
+    rtt: Duration,
+    tx: Option<mpsc::Sender<(Instant, Vec<u8>)>>,
+    writer: Option<JoinHandle<()>>,
+    /// Writes queued and not yet handed to the socket.
+    pending: Arc<AtomicUsize>,
+    /// Something was queued since the client last waited.
+    replied: bool,
+}
+
+impl DelayLine {
+    fn start(stream: &TcpStream, rtt: Duration) -> std::io::Result<DelayLine> {
+        let mut out = stream.try_clone()?;
+        let (tx, rx) = mpsc::channel::<(Instant, Vec<u8>)>();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let left = Arc::clone(&pending);
+        let writer = thread::spawn(move || {
+            for (due, bytes) in rx {
+                thread::sleep(due.saturating_duration_since(Instant::now()));
+                // Counted down first: the client cannot answer bytes it has
+                // not been sent, so a wait is never missed.
+                left.fetch_sub(1, Ordering::SeqCst);
+                if out.write_all(&bytes).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(DelayLine {
+            rtt,
+            tx: Some(tx),
+            writer: Some(writer),
+            pending,
+            replied: false,
+        })
+    }
+
+    /// Waits until everything queued has been written.
+    fn drain(&mut self) {
+        drop(self.tx.take());
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
+    }
 }
 
 impl Conn<'_> {
@@ -1162,7 +1253,11 @@ impl Conn<'_> {
                     .session
                     .encrypt(chunk, &mut e.output)
                     .map_err(|x| std::io::Error::other(format!("{x:?}")))?;
-                self.stream.write_all(e.output.get(..n).unwrap_or(&[]))?;
+                send_to(
+                    &mut self.stream,
+                    self.delay.as_mut(),
+                    e.output.get(..n).unwrap_or(&[]),
+                )?;
             }
             return Ok(());
         }
@@ -1183,12 +1278,25 @@ impl Conn<'_> {
         {
             let gap = Duration::from_secs(1) / (*bytes_per_second).max(1);
             for b in bytes {
-                self.stream.write_all(core::slice::from_ref(b))?;
+                self.send(core::slice::from_ref(b))?;
                 thread::sleep(gap);
             }
             return Ok(());
         }
-        self.stream.write_all(bytes)
+        self.send(bytes)
+    }
+
+    /// Writes to the client now, or through the delay line.
+    fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        send_to(&mut self.stream, self.delay.as_mut(), bytes)
+    }
+
+    /// Closes the connection once every delayed reply is out.
+    fn close(&mut self) -> std::io::Result<()> {
+        if let Some(d) = self.delay.as_mut() {
+            d.drain();
+        }
+        self.stream.shutdown(Shutdown::Both)
     }
 
     fn closes_at(&self, stage: Stage) -> bool {
@@ -1197,10 +1305,27 @@ impl Conn<'_> {
 
     /// Reads more plaintext; false at EOF.
     fn fill(&mut self) -> std::io::Result<bool> {
+        let more = self.fill_inner()?;
+        if let Some(d) = self.delay.as_mut() {
+            if more && d.replied && d.pending.load(Ordering::SeqCst) == 0 {
+                d.replied = false;
+                if let Ok(mut s) = self.shared.lock() {
+                    s.waits += 1;
+                }
+            }
+        }
+        Ok(more)
+    }
+
+    fn fill_inner(&mut self) -> std::io::Result<bool> {
         if let Some(e) = self.engine.as_mut() {
             let before = self.plain.len();
             loop {
-                match e.step(&mut self.stream, &mut self.plain)? {
+                let step = e.step(
+                    &mut |b| send_to(&mut self.stream, self.delay.as_mut(), b),
+                    &mut self.plain,
+                )?;
+                match step {
                     EngineStep::Closed => return Ok(self.plain.len() > before),
                     EngineStep::NeedInput if self.plain.len() > before => return Ok(true),
                     EngineStep::NeedInput => {
@@ -1266,7 +1391,11 @@ impl Conn<'_> {
                 output: std::vec![0; 32 * 1024],
             };
             loop {
-                match link.step(&mut self.stream, &mut self.plain) {
+                let step = link.step(
+                    &mut |b| send_to(&mut self.stream, self.delay.as_mut(), b),
+                    &mut self.plain,
+                );
+                match step {
                     Ok(EngineStep::Handshaken) => break,
                     Ok(EngineStep::NeedInput) => {
                         if !link.read(&mut self.stream)? {
@@ -1300,7 +1429,7 @@ impl Conn<'_> {
         let name_ok = insecure || name.eq_ignore_ascii_case(&self.cfg.tls_name);
         let accept =
             ok_shape && name_ok && self.fault(|f| *f == Fault::RejectCertificate).is_none();
-        self.stream.write_all(if accept {
+        self.send(if accept {
             b"TESTTLS1 OK\n"
         } else {
             b"TESTTLS1 REJECT\n"
@@ -1334,12 +1463,18 @@ fn serve(
         tls: false,
         cfg,
         shared,
+        delay: None,
     };
+    if let Some(Fault::RoundTrip(rtt)) =
+        cfg.faults.iter().find(|f| matches!(f, Fault::RoundTrip(_)))
+    {
+        c.delay = Some(DelayLine::start(&c.stream, *rtt)?);
+    }
     if cfg.tls == TlsMode::Implicit && !c.tls_accept()? {
-        return c.stream.shutdown(Shutdown::Both);
+        return c.close();
     }
     if c.closes_at(Stage::Greeting) {
-        return c.stream.shutdown(Shutdown::Both);
+        return c.close();
     }
     c.reply(Stage::Greeting, "220 test.smtp-net.invalid ESMTP")?;
     let mut from: Option<(String, Vec<String>)> = None;
@@ -1377,7 +1512,7 @@ fn serve(
             _ => Stage::Total,
         };
         if c.closes_at(stage) {
-            return c.stream.shutdown(Shutdown::Both);
+            return c.close();
         }
         match stage {
             Stage::Ehlo if cfg.ehlo_refused => c.reply(stage, "502 5.5.1 EHLO not implemented")?,
@@ -1421,10 +1556,10 @@ fn serve(
                     c.fault(|f| matches!(f, Fault::InjectAfterStartTls(_)))
                 {
                     let b: &[u8] = b;
-                    c.stream.write_all(b)?;
+                    c.send(b)?;
                 }
                 if !c.tls_accept()? {
-                    return c.stream.shutdown(Shutdown::Both);
+                    return c.close();
                 }
                 // RFC 3207 4.2: forget everything from before TLS.
                 from = None;
@@ -1682,7 +1817,7 @@ fn store(
         });
     }
     if c.fault(|f| *f == Fault::CloseAfterDataEnd).is_some() {
-        c.stream.shutdown(Shutdown::Both)?;
+        c.close()?;
         return Ok(false);
     }
     c.reply(
@@ -1693,7 +1828,7 @@ fn store(
     if c.fault(|f| *f == Fault::CloseAfterMessages(*delivered))
         .is_some()
     {
-        c.stream.shutdown(Shutdown::Both)?;
+        c.close()?;
         return Ok(false);
     }
     Ok(true)
