@@ -173,12 +173,20 @@ impl BodyCanonicalizer {
                         self.cr = false;
                         self.content(b"\r", out);
                     }
+                    // A run of words: a single space followed by another
+                    // ordinary octet is already canonical, so it stays in
+                    // the run and a line of prose goes out in one piece.
                     let start = i;
-                    while input
-                        .get(i)
-                        .is_some_and(|c| !matches!(c, b' ' | b'\t' | b'\r' | b'\n'))
-                    {
-                        i += 1;
+                    let plain = |c: &u8| !matches!(c, b' ' | b'\t' | b'\r' | b'\n');
+                    loop {
+                        while input.get(i).is_some_and(plain) {
+                            i += 1;
+                        }
+                        if input.get(i) == Some(&b' ') && input.get(i + 1).is_some_and(plain) {
+                            i += 2;
+                        } else {
+                            break;
+                        }
                     }
                     self.content(input.get(start..i).unwrap_or(&[]), out);
                 }

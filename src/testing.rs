@@ -879,6 +879,9 @@ impl TestServerBuilder {
                     break;
                 }
                 let Ok(stream) = stream else { continue };
+                // Replies go out as written: Nagle's algorithm with the
+                // peer's delayed ACK would add about 40 ms per exchange.
+                let _ = stream.set_nodelay(true);
                 let (s, c) = (Arc::clone(&s), Arc::clone(&c0));
                 thread::spawn(move || {
                     let _ = serve(stream, &c, &s);
