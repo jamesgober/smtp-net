@@ -36,6 +36,29 @@ pub(crate) fn find_line_end(bytes: &[u8]) -> Option<usize> {
         .map(|i| at + i)
 }
 
+/// The index of the first octet at or below SP (0x20) in `bytes`, or its
+/// length: spaces, tabs, CR, LF, and the other controls.
+pub(crate) fn skip_above_space(bytes: &[u8]) -> usize {
+    let mut chunks = bytes.chunks_exact(8);
+    let mut at = 0usize;
+    for chunk in &mut chunks {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(chunk);
+        let x = u64::from_le_bytes(w);
+        // Octets below 0x21; the lowest flag is exact, as in `zero_octets`.
+        let hit = x.wrapping_sub(ONES * 0x21) & !x & HIGHS;
+        if hit != 0 {
+            return at + (hit.trailing_zeros() / 8) as usize;
+        }
+        at += 8;
+    }
+    at + chunks
+        .remainder()
+        .iter()
+        .position(|&b| b <= b' ')
+        .unwrap_or(chunks.remainder().len())
+}
+
 /// True for an octet quoted-printable writes as it is.
 pub(crate) const fn qp_literal(b: u8) -> bool {
     matches!(b, 33..=60 | 62..=126)
@@ -92,6 +115,11 @@ mod tests {
                     "{s:?}"
                 );
                 assert_eq!(is_ascii(s), s.is_ascii());
+                assert_eq!(
+                    skip_above_space(s),
+                    s.iter().position(|&b| b <= b' ').unwrap_or(s.len()),
+                    "{s:?}"
+                );
                 assert_eq!(
                     is_printable_or_tab(s),
                     s.iter().all(|&b| b == b'\t' || (0x20..0x7f).contains(&b)),

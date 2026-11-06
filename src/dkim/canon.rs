@@ -179,10 +179,12 @@ impl BodyCanonicalizer {
                     let start = i;
                     let plain = |c: &u8| !matches!(c, b' ' | b'\t' | b'\r' | b'\n');
                     loop {
-                        while input.get(i).is_some_and(plain) {
+                        i += crate::scan::skip_above_space(input.get(i..).unwrap_or(&[]));
+                        if input.get(i).is_some_and(plain) {
+                            // A control octet other than TAB, CR or LF.
                             i += 1;
-                        }
-                        if input.get(i) == Some(&b' ') && input.get(i + 1).is_some_and(plain) {
+                        } else if input.get(i) == Some(&b' ') && input.get(i + 1).is_some_and(plain)
+                        {
                             i += 2;
                         } else {
                             break;
