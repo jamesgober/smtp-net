@@ -37,7 +37,14 @@ fn test_64_threads_share_one_connection() {
 #[test]
 fn test_connections_never_exceed_the_limit() {
     let server = TestServer::start().unwrap();
-    let pool = Arc::new(Pool::new(server.server(), 4).unwrap());
+    // Every connection accepted is counted, so none may reach the
+    // 100-message reconnect: under load one slot can carry most of the 128.
+    let s = server
+        .server_builder()
+        .max_messages_per_connection(1000)
+        .build()
+        .unwrap();
+    let pool = Arc::new(Pool::new(s, 4).unwrap());
     let threads: Vec<_> = (0..16)
         .map(|t| {
             let pool = pool.clone();
@@ -97,7 +104,16 @@ fn test_busy_pool_times_out_with_pool_exhausted() {
     );
     let p = pool.clone();
     let slow = std::thread::spawn(move || p.send(&msg(0)));
-    std::thread::sleep(Duration::from_millis(200));
+    // The first send holds the only slot once its connection is up (a
+    // fixed sleep raced on a loaded machine); its end of data waits 800 ms.
+    let up = std::time::Instant::now();
+    while server.connections() == 0 {
+        assert!(
+            up.elapsed() < Duration::from_secs(10),
+            "first send never connected"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let e = pool.send(&msg(1)).unwrap_err();
     assert_eq!(e.kind(), &ErrorKind::PoolExhausted, "{e:?}");
     assert!(e.is_temporary());
