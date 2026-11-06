@@ -9,7 +9,7 @@ description = "Benchmarks for smtp-net's hot paths (dev/PLAN.md 11.2)"
 # this crate only, so it never reaches smtp-net's dev-dependencies or its
 # MSRV job. Competitor comparisons live in smtp-net-bench (D-035).
 [dependencies]
-smtp-net = { path = ".." }
+smtp-net = { path = "..", features = ["testing", "dkim", "scram"] }
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
@@ -22,6 +22,18 @@ harness = false
 
 [[bench]]
 name = "proto"
+harness = false
+
+[[bench]]
+name = "dkim"
+harness = false
+
+[[bench]]
+name = "send"
+harness = false
+
+[[bench]]
+name = "gate"
 harness = false
 
 # Keeps this crate out of any parent workspace.

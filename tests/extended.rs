@@ -594,3 +594,33 @@ fn test_list_unsubscribe_and_auto_submitted_headers() {
         "reserved"
     );
 }
+
+#[test]
+fn test_round_trips_pipelining_and_chunking_save() {
+    // PLAN 11.3 item 1: one turnaround for MAIL, RCPT, and the body with
+    // PIPELINING and CHUNKING; one per command without them.
+    const RTT: Duration = Duration::from_millis(40);
+    let time = |pipelining: bool, chunking: bool| {
+        let server = TestServer::builder()
+            .fault(Fault::RoundTrip(RTT))
+            .extensions(&["PIPELINING", "CHUNKING", "8BITMIME"])
+            .start()
+            .unwrap();
+        let s = server
+            .server_builder()
+            .pipelining(pipelining)
+            .chunking(chunking)
+            .build()
+            .unwrap();
+        let start = std::time::Instant::now();
+        smtp_net::send(&s, &msg("a@example.org")).unwrap();
+        start.elapsed()
+    };
+    let fast = time(true, true);
+    let slow = time(false, false);
+    // Turnarounds: greeting, EHLO, MAIL+RCPT+BDAT, QUIT against greeting,
+    // EHLO, MAIL, RCPT, DATA, body, QUIT.
+    assert!(fast < RTT * 5, "{fast:?}");
+    assert!(slow >= RTT * 6, "{slow:?}");
+    assert!(slow > fast + RTT * 2, "{fast:?} {slow:?}");
+}

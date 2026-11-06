@@ -722,6 +722,10 @@ pub enum Fault {
     /// SCRAM-SHA-256: send a server signature with one bit flipped, as a
     /// server that does not know the password would.
     BadScramSignature,
+    /// Simulate a network round trip: wait this long each time the server,
+    /// having replied, waits for the client again. Pipelined commands and
+    /// the body pay it once per turnaround, as on a real link.
+    RoundTrip(Duration),
 }
 
 /// A message as the [`TestServer`] received it.
@@ -1109,6 +1113,8 @@ struct Conn<'a> {
     tls: bool,
     cfg: &'a TestServerBuilder,
     shared: &'a Mutex<Shared>,
+    /// A reply went out since the last read: the next read is a turnaround.
+    turnaround: bool,
 }
 
 impl Conn<'_> {
@@ -1152,6 +1158,7 @@ impl Conn<'_> {
             let again = bytes.clone();
             bytes.extend_from_slice(&again);
         }
+        self.turnaround = true;
         self.write(&bytes)
     }
 
@@ -1197,6 +1204,13 @@ impl Conn<'_> {
 
     /// Reads more plaintext; false at EOF.
     fn fill(&mut self) -> std::io::Result<bool> {
+        // A simulated round trip: once per turnaround, however many
+        // pipelined commands or body segments the client then sends.
+        if core::mem::take(&mut self.turnaround) {
+            if let Some(Fault::RoundTrip(rtt)) = self.fault(|f| matches!(f, Fault::RoundTrip(_))) {
+                thread::sleep(*rtt);
+            }
+        }
         if let Some(e) = self.engine.as_mut() {
             let before = self.plain.len();
             loop {
@@ -1334,6 +1348,7 @@ fn serve(
         tls: false,
         cfg,
         shared,
+        turnaround: false,
     };
     if cfg.tls == TlsMode::Implicit && !c.tls_accept()? {
         return c.stream.shutdown(Shutdown::Both);
