@@ -222,7 +222,16 @@ impl Envelope {
         to: &[Address],
         limit: u16,
     ) -> Result<Envelope, Error> {
-        if to.is_empty() {
+        Envelope::from_refs(from, to.iter(), limit)
+    }
+
+    /// Deduplicates `to` (by mailbox) while copying each address once.
+    pub(crate) fn from_refs<'a>(
+        from: Option<Address>,
+        to: impl ExactSizeIterator<Item = &'a Address>,
+        limit: u16,
+    ) -> Result<Envelope, Error> {
+        if to.len() == 0 {
             return Err(BuildError::NoRecipients.into());
         }
         let mut recipients: Vec<Address> = Vec::with_capacity(to.len());

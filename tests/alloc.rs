@@ -120,9 +120,10 @@ fn test_text_plus_html_build_allocation_budget() {
             .build_with(&mut Counter(0), 1_700_000_000)
             .unwrap()
     });
-    // Measured 97 at 0.3.0; the target of PLAN 6 is at most 8 (ROADMAP 0.6).
-    // This bound only stops it from growing.
-    assert!(n <= 100, "{n} allocations");
+    // 97 at 0.3.0, 21 at 0.6.0 (D-083): five setters store their input, and
+    // the message owns its head, header index, parts, and id. The PLAN 11.1
+    // estimate of 8 is recorded as missed with that reason.
+    assert!(n <= 21, "{n} allocations");
     println!("text plus HTML build: {n} allocations");
 }
 

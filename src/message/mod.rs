@@ -16,7 +16,7 @@ use prepared::{Envelope, PreparedMessage};
 use sink::Sink;
 
 use crate::{
-    address::{Address, Mailbox},
+    address::Mailbox,
     error::{BuildError, Error, HeaderError},
 };
 
@@ -184,12 +184,11 @@ impl Message {
     /// `Build(NoRecipients)`, `Build(TooManyRecipients)`.
     pub fn envelope(&self) -> Result<Envelope, Error> {
         let from = self.sender.as_ref().unwrap_or(&self.from).address().clone();
-        let to: Vec<Address> = self
-            .recipients
-            .iter()
-            .map(|m| m.address().clone())
-            .collect();
-        Envelope::with_limit(Some(from), &to, self.max_recipients)
+        Envelope::from_refs(
+            Some(from),
+            self.recipients.iter().map(Mailbox::address),
+            self.max_recipients,
+        )
     }
 
     /// True when an address needs SMTPUTF8 (RFC 6531).
@@ -784,19 +783,21 @@ impl MessageBuilder {
     ///
     /// As [`build`](MessageBuilder::build).
     pub fn build_with(
-        self,
+        mut self,
         random: &mut dyn RandomSource,
         now_unix: u64,
     ) -> Result<Message, Error> {
-        let from = self.from.clone().ok_or(BuildError::MissingFrom)?;
+        // The builder is consumed: its strings and lists move into the
+        // message instead of being copied.
+        let from = self.from.take().ok_or(BuildError::MissingFrom)?;
         if self.recipient_count() == 0 {
             return Err(BuildError::NoRecipients.into());
         }
         if !self.inlines.is_empty() && self.html.is_none() && self.body.is_none() {
             return Err(BuildError::InlineWithoutHtml.into());
         }
-        let mut body = match &self.body {
-            Some(p) => p.clone(),
+        let mut body = match self.body.take() {
+            Some(p) => p,
             None => self.body_tree(),
         };
         if body.count() > usize::from(self.limits.max_parts) {
@@ -805,8 +806,8 @@ impl MessageBuilder {
         if body.depth() > usize::from(self.limits.max_depth) {
             return Err(BuildError::DepthExceeded.into());
         }
-        let message_id = match &self.message_id {
-            Some(id) => id.clone(),
+        let message_id = match self.message_id.take() {
+            Some(id) => id,
             None => {
                 let domain = match &self.message_id_domain {
                     Some(d) => d.as_str(),
@@ -821,9 +822,21 @@ impl MessageBuilder {
             }
         };
         assign_boundaries(&mut body, random)?;
-        body.render_children()?;
 
-        let mut block = HeaderBlock::default();
+        // One allocation for the block in the common case: room for the
+        // fixed fields, the mailboxes, and encoded text.
+        let mailboxes = 1 + self.reply_to.len() + self.to.len() + self.cc.len();
+        let estimate = 448
+            + 96 * mailboxes
+            + self.subject.as_ref().map_or(0, |s| s.len() * 3)
+            + self
+                .custom
+                .iter()
+                .map(|(n, v)| n.as_str().len() + v.len() * 3 + 4)
+                .sum::<usize>();
+        let mut block = HeaderBlock::with_capacity(estimate);
+        // The parts share the block's scratch buffer.
+        body.render_children(&mut block.scratch)?;
         let when = self.date.unwrap_or(now_unix);
         let date = parse_net::MailDate::new(
             i64::try_from(when).map_err(|_| HeaderError::InvalidDate)?,
@@ -851,7 +864,7 @@ impl MessageBuilder {
         if let Some(s) = &self.subject {
             block.unstructured("Subject", "Subject", s)?;
         }
-        block.folded("Message-ID", &alloc::format!("<{message_id}>"))?;
+        block.angle("Message-ID", &message_id)?;
         if let Some(r) = &self.in_reply_to {
             block.folded("In-Reply-To", r)?;
         }
@@ -889,9 +902,10 @@ impl MessageBuilder {
             .chain(self.bcc.iter())
             .any(|m| m.address().needs_smtputf8());
         let has_8bit = body.has_8bit();
-        let mut recipients = self.to;
-        recipients.extend(self.cc);
-        recipients.extend(self.bcc);
+        let mut recipients = core::mem::take(&mut self.to);
+        recipients.reserve_exact(self.cc.len() + self.bcc.len());
+        recipients.append(&mut self.cc);
+        recipients.append(&mut self.bcc);
         Ok(Message {
             head: block.bytes,
             headers: block.headers,
@@ -908,15 +922,16 @@ impl MessageBuilder {
     }
 
     /// The MIME tree: mixed > related > alternative (PLAN FR-3).
-    fn body_tree(&self) -> Part {
+    fn body_tree(&mut self) -> Part {
+        let allow_8bit = self.allow_8bit;
         let text = self
             .text
-            .as_ref()
-            .map(|t| Part::text_body("text/plain", t.clone(), self.allow_8bit));
+            .take()
+            .map(|t| Part::text_body("text/plain", t, allow_8bit));
         let html = self
             .html
-            .as_ref()
-            .map(|h| Part::text_body("text/html", h.clone(), self.allow_8bit));
+            .take()
+            .map(|h| Part::text_body("text/html", h, allow_8bit));
         let mut core = match (text, html) {
             (Some(t), Some(h)) => Part::multipart(Multipart::Alternative, vec![t, h]),
             (Some(t), None) => t,
@@ -925,12 +940,20 @@ impl MessageBuilder {
         };
         if !self.inlines.is_empty() {
             let mut parts = vec![core];
-            parts.extend(self.inlines.iter().cloned().map(Part::from_inline));
+            parts.extend(
+                core::mem::take(&mut self.inlines)
+                    .into_iter()
+                    .map(Part::from_inline),
+            );
             core = Part::multipart(Multipart::Related, parts);
         }
         if !self.attachments.is_empty() {
             let mut parts = vec![core];
-            parts.extend(self.attachments.iter().cloned().map(Part::from_attachment));
+            parts.extend(
+                core::mem::take(&mut self.attachments)
+                    .into_iter()
+                    .map(Part::from_attachment),
+            );
             core = Part::multipart(Multipart::Mixed, parts);
         }
         core
@@ -941,12 +964,10 @@ impl MessageBuilder {
 /// encoding has a line that starts with `--` and the boundary (T-15).
 fn assign_boundaries(part: &mut Part, random: &mut dyn RandomSource) -> Result<(), Error> {
     if let part::Body::Multipart { .. } = &part.body {
-        let mut texts = Vec::new();
-        part.plain_texts(&mut texts);
         let mut chosen = None;
         for _ in 0..8 {
             let b = id::boundary(random)?;
-            if !texts.iter().any(|t| collides(t, &b)) {
+            if !part.any_plain_text(&mut |t| collides(t, &b)) {
                 chosen = Some(b);
                 break;
             }

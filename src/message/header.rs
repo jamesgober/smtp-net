@@ -4,7 +4,7 @@
 //! first; there is no other way in (PLAN 10.2). Folding and RFC 2047 words
 //! come from parse-net (`mail::fold`, `mail::encode_words`, `mail::encode_words_b`).
 
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::fmt;
 
 use parse_net::{CountSink, WriteError, mail, write};
@@ -77,7 +77,7 @@ pub fn check_header_value(field: &'static str, value: &str) -> Result<(), Header
 /// A validated header name: RFC 5322 `ftext` (printable ASCII 33 to 126 except
 /// `:`), 1 to 76 octets.
 #[derive(Clone, PartialEq, Eq)]
-pub struct HeaderName(String);
+pub struct HeaderName(Cow<'static, str>);
 
 impl HeaderName {
     /// Validates `name`.
@@ -89,7 +89,15 @@ impl HeaderName {
         if name.len() > MAX_HEADER_NAME || !mail::is_field_name(name.as_bytes()) {
             return Err(HeaderError::InvalidName);
         }
-        Ok(HeaderName(String::from(name)))
+        Ok(HeaderName(Cow::Owned(String::from(name))))
+    }
+
+    /// A name the crate itself writes, held without an allocation.
+    pub(crate) fn of(name: &str) -> HeaderName {
+        match WRITTEN.iter().find(|w| **w == name) {
+            Some(w) => HeaderName(Cow::Borrowed(w)),
+            None => HeaderName(Cow::Owned(String::from(name))),
+        }
     }
 
     /// The name as written.
@@ -99,8 +107,11 @@ impl HeaderName {
     }
 
     pub(crate) fn is_reserved(&self) -> bool {
-        let lower = self.0.to_ascii_lowercase();
-        RESERVED.contains(&lower.as_str()) || lower.starts_with("content-")
+        RESERVED.iter().any(|r| r.eq_ignore_ascii_case(&self.0))
+            || self
+                .0
+                .get(..8)
+                .is_some_and(|p| p.eq_ignore_ascii_case("content-"))
     }
 }
 
@@ -120,7 +131,10 @@ impl fmt::Display for HeaderName {
 /// unfolded, non-ASCII text already RFC 2047 encoded).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Headers {
-    list: Vec<(HeaderName, String)>,
+    /// Each name with the start and end of its value in `text`.
+    list: Vec<(HeaderName, usize, usize)>,
+    /// Every value, back to back: one allocation for all of them.
+    text: String,
 }
 
 impl Headers {
@@ -129,13 +143,15 @@ impl Headers {
     pub fn get(&self, name: &str) -> Option<&str> {
         self.list
             .iter()
-            .find(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+            .find(|(n, _, _)| n.as_str().eq_ignore_ascii_case(name))
+            .map(|&(_, s, e)| self.text.get(s..e).unwrap_or(""))
     }
 
     /// Every field in order.
     pub fn iter(&self) -> impl Iterator<Item = (&HeaderName, &str)> {
-        self.list.iter().map(|(n, v)| (n, v.as_str()))
+        self.list
+            .iter()
+            .map(|(n, s, e)| (n, self.text.get(*s..*e).unwrap_or("")))
     }
 
     /// Number of fields.
@@ -150,9 +166,22 @@ impl Headers {
         self.list.is_empty()
     }
 
-    pub(crate) fn push(&mut self, name: &str, value: String) {
-        // Names written by the crate itself are constants in ftext.
-        self.list.push((HeaderName(String::from(name)), value));
+    /// Records `name` with the unfolded form of the written `line` (the
+    /// octets after `Name:`, folding CRLFs removed).
+    fn push_unfolded(&mut self, name: &str, line: &[u8]) {
+        if self.list.capacity() == 0 {
+            self.list.reserve(12);
+            self.text.reserve(256);
+        }
+        let start = self.text.len();
+        let line = line.strip_prefix(b" ").unwrap_or(line);
+        // The block holds only ASCII and UTF-8 the crate wrote itself.
+        let text = core::str::from_utf8(line).unwrap_or("");
+        for piece in text.split("\r\n") {
+            self.text.push_str(piece);
+        }
+        self.list
+            .push((HeaderName::of(name), start, self.text.len()));
     }
 }
 
@@ -286,14 +315,78 @@ pub(crate) fn write_mailbox(m: &Mailbox, out: &mut String, col: usize) {
     out.push('>');
 }
 
+/// Names the crate writes itself: kept as `&'static str`, not copied.
+const WRITTEN: &[&str] = &[
+    "Date",
+    "From",
+    "Sender",
+    "Reply-To",
+    "To",
+    "Cc",
+    "Subject",
+    "Message-ID",
+    "In-Reply-To",
+    "References",
+    "List-Unsubscribe",
+    "List-Unsubscribe-Post",
+    "Auto-Submitted",
+    "MIME-Version",
+    "Content-Type",
+    "Content-Transfer-Encoding",
+    "Content-ID",
+    "Content-Disposition",
+];
+
 /// Builds the header block line by line.
-#[derive(Default)]
 pub(crate) struct HeaderBlock {
     pub(crate) bytes: Vec<u8>,
     pub(crate) headers: Headers,
+    /// False for a part's headers, which nothing looks up.
+    index: bool,
+    /// Reused for parameters, mailboxes, and ids.
+    pub(crate) scratch: Vec<u8>,
+    scratch_text: String,
+}
+
+impl Default for HeaderBlock {
+    fn default() -> HeaderBlock {
+        HeaderBlock::with_capacity(0)
+    }
 }
 
 impl HeaderBlock {
+    /// A block whose fields are recorded for `Message::headers`.
+    pub(crate) fn with_capacity(capacity: usize) -> HeaderBlock {
+        HeaderBlock {
+            bytes: Vec::with_capacity(capacity),
+            headers: Headers::default(),
+            index: true,
+            scratch: Vec::new(),
+            scratch_text: String::new(),
+        }
+    }
+
+    /// A block written only as bytes (a part's headers).
+    pub(crate) fn unindexed(capacity: usize) -> HeaderBlock {
+        HeaderBlock {
+            index: false,
+            ..HeaderBlock::with_capacity(capacity)
+        }
+    }
+
+    /// `Name: <id>`, the id between angle brackets.
+    pub(crate) fn angle(&mut self, name: &str, id: &str) -> Result<(), HeaderError> {
+        let mut v = core::mem::take(&mut self.scratch_text);
+        v.clear();
+        v.reserve(id.len() + 2);
+        v.push('<');
+        v.push_str(id);
+        v.push('>');
+        let r = self.folded(name, &v);
+        self.scratch_text = v;
+        r
+    }
+
     /// An unstructured field (Subject, custom headers): folded ASCII, or RFC
     /// 2047 words when the text is not printable ASCII or contains `=?` (T-23).
     pub(crate) fn unstructured(
@@ -332,8 +425,10 @@ impl HeaderBlock {
         self.bytes.extend_from_slice(name.as_bytes());
         self.bytes.push(b':');
         let mut col = name.len() + 1;
+        let mut item = core::mem::take(&mut self.scratch_text);
+        item.reserve(128);
         for (i, m) in list.iter().enumerate() {
-            let mut item = String::new();
+            item.clear();
             write_mailbox(m, &mut item, col + 1);
             let first_line = item.find('\r').unwrap_or(item.len());
             let sep = usize::from(i + 1 < list.len());
@@ -351,22 +446,16 @@ impl HeaderBlock {
                 col += 1;
             }
         }
+        self.scratch_text = item;
         self.finish_line(name, start);
     }
 
     /// Appends CRLF and records the unfolded value.
     pub(crate) fn finish_line(&mut self, name: &str, start: usize) {
-        let line = self.bytes.get(start + name.len() + 1..).unwrap_or(&[]);
-        let mut value = String::with_capacity(line.len());
-        let text = String::from_utf8_lossy(line);
-        for (i, piece) in text.split("\r\n").enumerate() {
-            if i == 0 {
-                value.push_str(piece.strip_prefix(' ').unwrap_or(piece));
-            } else {
-                value.push_str(piece);
-            }
+        if self.index {
+            let line = self.bytes.get(start + name.len() + 1..).unwrap_or(&[]);
+            self.headers.push_unfolded(name, line);
         }
-        self.headers.push(name, value);
         self.bytes.extend_from_slice(b"\r\n");
     }
 }
