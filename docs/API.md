@@ -881,6 +881,7 @@ pub struct TestServerBuilder { /* extensions offered, AUTH, TLS certificate, fau
     ReplyAt { stage: Stage, reply: &'static str }, CloseAt(Stage), CloseAfterDataEnd, DelayAt { stage: Stage, by: Duration },
     InjectAfterStartTls(&'static [u8]), OmitStartTls, MalformedReply(Stage), OversizedReply(Stage),
     ExtraReply(Stage), RejectRecipient(usize), TooManyRecipientsAfter(usize), SlowDrip { bytes_per_second: u32 },
+    RoundTrip(Duration),
 }
 ```
 
@@ -1055,3 +1056,5 @@ Each change is recorded in `dev/PLAN.md` section 19.
 | 0.5.0 | `Attachment::from_source` (feature `std`), `Attachment::{len, is_empty, is_streamed}`, `BodySource` returning `SourceError`, `ReadSource`; `ErrorKind::Source(SourceError)` | D-078 |
 | 0.5.0 | Test support: `TestServerBuilder::oauth2`, SCRAM-SHA-256 in `TestServer` with the `scram` feature, `Fault::BadScramSignature`, transcripts take `C: <EMPTY>` | none |
 | 0.5.1 | RFC 2047 words choose Q or B per header; parse-net 0.9.1 | D-082 |
+| 0.6.0 | `Envelope` shares its addresses behind an `Arc` (clone is a reference count; `Session::begin` allocates nothing); `Session` memory is `SessionConfig::output_capacity` plus about 3 KiB | D-084, D-085 |
+| 0.6.0 | Test support: `Fault::RoundTrip(Duration)` (one delay per client turnaround); `TestServer` sets `TCP_NODELAY` | D-089 |

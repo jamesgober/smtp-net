@@ -13,6 +13,43 @@
 
 ---
 
+## [0.6.0] - 2026-11-06
+
+Optimisation: every PLAN 11.1 target measured, the misses recorded with
+their reasons (D-083, D-085, D-093), and the results published in
+`docs/PERFORMANCE.md`.
+
+### Added
+
+- `docs/PERFORMANCE.md`: every target with its measured number, the
+  comparison with lettre, mail-builder, mail-send, and mail-auth, the
+  method, and the machine.
+- Benchmarks `dkim`, `send` (0, 1, and 10 ms round trips), and `gate`, and
+  `benches/examples/targets.rs`, which prints every target in one table.
+- Test support: `Fault::RoundTrip(Duration)`, one delay per client
+  turnaround, the way a real round trip costs a pipelining client.
+
+### Changed
+
+- Dot-stuffing, raw-message input, the header value check, and relaxed
+  DKIM body canonicalization scan eight octets at a time (no `unsafe`):
+  dot-stuffing ran at about 6 GB/s in a quiet run (0.46 at 0.5), the
+  header check at about 18 GB/s.
+- base64 encodes six octets per step through a 12-bit table (about
+  2.9 GB/s, 1.75 at 0.5); quoted-printable copies literal runs through a
+  class table (about 2.7 times faster in a quiet run).
+- A text plus HTML build allocates 21 times (97 at 0.5); `Session::begin`
+  allocates nothing: an `Envelope` is shared behind an `Arc`, so cloning
+  one no longer copies its addresses.
+- The relaxed body canonicalizer passes a line of prose out in one piece;
+  an Ed25519 DKIM signature of a 10 KiB message takes about 20 µs (30 at
+  0.5).
+- EHLO capabilities keep the AUTH mechanism names in one buffer instead
+  of one allocation per name.
+- `TestServer` sets `TCP_NODELAY`, so a test conversation no longer waits
+  on delayed acknowledgements.
+- net-io 0.6.1 is the minimum.
+
 ## [0.5.1] - 2026-11-05
 
 ### Changed
