@@ -35,9 +35,9 @@ scripts/run.sh                                 # in smtp-net-bench, the competit
 | DKIM relaxed body canonicalization | at least 2 GB/s | 1.22 to 1.50 GB/s under load | missed, D-093 |
 | DKIM Ed25519 signature, 10 KiB message | at most 40 µs | 20 µs | met |
 | DKIM RSA-2048 signature, 10 KiB message | at most 1.6 ms | 217 to 230 µs | met |
-| One message on a reused connection, 0 ms round trip | 20% less than lettre | 24 µs against 67 ms | met |
-| Same, 1 ms round trip | 20% less than lettre | 2.1 ms against 101 ms | met |
-| Same, 10 ms round trip | 20% less than lettre | 16.5 ms against 182 ms | met |
+| One message on a reused connection, 0 ms round trip | 20% less than lettre | 25 µs against 70 ms | met |
+| Same, 1 ms round trip | 20% less than lettre | 3.8 ms against 125 ms | met |
+| Same, 10 ms round trip | 20% less than lettre | 42 ms against 134 ms | met |
 | Session memory, ready with one transaction | at most 16 KiB | 19,176 bytes (6,888 with a 4 KiB output buffer) | missed, D-085 |
 | `HourlyLimit::admit`, uncontended | at most 30 ns | 29 to 32 ns | met within noise |
 
@@ -55,14 +55,14 @@ Versions: lettre 0.11.23, mail-builder 2.0.1, mail-send 0.7.0, mail-auth 0.15.1,
 | quoted-printable, 1 MiB | 1.84 ms | quoted_printable crate 8.50 ms (4.61x) |
 | DKIM Ed25519, 10 KiB | 20.7 µs | mail-auth 18.6 µs (0.90x), lettre 34.5 µs (1.67x) |
 | DKIM RSA-2048, 10 KiB | 230 µs | mail-auth 218 µs (0.95x), lettre 3.24 ms (14.06x) |
-| One message on a reused connection, 0 ms round trip | 23.6 µs | lettre 67.0 ms, mail-send 64.6 ms |
-| Same, 1 ms round trip | 2.13 ms | lettre 101 ms, mail-send 95.6 ms |
-| Same, 10 ms round trip | 16.5 ms | lettre 182 ms, mail-send 160 ms |
+| One message on a reused connection, 0 ms round trip | 24.8 µs | lettre 69.7 ms, mail-send 65.3 ms |
+| Same, 1 ms round trip | 3.84 ms | lettre 125 ms, mail-send 131 ms |
+| Same, 10 ms round trip | 41.9 ms | lettre 134 ms, mail-send 233 ms |
 
 Reading the table:
 
 - **mail-builder is faster to build** because it does not check addresses or header values (smtp-net refuses header injection, bare CR or LF, and over-long lines at build time), and its base64 comes from a SIMD crate built on `unsafe` code. smtp-net keeps the checks and `#![forbid(unsafe_code)]` (D-091).
-- **The send rows are mostly round trips.** smtp-net pipelines MAIL, RCPT, and DATA (or BDAT) and disables Nagle's algorithm on its socket. lettre and mail-send leave Nagle on, so on Linux a small write that follows another waits for the server's delayed acknowledgement (about 40 ms) before it is sent; that is most of their time at 0 ms. The same `TestServer`, with `TCP_NODELAY`, served every client.
+- **The send rows are mostly round trips**, simulated by `Fault::RoundTrip`, a delay line that hands every reply to the client that much later (D-089). Under the release-day load each simulated round trip ran long (a 10 ms delay took about 40 ms), for every client alike, so compare the ratios, not the absolute times. smtp-net pipelines MAIL, RCPT, and DATA (or BDAT) and disables Nagle's algorithm on its socket. lettre and mail-send leave Nagle on, so on Linux a small write that follows another waits for the server's delayed acknowledgement (about 40 ms) before it is sent; that is most of their time at 0 ms. The same `TestServer`, with `TCP_NODELAY`, served every client.
 - base64 and the base64 crate are not the same job: smtp-net writes 76-column lines with CRLF, the base64 crate one line.
 
 ## What changed in 0.6

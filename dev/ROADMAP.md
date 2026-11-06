@@ -64,7 +64,7 @@ Depends on: crypt-io 1.3 with `sign-ed25519`, `sign-rsa`, `kdf-pbkdf2` (publishe
 ## v0.6.0 - Optimisation - DONE
 Exit: every target in PLAN 11.1 met, or the miss recorded with the measured number and the reason; `docs/PERFORMANCE.md` published.
 - [x] Benchmarks against lettre, mail-builder, mail-send, and mail-auth in `smtp-net-bench` (D-035, D-091).
-- [x] SWAR scanning (D-086); end-to-end send at 0, 1, 10 ms simulated round-trip time with `Fault::RoundTrip` (D-089): 24 µs, 2.1 ms, and 16.5 ms per message on a reused connection, against 67, 101, and 182 ms for lettre.
+- [x] SWAR scanning (D-086); end-to-end send at 0, 1, 10 ms simulated round-trip time with `Fault::RoundTrip` (D-089): 25 µs, 3.8 ms, and 42 ms per message on a reused connection, against 70, 125, and 134 ms for lettre (round trips ran long under load for every client).
 - [x] Allocation targets moved from 0.3 (D-047): `Session::begin` allocates nothing (D-084); a text plus HTML build allocates 21 times (D-083); `Event::Delivered` keeps its owned reply (D-087); unsigned mail is not streamed from the tree (D-088).
 - Misses, recorded with numbers and reasons (D-093), re-measured on a quiet machine in the 0.9 pass:
   - Build allocations: 21 against an estimate of 8 (D-083).

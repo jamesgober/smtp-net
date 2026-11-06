@@ -26,8 +26,10 @@ their reasons (D-083, D-085, D-093), and the results published in
   method, and the machine.
 - Benchmarks `dkim`, `send` (0, 1, and 10 ms round trips), and `gate`, and
   `benches/examples/targets.rs`, which prints every target in one table.
-- Test support: `Fault::RoundTrip(Duration)`, one delay per client
-  turnaround, the way a real round trip costs a pipelining client.
+- Test support: `Fault::RoundTrip(Duration)`: every byte the server writes
+  reaches the client that much later, so a client pays one round trip
+  each time it waits, the way a pipelining client does on a real link;
+  `TestServer::client_waits` counts those waits.
 
 ### Changed
 
