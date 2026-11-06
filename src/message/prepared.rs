@@ -374,44 +374,51 @@ impl PreparedMessage {
         let mut header_8bit = false;
         let b = &rfc5322;
         let mut i = 0usize;
-        while i < b.len() {
-            let c = b.get(i).copied().unwrap_or(0);
-            match c {
-                b'\r' => {
-                    if b.get(i + 1) != Some(&b'\n') {
-                        return Err(BuildError::BareCarriageReturn { position: i as u64 }.into());
-                    }
-                    let text = b.get(line_start..i).unwrap_or(&[]);
-                    if text.len() > 998 {
-                        return Err(BuildError::LineTooLong { line }.into());
-                    }
-                    if header_end.is_none() {
-                        if text.is_empty() {
-                            header_end = Some(i + 2);
-                        } else {
-                            if starts_with_name(text, b"from") {
-                                from = true;
-                            }
-                            if message_id.is_none() && starts_with_name(text, b"message-id") {
-                                message_id = extract_id(text);
-                            }
-                        }
-                    }
-                    line += 1;
-                    i += 2;
-                    line_start = i;
-                    continue;
+        // Line by line: the next CR or LF and the 8-bit check are word-at-a-
+        // time scans (PLAN 11.3 item 4).
+        while let Some(rest) = b.get(i..).filter(|r| !r.is_empty()) {
+            let k = crate::scan::find_line_end(rest).unwrap_or(rest.len());
+            let text = rest.get(..k).unwrap_or(&[]);
+            if !crate::scan::is_ascii(text) {
+                eight_bit = true;
+                if header_end.is_none() {
+                    header_8bit = true;
                 }
-                b'\n' => return Err(BuildError::BareLineFeed { position: i as u64 }.into()),
-                0x80..=0xff => {
-                    eight_bit = true;
-                    if header_end.is_none() {
-                        header_8bit = true;
-                    }
-                }
-                _ => {}
             }
-            i += 1;
+            match rest.get(k) {
+                None => break,
+                Some(b'\n') => {
+                    return Err(BuildError::BareLineFeed {
+                        position: (i + k) as u64,
+                    }
+                    .into());
+                }
+                Some(_) if rest.get(k + 1) != Some(&b'\n') => {
+                    return Err(BuildError::BareCarriageReturn {
+                        position: (i + k) as u64,
+                    }
+                    .into());
+                }
+                Some(_) => {}
+            }
+            if text.len() > 998 {
+                return Err(BuildError::LineTooLong { line }.into());
+            }
+            if header_end.is_none() {
+                if text.is_empty() {
+                    header_end = Some(i + k + 2);
+                } else {
+                    if starts_with_name(text, b"from") {
+                        from = true;
+                    }
+                    if message_id.is_none() && starts_with_name(text, b"message-id") {
+                        message_id = extract_id(text);
+                    }
+                }
+            }
+            line += 1;
+            i += k + 2;
+            line_start = i;
         }
         if b.len() - line_start > 998 {
             return Err(BuildError::LineTooLong { line }.into());

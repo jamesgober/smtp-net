@@ -61,9 +61,10 @@ impl DotStuffer {
         cap: usize,
     ) -> Result<usize, BuildError> {
         let mut taken = 0usize;
-        for &b in input {
+        while let Some(&b) = input.get(taken) {
             // Room for the byte, a stuffed dot, and a held CR.
-            if out.len() + 3 > cap {
+            let room = cap.saturating_sub(out.len());
+            if room < 3 {
                 break;
             }
             if self.pending_cr {
@@ -76,22 +77,38 @@ impl DotStuffer {
                 out.extend_from_slice(b"\r\n");
                 self.at_line_start = true;
                 self.ends_crlf = true;
-            } else if b == b'\r' {
-                self.pending_cr = true;
-            } else if b == b'\n' {
-                return Err(BuildError::BareLineFeed {
-                    position: self.offset,
-                });
-            } else {
-                if self.stuff && self.at_line_start && b == b'.' {
-                    out.push(b'.');
-                }
-                out.push(b);
-                self.at_line_start = false;
-                self.ends_crlf = false;
+                self.offset += 1;
+                taken += 1;
+                continue;
             }
-            self.offset += 1;
-            taken += 1;
+            match b {
+                b'\r' => {
+                    self.pending_cr = true;
+                    self.offset += 1;
+                    taken += 1;
+                }
+                b'\n' => {
+                    return Err(BuildError::BareLineFeed {
+                        position: self.offset,
+                    });
+                }
+                _ => {
+                    if self.stuff && self.at_line_start && b == b'.' {
+                        out.push(b'.');
+                    }
+                    // The rest of the line up to its CR (or the room left)
+                    // goes in one copy (PLAN 11.3 item 4).
+                    let rest = input.get(taken..).unwrap_or(&[]);
+                    let max = rest.len().min(room - 2);
+                    let window = rest.get(..max).unwrap_or(&[]);
+                    let run = crate::scan::find_line_end(window).unwrap_or(max).max(1);
+                    out.extend_from_slice(rest.get(..run).unwrap_or(&[]));
+                    self.at_line_start = false;
+                    self.ends_crlf = false;
+                    self.offset += run as u64;
+                    taken += run;
+                }
+            }
         }
         Ok(taken)
     }
@@ -214,5 +231,106 @@ mod tests {
         let mut out = Vec::new();
         s.finish(&mut out).unwrap();
         assert_eq!(out, b".\r\n");
+    }
+
+    /// Deterministic inputs biased to the octets the encoders treat specially.
+    fn corpus(cases: usize) -> Vec<Vec<u8>> {
+        const ALPHABET: &[u8] = b" \t=.Fromx\r\n\xc3\xa9a!~\x7f\x00";
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        (0..cases)
+            .map(|_| {
+                let len = (next() % 300) as usize;
+                (0..len)
+                    .map(|_| {
+                        let r = next();
+                        if r % 4 == 0 {
+                            ALPHABET[(r >> 8) as usize % ALPHABET.len()]
+                        } else {
+                            b'a' + (r >> 8) as u8 % 26
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The stuffer before the run fast path, for comparison.
+    fn reference(input: &[u8]) -> Result<Vec<u8>, BuildError> {
+        let mut out = Vec::new();
+        let (mut start, mut cr) = (true, false);
+        for (i, &b) in input.iter().enumerate() {
+            if cr {
+                if b != b'\n' {
+                    return Err(BuildError::BareCarriageReturn {
+                        position: i as u64 - 1,
+                    });
+                }
+                cr = false;
+                out.extend_from_slice(b"\r\n");
+                start = true;
+            } else if b == b'\r' {
+                cr = true;
+            } else if b == b'\n' {
+                return Err(BuildError::BareLineFeed { position: i as u64 });
+            } else {
+                if start && b == b'.' {
+                    out.push(b'.');
+                }
+                out.push(b);
+                start = false;
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn test_run_path_matches_the_octet_at_a_time_stuffer() {
+        for (n, mut input) in corpus(3000).into_iter().enumerate() {
+            // Mostly valid CRLF text, with some bare CR and LF left in.
+            if n % 3 != 0 {
+                let mut fixed = Vec::new();
+                for &b in &input {
+                    match b {
+                        b'\r' => {}
+                        b'\n' => fixed.extend_from_slice(b"\r\n"),
+                        _ => fixed.push(b),
+                    }
+                }
+                input = fixed;
+            }
+            for cap in [3, 4, 9, 64, 4096] {
+                let mut s = DotStuffer::new();
+                let mut out = Vec::new();
+                let mut all = Vec::new();
+                let mut rest = &input[..];
+                let got = loop {
+                    if rest.is_empty() {
+                        break Ok(());
+                    }
+                    match s.push(rest, &mut out, cap) {
+                        Ok(k) => {
+                            assert!(out.len() <= cap);
+                            if k == 0 {
+                                all.append(&mut out);
+                            }
+                            rest = &rest[k..];
+                        }
+                        Err(e) => break Err(e),
+                    }
+                };
+                all.append(&mut out);
+                match (got, reference(&input)) {
+                    (Ok(()), Ok(want)) => assert_eq!(all, want, "cap {cap}"),
+                    (Err(a), Err(b)) => assert_eq!(a, b, "cap {cap}"),
+                    (a, b) => panic!("cap {cap}: {a:?} against {b:?}"),
+                }
+            }
+        }
     }
 }

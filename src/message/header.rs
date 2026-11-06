@@ -62,8 +62,8 @@ const RESERVED: &[&str] = &[
 /// );
 /// ```
 pub fn check_header_value(field: &'static str, value: &str) -> Result<(), HeaderError> {
-    // Fast path: printable ASCII and TAB only.
-    if value.bytes().all(|b| b == b'\t' || (32..127).contains(&b)) {
+    // Fast path: printable ASCII and TAB only, eight octets at a time.
+    if crate::scan::is_printable_or_tab(value.as_bytes()) {
         return Ok(());
     }
     for (i, c) in value.char_indices() {

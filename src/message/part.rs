@@ -954,14 +954,14 @@ fn write_text<S: Sink>(
 }
 
 fn write_base64<S: Sink>(bytes: &[u8], sink: &mut S) -> Result<(), SinkError> {
-    let mut buf = [0u8; MIME_LINE_LENGTH];
-    let mut first = true;
-    for chunk in bytes.chunks(B64_LINE_INPUT) {
-        if !first {
+    // 32 lines per sink write: fewer calls, the same bytes.
+    const LINES: usize = 32;
+    let mut buf = [0u8; (MIME_LINE_LENGTH + 2) * LINES];
+    for (i, block) in bytes.chunks(B64_LINE_INPUT * LINES).enumerate() {
+        if i > 0 {
             sink.write(b"\r\n")?;
         }
-        first = false;
-        let n = encode::base64_line(chunk, &mut buf);
+        let n = encode::base64_lines_into(block, &mut buf);
         sink.write(buf.get(..n).unwrap_or(&[]))?;
     }
     Ok(())

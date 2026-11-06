@@ -71,6 +71,7 @@ mod error;
 mod gate;
 mod message;
 mod proto;
+mod scan;
 #[cfg(feature = "testing")]
 mod testing;
 

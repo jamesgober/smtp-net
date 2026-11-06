@@ -51,51 +51,89 @@ pub fn base64_encode_lines(input: &[u8], out: &mut [u8]) -> Result<usize, Error>
     let Some(out) = out.get_mut(..need) else {
         return Err(Error::new(ErrorKind::BufferTooSmall));
     };
+    Ok(base64_lines_into(input, out))
+}
+
+/// Writes `input` as base64 lines (CRLF between them) into `out`, which must
+/// hold `base64_encoded_len(input.len())` octets; returns the bytes written.
+pub(crate) fn base64_lines_into(input: &[u8], out: &mut [u8]) -> usize {
     let mut at = 0usize;
-    let mut first = true;
-    for line in input.chunks(B64_LINE_INPUT) {
-        if !first {
-            put(out, &mut at, b"\r\n");
+    for (i, line) in input.chunks(B64_LINE_INPUT).enumerate() {
+        if i > 0 {
+            if let Some(dst) = out.get_mut(at..at + 2) {
+                dst.copy_from_slice(b"\r\n");
+            }
+            at += 2;
         }
-        first = false;
-        let mut buf = [0u8; MIME_LINE_LENGTH];
-        let n = base64_line(line, &mut buf);
-        put(out, &mut at, buf.get(..n).unwrap_or(&[]));
+        at += base64_into(line, out.get_mut(at..).unwrap_or(&mut []));
     }
-    Ok(at)
+    at
 }
 
-fn put(out: &mut [u8], at: &mut usize, bytes: &[u8]) {
-    if let Some(dst) = out.get_mut(*at..*at + bytes.len()) {
-        dst.copy_from_slice(bytes);
+/// Two base64 characters for every 12-bit value: one lookup per half group.
+#[allow(clippy::indexing_slicing)] // const evaluation: indexes below 4096 and 64
+const B64_PAIRS: [[u8; 2]; 4096] = {
+    let mut t = [[0u8; 2]; 4096];
+    let mut i = 0;
+    while i < 4096 {
+        t[i] = [B64[i >> 6], B64[i & 63]];
+        i += 1;
     }
-    *at += bytes.len();
+    t
+};
+
+fn pair(v: u32) -> [u8; 2] {
+    B64_PAIRS
+        .get((v & 0xfff) as usize)
+        .copied()
+        .unwrap_or([b'A'; 2])
 }
 
-/// Encodes at most 57 octets into one base64 line of at most 76 characters.
-pub(crate) fn base64_line(input: &[u8], out: &mut [u8; MIME_LINE_LENGTH]) -> usize {
+/// Writes `input` as one unbroken padded base64 string into `out` (which
+/// must hold `4 * ceil(len / 3)` octets); returns the bytes written.
+pub(crate) fn base64_into(input: &[u8], out: &mut [u8]) -> usize {
     let mut n = 0;
-    for chunk in input.chunks(3) {
-        let b0 = chunk.first().copied().unwrap_or(0);
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        let v = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+    let mut groups = input.chunks_exact(3);
+    let mut dst = out.chunks_exact_mut(4);
+    for (g, o) in (&mut groups).zip(&mut dst) {
+        let (&[a, b, c], [o0, o1, o2, o3]) = (g, o) else {
+            continue;
+        };
+        let v = (u32::from(a) << 16) | (u32::from(b) << 8) | u32::from(c);
+        let [p0, p1] = pair(v >> 12);
+        let [p2, p3] = pair(v);
+        (*o0, *o1, *o2, *o3) = (p0, p1, p2, p3);
+        n += 4;
+    }
+    let tail = groups.remainder();
+    if !tail.is_empty() {
+        let b0 = tail.first().copied().unwrap_or(0);
+        let b1 = tail.get(1).copied().unwrap_or(0);
+        let v = (u32::from(b0) << 16) | (u32::from(b1) << 8);
         let chars = [
             b64((v >> 18) & 63),
             b64((v >> 12) & 63),
-            if chunk.len() > 1 {
+            if tail.len() > 1 {
                 b64((v >> 6) & 63)
             } else {
                 b'='
             },
-            if chunk.len() > 2 { b64(v & 63) } else { b'=' },
+            b'=',
         ];
-        if let Some(dst) = out.get_mut(n..n + 4) {
-            dst.copy_from_slice(&chars);
+        if let Some(d) = out.get_mut(n..n + 4) {
+            d.copy_from_slice(&chars);
         }
         n += 4;
     }
     n
+}
+
+/// Encodes at most 57 octets into one base64 line of at most 76 characters.
+pub(crate) fn base64_line(input: &[u8], out: &mut [u8; MIME_LINE_LENGTH]) -> usize {
+    base64_into(
+        input.get(..B64_LINE_INPUT.min(input.len())).unwrap_or(&[]),
+        out,
+    )
 }
 
 fn b64(i: u32) -> u8 {
@@ -426,7 +464,17 @@ fn qp_byte(state: &mut QpState, b: u8, emit: &mut impl FnMut(&[u8])) {
 }
 
 pub(crate) fn qp_push(state: &mut QpState, input: &[u8], emit: &mut impl FnMut(&[u8])) {
-    for &b in input {
+    let mut i = 0usize;
+    while i < input.len() {
+        if state.mid_line && !state.pending_cr && state.pending_ws.is_none() && state.from == 0 {
+            let done = qp_mid_line(state, input.get(i..).unwrap_or(&[]), emit);
+            if done > 0 {
+                i += done;
+                continue;
+            }
+        }
+        let Some(&b) = input.get(i) else { break };
+        i += 1;
         if state.pending_cr {
             state.pending_cr = false;
             if b == b'\n' {
@@ -443,6 +491,69 @@ pub(crate) fn qp_push(state: &mut QpState, input: &[u8], emit: &mut impl FnMut(&
         }
         qp_byte(state, b, emit);
     }
+}
+
+const QP_LITERAL: u8 = 0;
+const QP_SPACE: u8 = 1;
+const QP_OTHER: u8 = 2;
+
+/// How quoted-printable treats each octet in the middle of a line.
+#[allow(clippy::indexing_slicing)] // const evaluation: the index is below 256
+const QP_CLASS: [u8; 256] = {
+    let mut t = [QP_OTHER; 256];
+    let mut i = 0;
+    while i < 256 {
+        if crate::scan::qp_literal(i as u8) {
+            t[i] = QP_LITERAL;
+        } else if i == 0x20 || i == 0x09 {
+            t[i] = QP_SPACE;
+        }
+        i += 1;
+    }
+    t
+};
+
+/// The middle of a line with nothing held: every octet has a fixed form
+/// (itself, or `=XX`; a space or tab is itself when an octet other than CR
+/// or LF follows it in `input`), so it is written without the per-octet
+/// state machine: runs that go out as they are are emitted as slices of the
+/// input, escapes as three-octet tokens. Stops at a line end, at whitespace
+/// whose fate is not known yet, and before an octet that would pass the
+/// soft line limit, leaving those to [`qp_byte`]. Returns the octets taken.
+fn qp_mid_line(state: &mut QpState, input: &[u8], emit: &mut impl FnMut(&[u8])) -> usize {
+    let mut j = 0usize;
+    loop {
+        let start = j;
+        let limit = (start + SOFT_LIMIT.saturating_sub(state.col)).min(input.len());
+        // Words are short, so a table lookup per octet beats starting a
+        // word-at-a-time scan for each one.
+        while let Some(&c) = input.get(j).filter(|_| j < limit) {
+            match QP_CLASS.get(usize::from(c)).copied().unwrap_or(QP_OTHER) {
+                QP_LITERAL => j += 1,
+                QP_SPACE if !matches!(input.get(j + 1), Some(b'\r' | b'\n') | None) => j += 1,
+                _ => break,
+            }
+        }
+        if j > start {
+            emit(input.get(start..j).unwrap_or(&[]));
+            state.col += j - start;
+        }
+        let Some(&c) = input.get(j) else { break };
+        if matches!(c, b'\r' | b'\n' | b' ' | b'\t')
+            || crate::scan::qp_literal(c)
+            || state.col + 3 > SOFT_LIMIT
+        {
+            break;
+        }
+        emit(&[
+            b'=',
+            HEX.get(usize::from(c >> 4)).copied().unwrap_or(b'0'),
+            HEX.get(usize::from(c & 15)).copied().unwrap_or(b'0'),
+        ]);
+        state.col += 3;
+        j += 1;
+    }
+    j
 }
 
 pub(crate) fn qp_finish(state: &mut QpState, emit: &mut impl FnMut(&[u8])) {
@@ -676,5 +787,104 @@ mod tests {
         let n = quoted_printable_encode(b"ab ", &mut out, &mut state).unwrap();
         let m = quoted_printable_finish(&mut out[n..], &mut state).unwrap();
         assert_eq!(&out[..n + m], b"ab=20");
+    }
+
+    /// Deterministic inputs biased to the octets the encoders treat specially.
+    fn corpus(cases: usize) -> Vec<Vec<u8>> {
+        const ALPHABET: &[u8] = b" \t=.Fromx\r\n\xc3\xa9a!~\x7f\x00";
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        (0..cases)
+            .map(|_| {
+                let len = (next() % 300) as usize;
+                (0..len)
+                    .map(|_| {
+                        let r = next();
+                        if r % 4 == 0 {
+                            ALPHABET[(r >> 8) as usize % ALPHABET.len()]
+                        } else {
+                            b'a' + (r >> 8) as u8 % 26
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The encoder before the run fast path: one octet at a time.
+    fn qp_reference(input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut state = QpState::new();
+        let mut emit = |b: &[u8]| out.extend_from_slice(b);
+        for &b in input {
+            if state.pending_cr {
+                state.pending_cr = false;
+                if b == b'\n' {
+                    qp_line_break(&mut state, &mut emit);
+                    continue;
+                }
+                qp_flush_from(&mut state, &mut emit);
+                qp_flush_ws(&mut state, false, &mut emit);
+                qp_hex(&mut state, b'\r', &mut emit);
+            }
+            if b == b'\r' {
+                state.pending_cr = true;
+                continue;
+            }
+            qp_byte(&mut state, b, &mut emit);
+        }
+        qp_finish(&mut state, &mut emit);
+        out
+    }
+
+    fn b64_reference(input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, line) in input.chunks(57).enumerate() {
+            if i > 0 {
+                out.extend_from_slice(b"\r\n");
+            }
+            for g in line.chunks(3) {
+                let v = (u32::from(g[0]) << 16)
+                    | (u32::from(*g.get(1).unwrap_or(&0)) << 8)
+                    | u32::from(*g.get(2).unwrap_or(&0));
+                out.push(B64[(v >> 18) as usize & 63]);
+                out.push(B64[(v >> 12) as usize & 63]);
+                out.push(if g.len() > 1 {
+                    B64[(v >> 6) as usize & 63]
+                } else {
+                    b'='
+                });
+                out.push(if g.len() > 2 {
+                    B64[v as usize & 63]
+                } else {
+                    b'='
+                });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_fast_paths_match_the_octet_at_a_time_encoders() {
+        for input in corpus(3000) {
+            // Whole and in pieces: the run path must stop at every boundary.
+            let mut pieces = Vec::new();
+            let mut state = QpState::new();
+            for part in input.chunks(7) {
+                qp_push(&mut state, part, &mut |b| pieces.extend_from_slice(b));
+            }
+            qp_finish(&mut state, &mut |b| pieces.extend_from_slice(b));
+            let want = qp_reference(&input);
+            assert_eq!(qp(&input), want, "{input:?}");
+            assert_eq!(pieces, want, "{input:?}");
+            assert_eq!(b64(&input), b64_reference(&input));
+        }
+        let big: Vec<u8> = (0..100_000u32).map(|i| (i * 31) as u8).collect();
+        assert_eq!(b64(&big), b64_reference(&big));
     }
 }
