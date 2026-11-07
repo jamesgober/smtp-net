@@ -13,6 +13,46 @@
 
 ---
 
+## [0.7.0] - 2026-11-08
+
+Hardening: every row of the threat table has a passing test
+(`docs/SECURITY.md`), one hour of fuzzing per target, the 24-hour soak,
+and the SCRAM timing check.
+
+### Added
+
+- `docs/SECURITY.md`: every threat, its defence, the tests that prove it,
+  and the 0.7 hardening record.
+- `MessageBuilder::allow_bidi_controls` and
+  `refuse_address_like_display_names`, with `HeaderError::BidiControl` and
+  `HeaderError::AddressLikeDisplayName` (T-25, T-35).
+- `DomainLimit` (feature `std`): a recipient budget per recipient domain.
+  `SendGate::admit_envelope` and `refund_envelope` (default methods), and a
+  pair of gates is a gate: `.gate((HourlyLimit::recipients(500),
+  DomainLimit::per_domain(100)))`.
+- Test support: `TestServerBuilder::record(false)` keeps no messages or
+  transcript; `TestServer::messages` counts accepted messages.
+- `tests/soak.rs` (the NFR-14 soak, ignored by default), `tests/threats.rs`,
+  three transcripts for out-of-step replies, a self-signed certificate
+  test, a dudect-style timing check of the SCRAM signature comparison, and
+  a CI job for the loom models.
+
+### Changed
+
+- Bidirectional overrides and isolates (U+202A to U+202E, U+2066 to
+  U+2069) in the Subject and display names are refused by default.
+- The `prepared_decode` fuzz target frames half its inputs with a valid
+  header and CRC-32C, so it reaches the fields behind the checksum.
+
+### Fixed
+
+- A reply whose class cannot answer its command (a `250` to DATA, a `354`
+  to MAIL or to the end of data) was reported as a permanent `Rejected`.
+  Under pipelining an extra reply from the server could do that to a
+  good message, which a job queue would then dead-letter. It is now
+  `Protocol(UnexpectedReply)`, temporary; the session closes; after the
+  end of data the message is possibly delivered.
+
 ## [0.6.0] - 2026-11-06
 
 Optimisation: every PLAN 11.1 target measured, the misses recorded with
@@ -226,7 +266,11 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/smtp-net/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/smtp-net/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/smtp-net/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/jamesgober/smtp-net/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/jamesgober/smtp-net/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/jamesgober/smtp-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/smtp-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/smtp-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/smtp-net/compare/v0.1.0...v0.2.0

@@ -95,4 +95,4 @@ Exit: no API change request open; every review finding closed test-first; the 1.
 Exit: full audit (API, docs, tests, benchmarks, security) recorded in `docs/STABILITY-1.0.md`; the first site has used it end to end (DIRECTIVES 3.10); **James's explicit go.**
 
 ## After 1.0
-P3 items, each in a minor version with its tests: OAUTHBEARER, SCRAM-SHA-256-PLUS, LMTP, REQUIRETLS, BINARYMIME, VERP helper, multiple From with Sender, `Group` syntax, display-name policy, bidi policy, IDNA when unicode-lang has it.
+P3 items, each in a minor version with its tests: OAUTHBEARER, SCRAM-SHA-256-PLUS, LMTP, REQUIRETLS, BINARYMIME, VERP helper, multiple From with Sender, `Group` syntax, IDNA when unicode-lang has it. (The display-name and bidi policies moved to 0.7, D-097.)
