@@ -823,9 +823,11 @@ impl Part {
 }
 
 impl HeaderBlock {
-    /// `Name: essence; p1=v1; p2=v2`, folding before a parameter that would
-    /// pass 78 columns; parameter values through parse-net's
-    /// `write_mime_param` (RFC 2231 for non-ASCII or long values).
+    /// `Name: essence; p1=v1; p2=v2` through parse-net's
+    /// `write_mime_param_at`, which is told the room left on the line: a
+    /// parameter that does not fit starts a new line, and RFC 2231 sections
+    /// are sized to the column they start at, so every line stays within 78
+    /// columns.
     pub(crate) fn with_params<'p>(
         &mut self,
         name: &str,
@@ -836,27 +838,20 @@ impl HeaderBlock {
         self.bytes.extend_from_slice(name.as_bytes());
         self.bytes.extend_from_slice(b": ");
         self.bytes.extend_from_slice(essence.as_bytes());
-        let mut col = name.len() + 2 + essence.len();
+        let mut room = RECOMMENDED_HEADER_LINE.saturating_sub(name.len() + 2 + essence.len());
         let mut p = core::mem::take(&mut self.scratch);
         // One allocation rather than a doubling series for the first parameter.
         p.reserve(128);
         for (pname, value) in params {
             p.clear();
-            if mail::write_mime_param(pname, value, &mut p).is_err() {
-                self.scratch = p;
-                return Err(HeaderError::InvalidContentType);
+            match mail::write_mime_param_at(pname, value, room, &mut p) {
+                Ok(left) => room = left,
+                Err(_) => {
+                    self.scratch = p;
+                    return Err(HeaderError::InvalidContentType);
+                }
             }
-            let first = p.iter().position(|&b| b == b'\r').unwrap_or(p.len());
-            if col + first > RECOMMENDED_HEADER_LINE && p.starts_with(b"; ") {
-                self.bytes.extend_from_slice(b";\r\n ");
-                self.bytes.extend_from_slice(p.get(2..).unwrap_or(&[]));
-            } else {
-                self.bytes.extend_from_slice(&p);
-            }
-            col = match self.bytes.iter().rposition(|&b| b == b'\n') {
-                Some(nl) if nl >= start => self.bytes.len() - nl - 1,
-                _ => self.bytes.len() - start,
-            };
+            self.bytes.extend_from_slice(&p);
         }
         self.scratch = p;
         self.finish_line(name, start);

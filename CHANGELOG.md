@@ -43,6 +43,8 @@ and the SCRAM timing check.
   U+2069) in the Subject and display names are refused by default.
 - The `prepared_decode` fuzz target frames half its inputs with a valid
   header and CRC-32C, so it reaches the fields behind the checksum.
+- parse-net 0.9.2 is the minimum: MIME parameters are folded by its
+  `write_mime_param_at`, with no change to the output.
 
 ### Fixed
 
