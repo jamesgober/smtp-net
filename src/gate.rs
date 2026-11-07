@@ -4,11 +4,14 @@
 
 use core::time::Duration;
 
+use crate::message::prepared::Envelope;
+
 /// Asked before connecting and before each transaction.
 ///
 /// A gate that already exists elsewhere (throttle-net inside a job runner,
 /// a database counter shared by several processes) implements this in a
-/// few lines.
+/// few lines. Two gates together are a gate: `(HourlyLimit, DomainLimit)`
+/// admits only what both admit.
 pub trait SendGate: Send + Sync {
     /// Whether a message to `recipients` recipients may be sent at
     /// `now_unix_ms` (wall clock, milliseconds).
@@ -18,6 +21,63 @@ pub trait SendGate: Send + Sync {
     /// the server accepted MAIL): give the allowance back.
     fn refund(&self, recipients: u32, now_unix_ms: u64) {
         let _ = (recipients, now_unix_ms);
+    }
+
+    /// What the client asks: [`admit`](SendGate::admit) with the number of
+    /// recipients, unless a gate needs the addresses themselves (a budget
+    /// per recipient domain).
+    fn admit_envelope(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission {
+        self.admit(recipient_count(envelope), now_unix_ms)
+    }
+
+    /// What the client gives back: [`refund`](SendGate::refund), unless
+    /// overridden with [`admit_envelope`](SendGate::admit_envelope).
+    fn refund_envelope(&self, envelope: &Envelope, now_unix_ms: u64) {
+        self.refund(recipient_count(envelope), now_unix_ms);
+    }
+}
+
+fn recipient_count(envelope: &Envelope) -> u32 {
+    u32::try_from(envelope.recipients().len()).unwrap_or(u32::MAX)
+}
+
+/// Both gates: admitted only when both admit; when the second refuses, the
+/// first is given its allowance back.
+impl<A: SendGate, B: SendGate> SendGate for (A, B) {
+    fn admit(&self, recipients: u32, now_unix_ms: u64) -> Admission {
+        match self.0.admit(recipients, now_unix_ms) {
+            Admission::Admit => match self.1.admit(recipients, now_unix_ms) {
+                Admission::Admit => Admission::Admit,
+                other => {
+                    self.0.refund(recipients, now_unix_ms);
+                    other
+                }
+            },
+            other => other,
+        }
+    }
+
+    fn refund(&self, recipients: u32, now_unix_ms: u64) {
+        self.0.refund(recipients, now_unix_ms);
+        self.1.refund(recipients, now_unix_ms);
+    }
+
+    fn admit_envelope(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission {
+        match self.0.admit_envelope(envelope, now_unix_ms) {
+            Admission::Admit => match self.1.admit_envelope(envelope, now_unix_ms) {
+                Admission::Admit => Admission::Admit,
+                other => {
+                    self.0.refund_envelope(envelope, now_unix_ms);
+                    other
+                }
+            },
+            other => other,
+        }
+    }
+
+    fn refund_envelope(&self, envelope: &Envelope, now_unix_ms: u64) {
+        self.0.refund_envelope(envelope, now_unix_ms);
+        self.1.refund_envelope(envelope, now_unix_ms);
     }
 }
 
@@ -44,6 +104,9 @@ pub enum CountUnit {
 
 #[cfg(target_has_atomic = "64")]
 pub use hourly::HourlyLimit;
+
+#[cfg(feature = "std")]
+pub use domain::DomainLimit;
 
 #[cfg(target_has_atomic = "64")]
 mod hourly {
@@ -391,6 +454,351 @@ mod hourly {
                 assert!(a ^ b);
                 assert_eq!(g.remaining(later), 0);
             });
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+mod domain {
+    use alloc::{boxed::Box, vec::Vec};
+    use core::time::Duration;
+    use std::{collections::HashMap, sync::Mutex};
+
+    use super::{Admission, SendGate};
+    use crate::message::prepared::Envelope;
+
+    /// Five-minute buckets.
+    const BUCKET_MS: u64 = 5 * 60_000;
+    /// A bucket is kept until its whole span has left the 60-minute window,
+    /// so a count is never dropped early (it may be kept up to 5 minutes
+    /// late: the limit errs towards refusing).
+    const BUCKETS: usize = 13;
+
+    #[derive(Debug, Default)]
+    struct Domain {
+        /// (bucket number, recipients) per slot.
+        buckets: [(u64, u32); BUCKETS],
+        last_used: u64,
+    }
+
+    impl Domain {
+        fn used(&mut self, bucket: u64) -> u64 {
+            let oldest = bucket.saturating_sub(BUCKETS as u64 - 1);
+            let mut used = 0u64;
+            for (b, n) in &mut self.buckets {
+                if *b < oldest {
+                    *n = 0;
+                }
+                used += u64::from(*n);
+            }
+            used
+        }
+
+        /// When enough recipients leave the window for `need` more.
+        fn wait(&self, bucket: u64, mut need: u64, now_unix_ms: u64) -> Duration {
+            let mut live: Vec<(u64, u32)> = self
+                .buckets
+                .iter()
+                .copied()
+                .filter(|&(_, n)| n > 0)
+                .collect();
+            live.sort_unstable();
+            for (b, n) in live {
+                if u64::from(n) >= need {
+                    let frees_at = (b + BUCKETS as u64) * BUCKET_MS;
+                    return Duration::from_millis(frees_at.saturating_sub(now_unix_ms).max(1));
+                }
+                need -= u64::from(n);
+            }
+            Duration::from_millis(
+                ((bucket + BUCKETS as u64) * BUCKET_MS).saturating_sub(now_unix_ms),
+            )
+        }
+
+        fn slot(&mut self, bucket: u64) -> Option<&mut (u64, u32)> {
+            self.buckets.get_mut((bucket % BUCKETS as u64) as usize)
+        }
+
+        fn add(&mut self, bucket: u64, n: u32) {
+            if let Some(slot) = self.slot(bucket) {
+                if slot.0 != bucket {
+                    *slot = (bucket, 0);
+                }
+                slot.1 = slot.1.saturating_add(n);
+            }
+        }
+
+        fn take(&mut self, bucket: u64, n: u32) {
+            if let Some(slot) = self.slot(bucket) {
+                if slot.0 == bucket {
+                    slot.1 = slot.1.saturating_sub(n);
+                }
+            }
+        }
+    }
+
+    /// At most `per_hour` recipients at any one recipient domain in any 60
+    /// minutes (PLAN 10.3): a compromised account or an abused form mailing
+    /// one victim domain is stopped at the limit and shows up as `Throttled`
+    /// errors, while mail to other domains goes on. Combine it with an
+    /// [`HourlyLimit`](crate::HourlyLimit) for the total:
+    /// `.gate((HourlyLimit::recipients(500), DomainLimit::per_domain(100)))`.
+    ///
+    /// Domains are compared without regard to ASCII case. The table holds at
+    /// most [`max_domains`](DomainLimit::max_domains) domains (default
+    /// 1,024; about 250 octets each); when it is full, the domain used least
+    /// recently is forgotten, so a domain under steady mail keeps its count.
+    /// A message is admitted for all its domains or none.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use smtp_net::{Address, Admission, DomainLimit, Envelope, SendGate};
+    /// let to = |s: &str| {
+    ///     Envelope::new(Address::parse("a@example.com").unwrap(), &[Address::parse(s).unwrap()])
+    ///         .unwrap()
+    /// };
+    /// let gate = DomainLimit::per_domain(2);
+    /// let t = 1_700_000_000_000;
+    /// assert_eq!(gate.admit_envelope(&to("x@victim.example"), t), Admission::Admit);
+    /// assert_eq!(gate.admit_envelope(&to("y@victim.example"), t), Admission::Admit);
+    /// assert!(matches!(
+    ///     gate.admit_envelope(&to("z@VICTIM.example"), t),
+    ///     Admission::RetryAfter(_)
+    /// ));
+    /// assert_eq!(gate.admit_envelope(&to("z@other.example"), t), Admission::Admit);
+    /// ```
+    #[derive(Debug)]
+    pub struct DomainLimit {
+        per_hour: u32,
+        max_domains: usize,
+        table: Mutex<HashMap<Box<str>, Domain>>,
+    }
+
+    impl DomainLimit {
+        /// At most `per_hour` recipients per recipient domain in any 60 minutes.
+        #[must_use]
+        pub fn per_domain(per_hour: u32) -> DomainLimit {
+            DomainLimit {
+                per_hour,
+                max_domains: 1024,
+                table: Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// Most domains remembered at once (at least 1).
+        #[must_use]
+        pub fn max_domains(mut self, n: usize) -> DomainLimit {
+            self.max_domains = n.max(1);
+            self
+        }
+
+        /// How many more recipients `domain` may have at `now_unix_ms`.
+        #[must_use]
+        pub fn remaining(&self, domain: &str, now_unix_ms: u64) -> u32 {
+            let key = domain.to_ascii_lowercase();
+            let used = match self.table.lock() {
+                Ok(mut t) => t
+                    .get_mut(key.as_str())
+                    .map_or(0, |d| d.used(now_unix_ms / BUCKET_MS)),
+                Err(_) => u64::from(self.per_hour),
+            };
+            u32::try_from(u64::from(self.per_hour).saturating_sub(used)).unwrap_or(0)
+        }
+
+        /// The envelope's recipients counted per domain, lowercase.
+        fn per_domain_counts(envelope: &Envelope) -> Vec<(Box<str>, u32)> {
+            let mut out: Vec<(Box<str>, u32)> = Vec::new();
+            for a in envelope.recipients() {
+                let d = a.domain().as_str().to_ascii_lowercase();
+                match out.iter_mut().find(|(k, _)| **k == *d) {
+                    Some((_, n)) => *n = n.saturating_add(1),
+                    None => out.push((d.into_boxed_str(), 1)),
+                }
+            }
+            out
+        }
+    }
+
+    impl SendGate for DomainLimit {
+        /// Without the addresses there is no domain to count: admitted. The
+        /// client always asks through `admit_envelope`.
+        fn admit(&self, _recipients: u32, _now_unix_ms: u64) -> Admission {
+            Admission::Admit
+        }
+
+        fn admit_envelope(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission {
+            let bucket = now_unix_ms / BUCKET_MS;
+            let counts = DomainLimit::per_domain_counts(envelope);
+            let Ok(mut table) = self.table.lock() else {
+                // A panic while the lock was held: refuse rather than guess.
+                return Admission::RetryAfter(Duration::from_millis(BUCKET_MS));
+            };
+            let limit = u64::from(self.per_hour);
+            let mut wait = Duration::ZERO;
+            for (d, n) in &counts {
+                let n = u64::from(*n);
+                match table.get_mut(d) {
+                    Some(entry) => {
+                        let used = entry.used(bucket);
+                        if used + n > limit {
+                            wait = wait.max(entry.wait(bucket, used + n - limit, now_unix_ms));
+                        }
+                    }
+                    None if n > limit => {
+                        wait = wait.max(Duration::from_millis(BUCKETS as u64 * BUCKET_MS));
+                    }
+                    None => {}
+                }
+            }
+            if !wait.is_zero() {
+                return Admission::RetryAfter(wait);
+            }
+            for (d, n) in counts {
+                if !table.contains_key(&d) && table.len() >= self.max_domains {
+                    let lru = table
+                        .iter()
+                        .min_by_key(|(_, v)| v.last_used)
+                        .map(|(k, _)| k.clone());
+                    if let Some(k) = lru {
+                        table.remove(&k);
+                    }
+                }
+                let entry = table.entry(d).or_default();
+                entry.add(bucket, n);
+                entry.last_used = now_unix_ms;
+            }
+            Admission::Admit
+        }
+
+        fn refund_envelope(&self, envelope: &Envelope, now_unix_ms: u64) {
+            let bucket = now_unix_ms / BUCKET_MS;
+            if let Ok(mut table) = self.table.lock() {
+                for (d, n) in DomainLimit::per_domain_counts(envelope) {
+                    if let Some(entry) = table.get_mut(&d) {
+                        entry.take(bucket, n);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::Address;
+
+        const T: u64 = 1_700_000_000_000 / BUCKET_MS * BUCKET_MS;
+        const MIN: u64 = 60_000;
+
+        fn env(to: &[&str]) -> Envelope {
+            let to: Vec<Address> = to.iter().map(|s| Address::parse(s).unwrap()).collect();
+            Envelope::new(Address::parse("a@example.com").unwrap(), &to).unwrap()
+        }
+
+        fn refused(a: Admission) -> bool {
+            matches!(a, Admission::RetryAfter(_))
+        }
+
+        #[test]
+        fn test_per_domain_limit_and_other_domains() {
+            let g = DomainLimit::per_domain(3);
+            assert_eq!(
+                g.admit_envelope(&env(&["a@v.example", "b@v.example"]), T),
+                Admission::Admit
+            );
+            assert_eq!(g.remaining("V.example", T), 1);
+            // Two more at v would pass the limit: the whole message waits,
+            // its w recipient included.
+            assert!(refused(g.admit_envelope(
+                &env(&["c@v.example", "d@v.example", "x@w.example"]),
+                T
+            )));
+            assert_eq!(g.remaining("w.example", T), 3);
+            assert_eq!(
+                g.admit_envelope(&env(&["c@v.example", "x@w.example"]), T),
+                Admission::Admit
+            );
+            assert!(refused(g.admit_envelope(&env(&["e@v.example"]), T)));
+        }
+
+        #[test]
+        fn test_window_and_retry_after() {
+            let g = DomainLimit::per_domain(2);
+            assert_eq!(
+                g.admit_envelope(&env(&["a@v.example"]), T),
+                Admission::Admit
+            );
+            assert_eq!(
+                g.admit_envelope(&env(&["b@v.example"]), T + 20 * MIN),
+                Admission::Admit
+            );
+            let Admission::RetryAfter(d) = g.admit_envelope(&env(&["c@v.example"]), T + 30 * MIN)
+            else {
+                panic!("admitted over the limit")
+            };
+            // The first recipient's bucket leaves 65 minutes after it opened.
+            assert_eq!(d, Duration::from_millis(35 * MIN));
+            assert!(refused(
+                g.admit_envelope(&env(&["c@v.example"]), T + 65 * MIN - 1)
+            ));
+            assert_eq!(
+                g.admit_envelope(&env(&["c@v.example"]), T + 65 * MIN),
+                Admission::Admit
+            );
+        }
+
+        #[test]
+        fn test_refund_and_oversized_message() {
+            let g = DomainLimit::per_domain(2);
+            let e = env(&["a@v.example", "b@v.example"]);
+            assert_eq!(g.admit_envelope(&e, T), Admission::Admit);
+            g.refund_envelope(&e, T);
+            assert_eq!(g.remaining("v.example", T), 2);
+            let three = env(&["a@v.example", "b@v.example", "c@v.example"]);
+            assert!(refused(g.admit_envelope(&three, T)));
+        }
+
+        #[test]
+        fn test_table_is_bounded_and_keeps_the_busy_domain() {
+            let g = DomainLimit::per_domain(1).max_domains(4);
+            assert_eq!(
+                g.admit_envelope(&env(&["a@busy.example"]), T),
+                Admission::Admit
+            );
+            for i in 0..100u64 {
+                // The busy domain is mailed again each time, so it is never
+                // the one used least recently.
+                assert!(refused(
+                    g.admit_envelope(&env(&["b@busy.example"]), T + 2 * i + 1)
+                ));
+                g.table
+                    .lock()
+                    .unwrap()
+                    .get_mut("busy.example")
+                    .unwrap()
+                    .last_used = T + 2 * i + 1;
+                let other = format!("x@d{i}.example");
+                assert_eq!(
+                    g.admit_envelope(&env(&[other.as_str()]), T + 2 * i + 2),
+                    Admission::Admit
+                );
+                assert!(g.table.lock().unwrap().len() <= 4);
+            }
+        }
+
+        #[test]
+        fn test_pair_refunds_the_first_when_the_second_refuses() {
+            let g = (
+                crate::HourlyLimit::recipients(10),
+                DomainLimit::per_domain(1),
+            );
+            assert_eq!(
+                g.admit_envelope(&env(&["a@v.example"]), T),
+                Admission::Admit
+            );
+            assert!(refused(g.admit_envelope(&env(&["b@v.example"]), T)));
+            assert_eq!(g.0.remaining(T), 9);
         }
     }
 }

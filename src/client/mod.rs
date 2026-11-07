@@ -526,8 +526,7 @@ fn admit(server: &Server, message: &PreparedMessage) -> Result<(), Error> {
     let Some(gate) = &server.gate else {
         return Ok(());
     };
-    let n = u32::try_from(message.envelope().recipients().len()).unwrap_or(u32::MAX);
-    match gate.admit(n, now_unix_ms()) {
+    match gate.admit_envelope(message.envelope(), now_unix_ms()) {
         Admission::RetryAfter(d) => Err(Error::new(ErrorKind::Throttled).with_retry_after(d)),
         _ => Ok(()),
     }
@@ -536,8 +535,7 @@ fn admit(server: &Server, message: &PreparedMessage) -> Result<(), Error> {
 fn refund_on(server: &Server, message: &PreparedMessage, e: &Error) {
     if let Some(gate) = &server.gate {
         if !e.possibly_delivered() && !matches!(e.kind(), ErrorKind::Throttled) {
-            let n = u32::try_from(message.envelope().recipients().len()).unwrap_or(u32::MAX);
-            gate.refund(n, now_unix_ms());
+            gate.refund_envelope(message.envelope(), now_unix_ms());
         }
     }
 }

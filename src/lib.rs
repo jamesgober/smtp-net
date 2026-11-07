@@ -114,6 +114,8 @@ pub use client::{
     Client, ObservedEvent, Observer, Pool, Report, Security, SecurityEventKind, Server,
     ServerBuilder, TlsConnector, TlsSetupError, send, send_local, send_prepared,
 };
+#[cfg(feature = "std")]
+pub use gate::DomainLimit;
 #[cfg(target_has_atomic = "64")]
 pub use gate::HourlyLimit;
 pub use gate::{Admission, CountUnit, SendGate};

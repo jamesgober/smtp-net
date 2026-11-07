@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use smtp_net::{Client, Error, Fault, Message, Pool, Stage, TestServer};
+use smtp_net::{Client, DomainLimit, Error, Fault, HourlyLimit, Message, Pool, Stage, TestServer};
 
 struct Counting;
 
@@ -193,7 +193,9 @@ impl FaultServer {
 }
 
 fn msg(i: u64) -> Message {
-    let to = format!("user{}@example.org", i % 1000);
+    // A thousand recipient domains, more than the domain gate remembers,
+    // so its table is always full and forgetting.
+    let to = format!("user@d{}.example.org", i % 1000);
     if i % 2 == 0 {
         Message::text("no-reply@example.com", &to, "Soak", "Hello.\n.\nBye.\n").unwrap()
     } else {
@@ -245,7 +247,17 @@ fn soak() {
     let every = Duration::from_secs((secs / 100).clamp(1, 60));
 
     let main = TestServer::builder().record(false).start().unwrap();
-    let mut client = Client::connect(&main.server()).unwrap();
+    // The main sender goes through both gates, with limits it never reaches
+    // (a day is about 8.6 million recipients over 1,000 domains).
+    let gated = main
+        .server_builder()
+        .gate((
+            HourlyLimit::recipients(u32::MAX),
+            DomainLimit::per_domain(u32::MAX).max_domains(256),
+        ))
+        .build()
+        .unwrap();
+    let mut client = Client::connect(&gated).unwrap();
     let mut faults = fault_servers();
 
     let stop = Arc::new(AtomicBool::new(false));
