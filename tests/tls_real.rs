@@ -10,6 +10,8 @@ const CA: &[u8] = include_bytes!("fixtures/ca.pem");
 const OTHER_CA: &[u8] = include_bytes!("fixtures/other-ca.pem");
 const CHAIN: &[u8] = include_bytes!("fixtures/localhost.pem");
 const KEY: &[u8] = include_bytes!("fixtures/localhost.key");
+const SELF_SIGNED: &[u8] = include_bytes!("fixtures/self-signed.pem");
+const SELF_SIGNED_KEY: &[u8] = include_bytes!("fixtures/self-signed.key");
 
 fn with_rustls(b: TestServerBuilder) -> TestServer {
     let tls = tls_net::server_from_pem(CHAIN, KEY).expect("fixture certificate");
@@ -83,6 +85,28 @@ fn test_untrusted_ca_is_certificate_rejected() {
     assert!(e.is_permanent());
     let t = server.transcript();
     assert!(!t.contains("C: AUTH") && !t.contains("C: MAIL"), "{t}");
+}
+
+#[test]
+fn test_self_signed_certificate_is_rejected() {
+    // T-11: a self-signed certificate for the right name is refused.
+    let tls = tls_net::server_from_pem(SELF_SIGNED, SELF_SIGNED_KEY).expect("fixture");
+    let server = TestServer::builder()
+        .starttls()
+        .tls_engine(move || {
+            tls.accept()
+                .ok()
+                .map(|s| Box::new(s) as Box<dyn net_io::TlsSession>)
+        })
+        .start()
+        .unwrap();
+    let e = smtp_net::send(&trusting(&server, CA), &msg()).unwrap_err();
+    assert!(
+        matches!(e.kind(), ErrorKind::Tls(TlsFailure::CertificateRejected)),
+        "{e:?}"
+    );
+    assert!(e.is_permanent());
+    assert!(!server.transcript().contains("C: MAIL"));
 }
 
 #[test]

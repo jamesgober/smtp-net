@@ -148,6 +148,14 @@ required-features = ["testing", "dkim"]
 name = "tls_real"
 required-features = ["testing", "tls"]
 
+[[test]]
+name = "threats"
+required-features = ["testing"]
+
+[[test]]
+name = "soak"
+required-features = ["testing"]
+
 
 # loom models for HourlyLimit: RUSTFLAGS="--cfg smtp_net_loom" cargo test --release --lib gate
 [target.'cfg(smtp_net_loom)'.dev-dependencies]

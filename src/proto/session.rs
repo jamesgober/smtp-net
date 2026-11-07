@@ -306,6 +306,18 @@ impl Expect {
     fn is_end(self) -> bool {
         matches!(self, Expect::DataEnd | Expect::BdatLast)
     }
+
+    /// Whether a reply of this class can answer the command (RFC 5321
+    /// 4.2.1 and 4.3.2): only DATA and AUTH have a 3yz, DATA has no 2yz,
+    /// and nothing has a 1yz. Anything else is out of sequence (T-14).
+    fn allows(self, code: super::ReplyCode) -> bool {
+        match (self, code.get() / 100) {
+            (_, 4 | 5) => true,
+            (Expect::Data, c) => c == 3,
+            (Expect::Auth, c) => c == 2 || c == 3,
+            (_, c) => c == 2,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -567,6 +579,17 @@ impl Session {
             let e = Error::new(ErrorKind::Rejected)
                 .with_reply(reply)
                 .with_disposition(Disposition::Temporary)
+                .at(stage);
+            self.pending.push_front(p);
+            return Err(self.close(e));
+        }
+        if !p.what.allows(code) {
+            // A reply that cannot answer this command: the replies are out
+            // of step with the commands (an extra reply earlier, or a server
+            // answering something else), so none of the later ones can be
+            // trusted.
+            let e = Error::from(ProtocolError::UnexpectedReply)
+                .with_reply(self.parser.take())
                 .at(stage);
             self.pending.push_front(p);
             return Err(self.close(e));

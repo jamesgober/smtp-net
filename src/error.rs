@@ -521,7 +521,9 @@ pub enum ProtocolError {
     BareLineFeed,
     /// A NUL byte in a reply.
     Nul,
-    /// A reply when no command was outstanding (T-14).
+    /// A reply when no command was outstanding, or one whose class cannot
+    /// answer the command it was matched with (a 250 to DATA, a 354 to
+    /// MAIL): the replies are out of step with the commands (T-14).
     UnexpectedReply,
     /// An EHLO capability line that cannot be parsed.
     MalformedCapability,
@@ -538,7 +540,7 @@ impl fmt::Display for ProtocolError {
             ProtocolError::BareLineFeed => "the server ended a reply line with LF instead of CRLF",
             ProtocolError::Nul => "the server sent a NUL byte",
             ProtocolError::UnexpectedReply => {
-                "the server sent a reply when no command was outstanding"
+                "the server's replies are out of step with the commands (a reply with none outstanding, or one that cannot answer the command)"
             }
             ProtocolError::MalformedCapability => {
                 "the server's EHLO reply has a capability line that is not valid"

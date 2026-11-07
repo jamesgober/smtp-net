@@ -1,0 +1,15 @@
+# T-14: 250 cannot answer DATA (an extra reply earlier put the replies out
+# of step): a protocol error, not a refusal, and nothing more is trusted.
+# config: loopback
+# expect:
+# closed: temp security
+S: 220 mx.example.com ESMTP
+C: EHLO [127.0.0.1]
+S: 250-mx.example.com
+S: 250 PIPELINING
+C: MAIL FROM:<a@example.com>
+C: RCPT TO:<b@example.org>
+C: DATA
+S: 250 ok
+S: 250 ok
+S: 250 ok

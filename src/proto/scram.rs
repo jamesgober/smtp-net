@@ -392,4 +392,64 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert_ne!(a, b);
     }
+
+    /// T-29, dudect style: checking a wrong server signature takes the same
+    /// time whether it differs from the right one in its first octet or its
+    /// last; an early-exit comparison would be faster for the first. The
+    /// check runs on the decoded signature, the step `on_server_final` hands
+    /// to crypt-io: the base64 before it reads only bytes the server sent.
+    /// The two classes are interleaved at random, each sample times 8
+    /// checks, the slowest 10% of each class is cropped, and Welch's t must
+    /// stay under 4.5 (dudect's threshold). Timing depends on the machine,
+    /// so it runs on request, in release:
+    /// `cargo test --release --features scram --lib scram::tests::timing -- --ignored --nocapture`.
+    #[cfg(feature = "std")]
+    #[test]
+    #[ignore = "timing; run in release on request"]
+    fn timing_server_signature_check() {
+        use std::time::Instant;
+
+        const SAMPLES: usize = 200_000;
+        const BATCH: usize = 8;
+        let key = [0x5au8; 32];
+        let auth = b"n=user,r=fyko+d2lbbFgONRv9qkxdawL,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096";
+        let good = mac(&key, auth).unwrap();
+        let wrong = |octet: usize| {
+            let mut s = good;
+            s[octet] ^= 1;
+            s
+        };
+        let classes = [wrong(0), wrong(31)];
+        let mut times: [Vec<u64>; 2] = [Vec::with_capacity(SAMPLES), Vec::with_capacity(SAMPLES)];
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..2 * SAMPLES {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let c = (x & 1) as usize;
+            let sig = core::hint::black_box(&classes[c]);
+            let t = Instant::now();
+            for _ in 0..BATCH {
+                let r = hmac_sha256_check(&key, auth, core::hint::black_box(sig));
+                assert!(core::hint::black_box(r).is_err());
+            }
+            times[c].push(t.elapsed().as_nanos() as u64);
+        }
+        let stats = |v: &mut Vec<u64>| {
+            v.sort_unstable();
+            v.truncate(v.len() * 9 / 10);
+            let n = v.len() as f64;
+            let mean = v.iter().map(|&t| t as f64).sum::<f64>() / n;
+            let var = v.iter().map(|&t| (t as f64 - mean).powi(2)).sum::<f64>() / (n - 1.0);
+            (n, mean, var)
+        };
+        let [mut a, mut b] = times;
+        let (na, ma, va) = stats(&mut a);
+        let (nb, mb, vb) = stats(&mut b);
+        let t = (ma - mb) / (va / na + vb / nb).sqrt();
+        std::println!(
+            "{BATCH} checks, first octet wrong: {ma:.1} ns, last octet wrong: {mb:.1} ns, Welch t = {t:.2} ({na} and {nb} samples)"
+        );
+        assert!(t.abs() < 4.5, "timing differs: t = {t:.2}");
+    }
 }
