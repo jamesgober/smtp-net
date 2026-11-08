@@ -87,14 +87,25 @@ One hour per target, all eleven at once, libFuzzer through cargo-fuzz, corpora k
 | `dkim` | 14.4 M | 517 | canonicalization split invariance; signing never panics |
 | `ehlo` | 25.4 M | 288 | |
 | `header_value` | 18.9 M | 534 | |
-| `prepared_decode` | see below | | |
+| `prepared_decode` | 100.3 M | 615 | second hour, with framed inputs (see below) |
 | `raw_message` | 29.8 M | 379 | |
 | `reply` | 47.3 M | 272 | |
 | `sasl` | 12.5 M | 1,076 | SCRAM, XOAUTH2, PLAIN, LOGIN against arbitrary server bytes |
 | `session_server_bytes` | 19.2 M | 965 | |
 | `transcript` | 31.6 M | 186 | |
 
-`prepared_decode` reached only 52 coverage points in its first hour: random payloads almost never carry a valid CRC-32C, so the fields behind the checksum were barely reached. The target now frames half its inputs with the header and a correct checksum. The figures for its second hour, and for `session_server_bytes` and `transcript` on the code with the reply-class check, are in the 0.7.0 release notes.
+`prepared_decode` reached only 52 coverage points in its first hour: random payloads almost never carry a valid CRC-32C, so the fields behind the checksum were barely reached. The target now frames half its inputs with the header and a correct checksum, and its second hour reached 615.
+
+Four targets ran a second hour on later code, again with no finding:
+
+| Target | Code | Executions | Coverage |
+|---|---|---|---|
+| `session_server_bytes` | with the reply-class check (D-096) | 32.9 M | 1,135 |
+| `transcript` | with the reply-class check (D-096) | 132.9 M | 189 |
+| `address` | with parse-net 0.9.2 (D-104) | 108.6 M | 1,102 |
+| `content_type` | with parse-net 0.9.2 (D-104) | 121.5 M | 1,497 |
+
+The second runs shared the machine with two or three targets rather than ten, which is most of the difference in executions.
 
 ### Soak (NFR-14)
 
