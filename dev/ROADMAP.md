@@ -71,9 +71,13 @@ Exit: every target in PLAN 11.1 met, or the miss recorded with the measured numb
   - Session memory: 19,176 bytes against 16 KiB, from the 16 KiB default output buffer; 6,888 bytes with a 4 KiB buffer (D-085).
   - Under the release-day load (D-090), five rows came in short: quoted-printable 0.53 to 0.63 GB/s (0.91 in a quieter run; target 0.8), single-line reply 61 to 94 ns (50 in a quieter run; target 50), dot-stuffing 2.9 to 3.6 GB/s (about 6 in a quieter run; target 4), EHLO with capabilities 661 to 788 ns (target 400; the reply alone 249 ns in a quieter run), and relaxed body canonicalization 1.22 to 1.50 GB/s (target 2; no quiet run). Each is re-measured on a quiet machine in the 0.9 pass and, if still short, fixed there (D-093).
 
-## v0.7.0 - Hardening
+## v0.7.0 - Hardening - DONE
 Exit: 1 hour per fuzz target with no finding open; 24-hour soak passes (NFR-14); every row of PLAN 10.1 has a passing test.
-- [ ] Every fuzz target running; every threat test complete; timing check for the SCRAM signature comparison; `docs/SECURITY.md`.
+- [x] Every fuzz target running; every threat test complete; timing check for the SCRAM signature comparison; `docs/SECURITY.md`.
+- [x] All eleven fuzz targets an hour each with no finding; `prepared_decode` a second hour with framed inputs (coverage 52 to 615, D-101); four targets again on later code.
+- [x] 24-hour soak: 8.64 M messages, 3.28 M pooled, 86,400 fault sends, none wrong; highest heap 620 KB then 673 KB, 29 descriptors, 21 threads.
+- [x] SCRAM timing: |t| at most 1.76 on Linux and 1.19 on Windows, against 4.5 (D-099).
+- [x] Defect found and fixed: an out-of-step reply was a permanent `Rejected` (D-096).
 
 ## v0.8.0 - Alpha
 Exit: the first site sends verification and reset mail through task-io and smtp-net in production for two weeks with every failure classified correctly; interop matrix (Exim, Postfix, Mailpit, Microsoft 365, Gmail) green.
