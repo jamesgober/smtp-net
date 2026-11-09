@@ -671,6 +671,36 @@ fn test_size_limit_checked_before_encoding() {
 }
 
 #[test]
+fn test_long_parameters_keep_header_lines_within_78_columns() {
+    // RFC 2231 sections are sized to the column they start at
+    // (parse-net's write_mime_param_at), so no parameter line passes 78
+    // columns, whatever text was on the line before it.
+    for name in [
+        "Résumé et lettre de motivation pour le poste de responsable.pdf",
+        "quarterly report for the northern region, final version 2026.pdf",
+        &"é".repeat(120),
+        "a.pdf",
+    ] {
+        let m = base()
+            .text("see attached")
+            .unwrap()
+            .attachment(Attachment::new(name, "application/pdf", b"%PDF".to_vec()).unwrap())
+            .unwrap()
+            .build_with(&mut Counter(0), T)
+            .unwrap();
+        let s = bytes(&m);
+        check_wire_rules(&s);
+        for part_head in s.split("\r\n\r\n") {
+            for line in part_head.split("\r\n") {
+                if line.starts_with("Content-") || line.starts_with(' ') {
+                    assert!(line.len() <= 78, "{} columns: {line}", line.len());
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn test_attachment_edge_sizes_and_parts_limit() {
     for n in [0usize, 1, 56, 57, 58, 1024] {
         let m = base()

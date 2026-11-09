@@ -347,7 +347,18 @@ pub struct MessageBuilder {
     in_reply_to: Option<String>,
     references: Vec<String>,
     allow_8bit: bool,
+    allow_bidi: bool,
+    refuse_address_like: bool,
     limits: MessageLimits,
+}
+
+/// The offset of the first bidirectional override or isolate in `text`
+/// (U+202A to U+202E, U+2066 to U+2069), all of which encode as
+/// `E2 80 AA..AE` or `E2 81 A6..A9`.
+fn find_bidi(text: &str) -> Option<usize> {
+    text.as_bytes()
+        .windows(3)
+        .position(|w| matches!(w, [0xE2, 0x80, 0xAA..=0xAE] | [0xE2, 0x81, 0xA6..=0xA9]))
 }
 
 fn mailbox<M>(m: M) -> Result<Mailbox, Error>
@@ -753,6 +764,59 @@ impl MessageBuilder {
         self
     }
 
+    /// Allows bidirectional overrides and isolates (U+202A to U+202E, U+2066
+    /// to U+2069) in the Subject and display names. Off by default: they can
+    /// make a reader show the text in another order than it was written
+    /// (T-35). Right-to-left text needs none of them; the marks U+200E and
+    /// U+200F are always allowed.
+    #[must_use]
+    pub fn allow_bidi_controls(mut self, allow: bool) -> Self {
+        self.allow_bidi = allow;
+        self
+    }
+
+    /// Refuses a display name containing `@` in From, Sender, Reply-To, To,
+    /// and Cc, so `"support@bank.example" <someone@else.example>` cannot be
+    /// built (T-25). Off by default; turn it on when display names come from
+    /// users, and never put untrusted text in the From display name.
+    #[must_use]
+    pub fn refuse_address_like_display_names(mut self, refuse: bool) -> Self {
+        self.refuse_address_like = refuse;
+        self
+    }
+
+    /// The display-name and bidi policies, over every mailbox and the
+    /// Subject (T-25, T-35).
+    fn check_policies(&self, from: &Mailbox) -> Result<(), Error> {
+        let fields = [
+            ("From", core::slice::from_ref(from)),
+            ("Sender", self.sender.as_slice()),
+            ("Reply-To", self.reply_to.as_slice()),
+            ("To", self.to.as_slice()),
+            ("Cc", self.cc.as_slice()),
+        ];
+        for (field, list) in fields {
+            for name in list.iter().filter_map(Mailbox::display_name) {
+                if self.refuse_address_like && name.contains('@') {
+                    return Err(HeaderError::AddressLikeDisplayName { field }.into());
+                }
+                if let (false, Some(position)) = (self.allow_bidi, find_bidi(name)) {
+                    return Err(HeaderError::BidiControl { field, position }.into());
+                }
+            }
+        }
+        if let (false, Some(position)) =
+            (self.allow_bidi, self.subject.as_deref().and_then(find_bidi))
+        {
+            return Err(HeaderError::BidiControl {
+                field: "Subject",
+                position,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     /// Replaces the budgets.
     #[must_use]
     pub fn limits(mut self, limits: MessageLimits) -> Self {
@@ -766,7 +830,8 @@ impl MessageBuilder {
     ///
     /// `Build(MissingFrom)`, `Build(NoRecipients)`, `Build(InlineWithoutHtml)`,
     /// every budget, `Header(InvalidMessageId)` when no ASCII domain is
-    /// available for the id, `Random`.
+    /// available for the id, `Header(BidiControl)` and
+    /// `Header(AddressLikeDisplayName)` under the policies, `Random`.
     #[cfg(feature = "std")]
     pub fn build(self) -> Result<Message, Error> {
         let now = std::time::SystemTime::now()
@@ -790,6 +855,7 @@ impl MessageBuilder {
         // The builder is consumed: its strings and lists move into the
         // message instead of being copied.
         let from = self.from.take().ok_or(BuildError::MissingFrom)?;
+        self.check_policies(&from)?;
         if self.recipient_count() == 0 {
             return Err(BuildError::NoRecipients.into());
         }

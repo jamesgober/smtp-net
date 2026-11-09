@@ -6,9 +6,9 @@ use std::{
 };
 
 use smtp_net::{
-    Address, BodyFlags, Envelope, Event, Message, Millis, QpState, RandomSource, ReplyLimits,
-    ReplyParser, Session, SessionConfig, SessionSecurity, base64_encode_lines, check_header_value,
-    quoted_printable_encode, quoted_printable_finish,
+    Address, BodyFlags, BuildError, Envelope, ErrorKind, Event, Message, Millis, Multipart, Part,
+    QpState, RandomSource, ReplyLimits, ReplyParser, Session, SessionConfig, SessionSecurity,
+    base64_encode_lines, check_header_value, quoted_printable_encode, quoted_printable_finish,
 };
 
 struct Counting;
@@ -18,6 +18,8 @@ std::thread_local! {
     static ALLOCS: Cell<usize> = const { Cell::new(0) };
     /// Bytes this thread holds (allocated minus freed).
     static LIVE: Cell<isize> = const { Cell::new(0) };
+    /// The most `LIVE` has been since it was last reset.
+    static PEAK: Cell<isize> = const { Cell::new(0) };
 }
 
 fn bump() {
@@ -25,7 +27,19 @@ fn bump() {
 }
 
 fn live(delta: isize) {
-    let _ = LIVE.try_with(|c| c.set(c.get() + delta));
+    let _ = LIVE.try_with(|c| {
+        let now = c.get() + delta;
+        c.set(now);
+        let _ = PEAK.try_with(|p| p.set(p.get().max(now)));
+    });
+}
+
+/// The most this thread held during `f`, above what it held before.
+fn peak<R>(f: impl FnOnce() -> R) -> (isize, R) {
+    let base = LIVE.with(Cell::get);
+    PEAK.with(|p| p.set(base));
+    let r = f();
+    (PEAK.with(Cell::get) - base, r)
 }
 
 // SAFETY: forwards to the system allocator; only counts calls.
@@ -216,4 +230,95 @@ fn test_session_memory() {
     println!("session with a 4 KiB output buffer: {small_total} bytes");
     assert!(small_total <= 4096 + 3 * 1024, "{small_total} bytes");
     drop(session);
+}
+
+#[test]
+fn test_t12_reply_flood_stays_within_the_budget() {
+    // T-12: a 10 MiB line and 100,000 continuation lines, fed in network
+    // sized pieces, are refused while the parser holds no more than its
+    // budget (8,192 octets of reply by default).
+    let limits = ReplyLimits::default();
+    let budget = limits.max_total as isize + 4096;
+    let mut line = b"250 ".to_vec();
+    line.resize(10 << 20, b'x');
+    line.extend_from_slice(b"\r\n");
+    let continuation = b"250-x\r\n".repeat(100_000);
+    for (name, input) in [("10 MiB line", &line), ("100,000 lines", &continuation)] {
+        let mut p = ReplyParser::new(limits, true);
+        let (held, refused) = peak(|| {
+            for piece in input.chunks(4096) {
+                let mut rest = piece;
+                while !rest.is_empty() {
+                    match p.push(rest) {
+                        Ok((n, _)) if n > 0 => rest = &rest[n..],
+                        Ok(_) => break,
+                        Err(e) => return Some(e),
+                    }
+                }
+            }
+            None
+        });
+        assert!(refused.is_some(), "{name}: not refused");
+        assert!(held <= budget, "{name}: held {held} octets");
+    }
+}
+
+#[test]
+fn test_t26_huge_trees_refused_before_encoding() {
+    // T-26: 10,000 parts and depth 100 are
+    // refused at build, before anything is encoded: the build itself holds
+    // little beyond what the caller gave it.
+    let from = |b: smtp_net::MessageBuilder| {
+        b.from("a@example.com")
+            .unwrap()
+            .to("b@example.org")
+            .unwrap()
+    };
+    let many: Vec<Part> = (0..10_000)
+        .map(|_| Part::text("text/plain", "x").unwrap())
+        .collect();
+    let b = from(Message::builder()).body(Part::multipart(Multipart::Mixed, many));
+    let (held, r) = peak(|| b.build_with(&mut Counter(0), 0));
+    assert!(matches!(
+        r.unwrap_err().kind(),
+        ErrorKind::Build(BuildError::TooManyParts)
+    ));
+    assert!(held <= 64 * 1024, "10,000 parts: held {held} octets");
+
+    let mut p = Part::text("text/plain", "x").unwrap();
+    for _ in 0..99 {
+        p = Part::multipart(Multipart::Mixed, vec![p]);
+    }
+    let b = from(Message::builder()).body(p);
+    let (held, r) = peak(|| b.build_with(&mut Counter(0), 0));
+    assert!(matches!(
+        r.unwrap_err().kind(),
+        ErrorKind::Build(BuildError::DepthExceeded)
+    ));
+    assert!(held <= 64 * 1024, "depth 100: held {held} octets");
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn test_t26_gib_attachment_refused_when_added() {
+    // T-26: a 1 GiB streamed attachment is refused from its declared length
+    // as soon as it is added; nothing is read.
+    let gib = smtp_net::Attachment::from_source(
+        "big.bin",
+        "application/octet-stream",
+        1 << 30,
+        Box::new(smtp_net::ReadSource::new(std::io::repeat(0))),
+    )
+    .unwrap();
+    let b = Message::builder()
+        .from("a@example.com")
+        .unwrap()
+        .to("b@example.org")
+        .unwrap();
+    let (held, r) = peak(|| b.attachment(gib));
+    assert!(matches!(
+        r.unwrap_err().kind(),
+        ErrorKind::Build(BuildError::TooLarge { .. })
+    ));
+    assert!(held <= 64 * 1024, "1 GiB: held {held} octets");
 }

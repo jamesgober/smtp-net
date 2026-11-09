@@ -758,6 +758,7 @@ struct Shared {
     transcript: String,
     connections: usize,
     waits: usize,
+    messages: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -791,6 +792,7 @@ pub struct TestServerBuilder {
     tls_name: String,
     auth: Option<(String, String)>,
     oauth: Option<(String, String)>,
+    record: bool,
 }
 
 impl TestServerBuilder {
@@ -858,6 +860,16 @@ impl TestServerBuilder {
     /// then `535` after the client's empty line.
     pub fn oauth2(mut self, user: &str, token: &str) -> Self {
         self.oauth = Some((user.to_string(), token.to_string()));
+        self
+    }
+
+    /// Whether to keep the messages and the transcript (default `true`).
+    /// With `false` the server keeps neither, so its memory stays flat for
+    /// a run of any length (a soak); [`messages`](TestServer::messages),
+    /// [`connections`](TestServer::connections), and
+    /// [`client_waits`](TestServer::client_waits) still count.
+    pub fn record(mut self, keep: bool) -> Self {
+        self.record = keep;
         self
     }
 
@@ -963,6 +975,7 @@ impl TestServer {
             tls_name: "localhost".to_string(),
             auth: None,
             oauth: None,
+            record: true,
         }
     }
 
@@ -1023,6 +1036,13 @@ impl TestServer {
             .lock()
             .map(|s| s.transcript.clone())
             .unwrap_or_default()
+    }
+
+    /// Messages accepted so far (counted with or without
+    /// [`record`](TestServerBuilder::record)).
+    #[must_use]
+    pub fn messages(&self) -> usize {
+        self.shared.lock().map(|s| s.messages).unwrap_or(0)
     }
 
     /// Connections accepted so far.
@@ -1204,6 +1224,9 @@ impl DelayLine {
 
 impl Conn<'_> {
     fn log(&self, dir: &str, line: &str) {
+        if !self.cfg.record {
+            return;
+        }
         if let Ok(mut s) = self.shared.lock() {
             s.transcript.push_str(dir);
             s.transcript.push_str(line);
@@ -1805,6 +1828,9 @@ fn store(
     let (path, params) = from.take().unwrap_or_default();
     let taken = core::mem::take(rcpts);
     if let Ok(mut s) = shared.lock() {
+        s.messages += 1;
+    }
+    if let (true, Ok(mut s)) = (c.cfg.record, shared.lock()) {
         s.received.push(ReceivedMessage {
             from: path,
             recipients: taken.iter().map(|(r, _)| r.clone()).collect(),

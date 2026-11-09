@@ -186,6 +186,8 @@ impl MessageBuilder {
     pub fn list_unsubscribe(self, targets: &[&str], one_click: bool) -> Result<Self, Error>;
     pub fn auto_submitted(self, value: AutoSubmitted) -> Self;
     pub fn allow_8bit(self, allow: bool) -> Self;
+    pub fn allow_bidi_controls(self, allow: bool) -> Self;                 // default false (T-35)
+    pub fn refuse_address_like_display_names(self, refuse: bool) -> Self;  // default false (T-25)
     pub fn limits(self, limits: MessageLimits) -> Self;
     pub fn body(self, part: Part) -> Result<Self, Error>;  // full control of the MIME tree
     pub fn build(self) -> Result<Message, Error>;
@@ -214,6 +216,8 @@ pub trait RandomSource { fn fill(&mut self, buf: &mut [u8]) -> Result<(), Error>
 | `MessageBuilder::list_unsubscribe` | `List-Unsubscribe: <https://...>, <mailto:...>`; with `one_click` also `List-Unsubscribe-Post: List-Unsubscribe=One-Click` (RFC 8058, which requires an HTTPS target); targets checked for `<`, `>`, `,`, whitespace, and control characters | `Header(InvalidUnsubscribe)` | 2 alloc | P2 | 2 | 0.4 |
 | `MessageBuilder::auto_submitted` | `Auto-Submitted: auto-generated` or `auto-replied` (RFC 3834); suppresses vacation replies to service mail (O-24) | none | 0 alloc | P2 | 2 | 0.4 |
 | `MessageBuilder::allow_8bit` | permits `8bit` for UTF-8 text parts (O-7) | none | 0 alloc | P2 | 2 | 0.4 |
+| `MessageBuilder::allow_bidi_controls` | lets bidirectional overrides and isolates (U+202A to U+202E, U+2066 to U+2069) into the Subject and display names; refused at `build` by default (T-35, D-097); right-to-left text and the RLM and LRM marks always pass | `Header(BidiControl { field, position })` without it | one scan per value | P1 | 2 | 0.7 |
+| `MessageBuilder::refuse_address_like_display_names` | refuses at `build` a display name containing `@` in From, Sender, Reply-To, To, or Cc (T-25, D-097); off by default | `Header(AddressLikeDisplayName { field })` | one scan per name | P1 | 2 | 0.7 |
 | `MessageBuilder::limits` | replaces budgets (8.4.1) | none | 0 alloc | P1 | 2 | 0.3 |
 | `MessageBuilder::body` | sets a caller-built `Part` tree instead of text, html, attachment, inline | `Build(DepthExceeded)`, `Build(TooManyParts)` | 0 alloc | P2 | 3 | 0.4 |
 | `MessageBuilder::build` | checks From present, at least one recipient, budgets, inline-without-HTML; draws Message-ID and boundaries from the OS CSPRNG; stamps Date from the wall clock (`std`) | `Build(MissingFrom)`, `Build(NoRecipients)`, every budget, `Random` | 2 µs for text plus HTML **[est.]** | P0 | 2 | 0.3 |
@@ -700,7 +704,10 @@ pub trait TlsConnector: Send + Sync {
 pub trait SendGate: Send + Sync {
     fn admit(&self, recipients: u32, now_unix_ms: u64) -> Admission;
     fn refund(&self, recipients: u32, now_unix_ms: u64) {}      // admitted message not sent
+    fn admit_envelope(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission { /* admit(count) */ }
+    fn refund_envelope(&self, envelope: &Envelope, now_unix_ms: u64) { /* refund(count) */ }
 }
+impl<A: SendGate, B: SendGate> SendGate for (A, B) { /* both must admit */ }
 #[non_exhaustive] pub enum Admission { Admit, RetryAfter(core::time::Duration) }
 
 pub struct HourlyLimit { /* 60 one-minute buckets, atomics */ }
@@ -711,6 +718,14 @@ impl HourlyLimit {
     pub fn remaining(&self, now_unix_ms: u64) -> u32;
 }
 impl SendGate for HourlyLimit { /* ... */ }
+
+#[cfg(feature = "std")] pub struct DomainLimit { /* per recipient domain, bounded table */ }
+impl DomainLimit {
+    pub fn per_domain(per_hour: u32) -> DomainLimit;
+    pub fn max_domains(self, n: usize) -> DomainLimit;          // default 1,024
+    pub fn remaining(&self, domain: &str, now_unix_ms: u64) -> u32;
+}
+impl SendGate for DomainLimit { /* admit_envelope */ }
 ```
 
 | Item | Behaviour | Errors | Cost | Grade | Tier | Ver |
@@ -718,6 +733,9 @@ impl SendGate for HourlyLimit { /* ... */ }
 | `SendGate`, `Admission` | called before connecting and before each transaction; `RetryAfter` becomes `Error::Throttled` with `retry_after` (temporary); `refund` is called when an admitted message is then not sent (connection failure before MAIL was accepted) | none | none | P1 | 2 | 0.4 |
 | `HourlyLimit::messages`, `recipients`, `CountUnit` | rolling 60-minute window of one-minute buckets; admission is a CAS loop on the current bucket after subtracting expired buckets; never over-admits under any thread count (loom-tested); `retry_after` is the time until enough of the oldest bucket expires; per process (several processes share nothing; documented, O-21) | none | 30 ns uncontended **[est.]**, 0 alloc | P1 | 2 | 0.4 |
 | `HourlyLimit::remaining` | inspection | none | 0 alloc | P2 | 2 | 0.4 |
+| `SendGate::admit_envelope`, `refund_envelope` | what the client calls; they default to `admit` and `refund` with the recipient count, so a count-based gate needs nothing more | none | none | P1 | 2 | 0.7 |
+| `(A, B)` as a `SendGate` | admits only what both admit; when the second refuses, the first is refunded | none | the two gates' costs | P1 | 2 | 0.7 |
+| `DomainLimit::per_domain`, `max_domains`, `remaining` | at most `per_hour` recipients per recipient domain (ASCII case ignored) in any 60 minutes, in 13 five-minute buckets (a count may be kept up to 5 minutes late, never dropped early); a message is admitted for all its domains or none; the table holds `max_domains` domains and forgets the least recently used (PLAN 10.3, D-098) | none | one lock and one hash per domain of the message **[est.]**; about 250 octets per domain | P1 | 2 | 0.7 |
 | throttle-net adapter | documented example in `docs/API.md`, not a dependency (3.5) | n/a | n/a | P3 | docs | 0.5 |
 
 ### 8.10 Timeouts
@@ -811,6 +829,8 @@ Each enum is `#[non_exhaustive]`, implements `Display` (what was refused and wha
     ControlCharacter { field: &'static str, position: usize },          // CR, LF, NUL, C0/C1, U+2028, U+2029
     InvalidName, Reserved, LineTooLong, InvalidMessageId, InvalidDate,
     InvalidUnsubscribe, InvalidFileName, InvalidContentType, InvalidContentId,
+    BidiControl { field: &'static str, position: usize },              // T-35, 0.7
+    AddressLikeDisplayName { field: &'static str },                    // T-25, 0.7
 }
 #[non_exhaustive] pub enum BuildError {                                   // Permanent
     MissingFrom, MultipleFrom, NoRecipients, TooManyRecipients { limit: u16 },
@@ -876,6 +896,10 @@ impl TestServer {
     pub fn received(&self) -> Vec<ReceivedMessage>;          // envelope + bytes as received
     pub fn transcript(&self) -> String;                      // AUTH redacted
     pub fn client_waits(&self) -> usize;                     // with Fault::RoundTrip: round trips the client waited
+    pub fn messages(&self) -> usize;                         // accepted, counted with or without record
+}
+impl TestServerBuilder {
+    pub fn record(self, keep: bool) -> Self;                 // false: keep no messages or transcript (a soak)
 }
 pub struct TestServerBuilder { /* extensions offered, AUTH, TLS certificate, faults */ }
 #[non_exhaustive] pub enum Fault {
@@ -1059,3 +1083,7 @@ Each change is recorded in `dev/PLAN.md` section 19.
 | 0.5.1 | RFC 2047 words choose Q or B per header; parse-net 0.9.1 | D-082 |
 | 0.6.0 | `Envelope` shares its addresses behind an `Arc` (clone is a reference count; `Session::begin` allocates nothing); `Session` memory is `SessionConfig::output_capacity` plus about 3 KiB | D-084, D-085 |
 | 0.6.0 | Test support: `Fault::RoundTrip(Duration)` (every byte to the client arrives that much later; a client pays it once per wait), `TestServer::client_waits`; `TestServer` sets `TCP_NODELAY` | D-089 |
+| 0.7.0 | New: `MessageBuilder::{allow_bidi_controls, refuse_address_like_display_names}`, `HeaderError::{BidiControl, AddressLikeDisplayName}`; bidi overrides and isolates in the Subject and display names are refused by default | D-097 |
+| 0.7.0 | New: `DomainLimit` (feature `std`), `SendGate::{admit_envelope, refund_envelope}` (default methods), `(A, B)` as a gate; the client asks through `admit_envelope` | D-098 |
+| 0.7.0 | `ProtocolError::UnexpectedReply` also covers a reply whose class cannot answer its command (250 to DATA, 354 to MAIL): temporary, the session closes (was a permanent `Rejected`) | D-096 |
+| 0.7.0 | Test support: `TestServerBuilder::record`, `TestServer::messages` | D-095 |

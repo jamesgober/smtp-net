@@ -41,12 +41,14 @@
 //!
 //! ## Status
 //!
-//! `0.6.0`, feature complete and tuned: messages, the session, local
-//! submission, STARTTLS and implicit TLS relays, AUTH (SCRAM-SHA-256, PLAIN,
-//! LOGIN, XOAUTH2, custom mechanisms), DKIM signing (Ed25519 and RSA),
-//! CHUNKING, DSN, pacing, job payloads, a connection pool, and an observer
-//! hook. Measured numbers are in `docs/PERFORMANCE.md`; `0.7.0` is hardening
-//! (`dev/ROADMAP.md` in the [repository](https://github.com/jamesgober/smtp-net)).
+//! `0.7.0`, feature complete, tuned, and hardened: messages, the session,
+//! local submission, STARTTLS and implicit TLS relays, AUTH (SCRAM-SHA-256,
+//! PLAIN, LOGIN, XOAUTH2, custom mechanisms), DKIM signing (Ed25519 and RSA),
+//! CHUNKING, DSN, pacing per hour and per recipient domain, job payloads, a
+//! connection pool, and an observer hook. Measured numbers are in
+//! `docs/PERFORMANCE.md`, the threat model and its tests in
+//! `docs/SECURITY.md`; `0.8.0` is the alpha (`dev/ROADMAP.md` in the
+//! [repository](https://github.com/jamesgober/smtp-net)).
 
 #![doc(html_root_url = "https://docs.rs/smtp-net")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -114,6 +116,8 @@ pub use client::{
     Client, ObservedEvent, Observer, Pool, Report, Security, SecurityEventKind, Server,
     ServerBuilder, TlsConnector, TlsSetupError, send, send_local, send_prepared,
 };
+#[cfg(feature = "std")]
+pub use gate::DomainLimit;
 #[cfg(target_has_atomic = "64")]
 pub use gate::HourlyLimit;
 pub use gate::{Admission, CountUnit, SendGate};

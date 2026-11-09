@@ -74,6 +74,22 @@ fn is_loopback_host(host: &str) -> bool {
     )
 }
 
+/// The session's security for a connected peer: plaintext only when the
+/// address the connection reached is loopback, whatever the host name
+/// resolved from (T-8, T-32: `localhost` pointing elsewhere is refused).
+fn session_security(security: Security, peer: IpAddr) -> Result<SessionSecurity, Error> {
+    match security {
+        Security::PlaintextLoopback if peer.is_loopback() => Ok(SessionSecurity::Plaintext {
+            peer_is_loopback: true,
+        }),
+        Security::PlaintextLoopback => {
+            Err(Error::new(ErrorKind::PlaintextRefused).at(Stage::Connect))
+        }
+        Security::StartTls => Ok(SessionSecurity::StartTlsRequired),
+        Security::ImplicitTls => Ok(SessionSecurity::ImplicitTls),
+    }
+}
+
 /// Where and how to submit mail. `Send + Sync`; build one and share it.
 ///
 /// # Examples
@@ -510,8 +526,7 @@ fn admit(server: &Server, message: &PreparedMessage) -> Result<(), Error> {
     let Some(gate) = &server.gate else {
         return Ok(());
     };
-    let n = u32::try_from(message.envelope().recipients().len()).unwrap_or(u32::MAX);
-    match gate.admit(n, now_unix_ms()) {
+    match gate.admit_envelope(message.envelope(), now_unix_ms()) {
         Admission::RetryAfter(d) => Err(Error::new(ErrorKind::Throttled).with_retry_after(d)),
         _ => Ok(()),
     }
@@ -520,8 +535,7 @@ fn admit(server: &Server, message: &PreparedMessage) -> Result<(), Error> {
 fn refund_on(server: &Server, message: &PreparedMessage, e: &Error) {
     if let Some(gate) = &server.gate {
         if !e.possibly_delivered() && !matches!(e.kind(), ErrorKind::Throttled) {
-            let n = u32::try_from(message.envelope().recipients().len()).unwrap_or(u32::MAX);
-            gate.refund(n, now_unix_ms());
+            gate.refund_envelope(message.envelope(), now_unix_ms());
         }
     }
 }
@@ -713,17 +727,12 @@ impl Client {
         server.notify(&ObservedEvent::Connected {
             peer: tcp.peer_addr(),
         });
-        let peer_is_loopback = tcp.peer_addr().ip().is_loopback();
-        let security = match server.security {
-            Security::PlaintextLoopback if peer_is_loopback => {
-                SessionSecurity::Plaintext { peer_is_loopback }
-            }
-            Security::PlaintextLoopback => {
+        let security = match session_security(server.security, tcp.peer_addr().ip()) {
+            Ok(s) => s,
+            Err(e) => {
                 tcp.abort();
-                return Err(Error::new(ErrorKind::PlaintextRefused).at(Stage::Connect));
+                return Err(e);
             }
-            Security::StartTls => SessionSecurity::StartTlsRequired,
-            Security::ImplicitTls => SessionSecurity::ImplicitTls,
         };
         let config = SessionConfig {
             security,
@@ -1216,5 +1225,34 @@ impl Client {
 impl Drop for Client {
     fn drop(&mut self) {
         let _ = self.quit_and_close(Some(DROP_QUIT));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plaintext_needs_a_loopback_peer_whatever_the_name() {
+        // T-8, T-32: a host name such as `localhost` that resolved to a
+        // remote address reaches a non-loopback peer, and is refused there.
+        for peer in ["192.0.2.1", "2001:db8::1", "10.0.0.1"] {
+            let e =
+                session_security(Security::PlaintextLoopback, peer.parse().unwrap()).unwrap_err();
+            assert!(matches!(e.kind(), ErrorKind::PlaintextRefused), "{peer}");
+            assert_eq!(e.stage(), Some(Stage::Connect));
+        }
+        for peer in ["127.0.0.1", "127.8.9.10", "::1"] {
+            assert_eq!(
+                session_security(Security::PlaintextLoopback, peer.parse().unwrap()).unwrap(),
+                SessionSecurity::Plaintext {
+                    peer_is_loopback: true
+                }
+            );
+        }
+        // TLS is verified by certificate, not by address.
+        let remote = "192.0.2.1".parse().unwrap();
+        assert!(session_security(Security::StartTls, remote).is_ok());
+        assert!(session_security(Security::ImplicitTls, remote).is_ok());
     }
 }

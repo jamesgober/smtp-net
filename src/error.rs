@@ -239,6 +239,22 @@ pub enum HeaderError {
     InvalidContentType,
     /// A `Content-ID` that is not `left@right` with dot-atom text on both sides.
     InvalidContentId,
+    /// A bidirectional override or isolate (U+202A to U+202E, U+2066 to
+    /// U+2069) in the Subject or a display name, which can make a reader show
+    /// the text in another order (T-35). Refused unless
+    /// `MessageBuilder::allow_bidi_controls` is set.
+    BidiControl {
+        /// The header field the value was for.
+        field: &'static str,
+        /// Byte offset of the character in the value.
+        position: usize,
+    },
+    /// A display name containing `@`, refused under
+    /// `MessageBuilder::refuse_address_like_display_names` (T-25).
+    AddressLikeDisplayName {
+        /// The header field the mailbox was for.
+        field: &'static str,
+    },
 }
 
 impl fmt::Display for HeaderError {
@@ -273,6 +289,14 @@ impl fmt::Display for HeaderError {
             HeaderError::InvalidContentId => {
                 f.write_str("the content id must look like left@right, for example logo@example.com")
             }
+            HeaderError::BidiControl { field, position } => write!(
+                f,
+                "the {field} value contains a bidirectional override or isolate at byte {position}; allow them with allow_bidi_controls"
+            ),
+            HeaderError::AddressLikeDisplayName { field } => write!(
+                f,
+                "a {field} display name contains @, so a reader could take it for the address"
+            ),
         }
     }
 }
@@ -497,7 +521,9 @@ pub enum ProtocolError {
     BareLineFeed,
     /// A NUL byte in a reply.
     Nul,
-    /// A reply when no command was outstanding (T-14).
+    /// A reply when no command was outstanding, or one whose class cannot
+    /// answer the command it was matched with (a 250 to DATA, a 354 to
+    /// MAIL): the replies are out of step with the commands (T-14).
     UnexpectedReply,
     /// An EHLO capability line that cannot be parsed.
     MalformedCapability,
@@ -514,7 +540,7 @@ impl fmt::Display for ProtocolError {
             ProtocolError::BareLineFeed => "the server ended a reply line with LF instead of CRLF",
             ProtocolError::Nul => "the server sent a NUL byte",
             ProtocolError::UnexpectedReply => {
-                "the server sent a reply when no command was outstanding"
+                "the server's replies are out of step with the commands (a reply with none outstanding, or one that cannot answer the command)"
             }
             ProtocolError::MalformedCapability => {
                 "the server's EHLO reply has a capability line that is not valid"

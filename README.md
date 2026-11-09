@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: feature complete and tuned (<code>0.6.0</code>).</strong> Message building, the sans-IO session, submission to the local mail server, STARTTLS and implicit TLS relays, AUTH (SCRAM-SHA-256, PLAIN, LOGIN, XOAUTH2), DKIM signing with Ed25519 and RSA, job payloads, pacing, a connection pool, CHUNKING, and DSN work and are tested. Measured performance against lettre, mail-builder, mail-send, and mail-auth is in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>; <code>0.7.0</code> is hardening. The full API is in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: feature complete, tuned, and hardened (<code>0.7.0</code>).</strong> Message building, the sans-IO session, submission to the local mail server, STARTTLS and implicit TLS relays, AUTH (SCRAM-SHA-256, PLAIN, LOGIN, XOAUTH2), DKIM signing with Ed25519 and RSA, job payloads, pacing, a connection pool, CHUNKING, and DSN work and are tested. Measured performance against lettre, mail-builder, mail-send, and mail-auth is in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>; every threat, its defence, and the test that proves it are in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>; <code>0.8.0</code> is the alpha. The full API is in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -40,19 +40,19 @@
 
 ```toml
 [dependencies]
-smtp-net = "0.6"
+smtp-net = "0.7"
 ```
 
 The default features include TLS through tls-net (rustls). For submission to a mail server on the same machine only, without building rustls:
 
 ```toml
-smtp-net = { version = "0.6", default-features = false, features = ["client"] }
+smtp-net = { version = "0.7", default-features = false, features = ["client"] }
 ```
 
 With DKIM signing and SCRAM-SHA-256:
 
 ```toml
-smtp-net = { version = "0.6", features = ["dkim", "scram"] }
+smtp-net = { version = "0.7", features = ["dkim", "scram"] }
 ```
 
 ## Quick start

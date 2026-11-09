@@ -8,6 +8,8 @@ certificates anywhere else.
 - `localhost.pem`, `localhost.key`: a certificate for `localhost` and `127.0.0.1`
   signed by that CA, and its key.
 - `other-ca.pem`: an unrelated CA, for the "untrusted CA" test.
+- `self-signed.pem`, `self-signed.key`: a self-signed certificate for `localhost`
+  and `127.0.0.1` (EC P-256, valid to 2036), for the self-signed test (T-11).
 
 The CA keys were not kept: nothing new can be signed with them.
 

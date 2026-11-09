@@ -1,0 +1,9 @@
+# T-14: 354 can only answer DATA.
+# config: loopback
+# expect:
+# closed: temp security
+S: 220 mx.example.com ESMTP
+C: EHLO [127.0.0.1]
+S: 250 mx.example.com
+C: MAIL FROM:<a@example.com>
+S: 354 go ahead

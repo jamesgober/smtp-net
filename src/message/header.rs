@@ -282,11 +282,9 @@ fn is_atom_phrase(text: &str) -> bool {
         && !text.starts_with(' ')
         && !text.ends_with(' ')
         && !text.contains("  ")
-        && text.bytes().all(|b| b == b' ' || is_atext(b))
-}
-
-fn is_atext(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&b)
+        && text
+            .bytes()
+            .all(|b| b == b' ' || parse_net::class::is_atext(b))
 }
 
 /// Appends the header form of `m` to `out`, starting at column `col` (used

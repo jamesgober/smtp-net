@@ -146,6 +146,44 @@ mod tests {
     }
 
     #[test]
+    fn test_shadow_check_over_arbitrary_path_bytes() {
+        // T-2: bytes that never passed the Address grammar, put where a path
+        // goes; the line is queued exactly when it has no CR, LF, or NUL and
+        // fits, and a refused line leaves nothing behind.
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..50_000 {
+            let len = (next() % 600) as usize;
+            let path: Vec<u8> = (0..len)
+                .map(|_| match next() % 16 {
+                    0 => b'\r',
+                    1 => b'\n',
+                    2 => 0,
+                    3 => b'>',
+                    _ => (next() % 256) as u8,
+                })
+                .collect();
+            let mut out = b"EHLO [127.0.0.1]\r\n".to_vec();
+            let mut l = Line::new(&mut out);
+            l.put(b"RCPT TO:<").put(&path).put(b">");
+            let clean = !path.iter().any(|&b| b == b'\r' || b == b'\n' || b == 0);
+            let fits = 10 + path.len() + 2 <= MAX_COMMAND_LINE;
+            assert_eq!(l.end().is_ok(), clean && fits);
+            if clean && fits {
+                assert_eq!(out.len(), 18 + 10 + path.len() + 2);
+                assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 2);
+            } else {
+                assert_eq!(out, b"EHLO [127.0.0.1]\r\n");
+            }
+        }
+    }
+
+    #[test]
     fn test_decimal_formatting() {
         let mut out = Vec::new();
         Line::new(&mut out)

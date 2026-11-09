@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "smtp-net"
-version = "0.6.0"
+version = "0.7.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -73,7 +73,7 @@ dkim = ["std", "crypt-io/sign-ed25519", "crypt-io/sign-rsa", "crypt-io/hash-sha2
 [dependencies]
 # RFC 5322 addresses, header folding, RFC 2047 words, RFC 2231 parameters,
 # Message-ID, and dates (dev/PLAN.md D-014). First party, no dependencies.
-parse-net = { version = "0.9.1", default-features = false, features = ["alloc"] }
+parse-net = { version = "0.9.2", default-features = false, features = ["alloc"] }
 # OS CSPRNG for Message-ID and MIME boundaries. First party, no dependencies.
 mod-rand = { version = "1", default-features = false, features = ["tier3"], optional = true }
 # Wipes credentials on drop (Zeroizing); with `dkim`, Ed25519 and RSA
@@ -147,6 +147,14 @@ required-features = ["testing", "dkim"]
 [[test]]
 name = "tls_real"
 required-features = ["testing", "tls"]
+
+[[test]]
+name = "threats"
+required-features = ["testing"]
+
+[[test]]
+name = "soak"
+required-features = ["testing"]
 
 
 # loom models for HourlyLimit: RUSTFLAGS="--cfg smtp_net_loom" cargo test --release --lib gate
