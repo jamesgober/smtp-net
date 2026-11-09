@@ -376,6 +376,18 @@ mod hourly {
         }
 
         #[test]
+        fn test_clock_jumping_forward_retires_the_window() {
+            // The gate reads the wall clock (D-106): a forward step of an hour
+            // retires the hour's counts, as it does for a provider counting
+            // on the same clock.
+            let g = HourlyLimit::messages(2);
+            assert_eq!(g.admit(1, T), Admission::Admit);
+            assert_eq!(g.admit(1, T), Admission::Admit);
+            assert!(matches!(g.admit(1, T), Admission::RetryAfter(_)));
+            assert_eq!(g.admit(1, T + 60 * MINUTE_MS), Admission::Admit);
+        }
+
+        #[test]
         fn test_refund_gives_back_and_request_over_limit_waits_a_window() {
             let g = HourlyLimit::recipients(4);
             assert_eq!(g.admit(4, T), Admission::Admit);
@@ -521,7 +533,11 @@ mod domain {
 
         fn add(&mut self, bucket: u64, n: u32) {
             if let Some(slot) = self.slot(bucket) {
-                if slot.0 != bucket {
+                // An older bucket is retired and its slot taken. A newer one
+                // (the clock stepped back by a whole window or more) keeps
+                // counting in place, so nothing is lost; it retires with its
+                // slot (D-058, D-106).
+                if slot.0 < bucket {
                     *slot = (bucket, 0);
                 }
                 slot.1 = slot.1.saturating_add(n);
@@ -720,6 +736,25 @@ mod domain {
                 Admission::Admit
             );
             assert!(refused(g.admit_envelope(&env(&["e@v.example"]), T)));
+        }
+
+        #[test]
+        fn test_clock_going_backwards_keeps_every_count() {
+            // 13 buckets back lands on the slot that holds the newer bucket: its
+            // count must stay counted, not be reset (D-058, D-106).
+            let g = DomainLimit::per_domain(3);
+            assert_eq!(
+                g.admit_envelope(&env(&["a@v.example", "b@v.example"]), T),
+                Admission::Admit
+            );
+            let back = T - 13 * BUCKET_MS;
+            assert_eq!(g.remaining("v.example", back), 1);
+            assert_eq!(
+                g.admit_envelope(&env(&["c@v.example"]), back),
+                Admission::Admit
+            );
+            assert!(refused(g.admit_envelope(&env(&["d@v.example"]), back)));
+            assert!(refused(g.admit_envelope(&env(&["d@v.example"]), T)));
         }
 
         #[test]

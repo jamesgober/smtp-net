@@ -471,3 +471,25 @@ fn test_drop_sends_quit_quickly() {
     std::thread::sleep(Duration::from_millis(50));
     assert!(server.transcript().contains("C: QUIT"));
 }
+
+#[test]
+fn test_localhost_connects_quickly_when_the_server_listens_on_ipv4_only() {
+    // Windows resolves `localhost` to `::1` first, and a refused connect there
+    // takes about 2 s (the SYN is retried); the server below listens on
+    // 127.0.0.1 only. The attempts race (D-107), so the IPv4 one wins within
+    // the loopback attempt delay instead of after the IPv6 attempt's share of
+    // the connect timeout.
+    let server = TestServer::start().unwrap();
+    let s = Server::builder("localhost", Security::PlaintextLoopback)
+        .port(server.port())
+        .timeouts(Timeouts::local())
+        .build()
+        .unwrap();
+    for _ in 0..3 {
+        let began = std::time::Instant::now();
+        let client = Client::connect(&s).unwrap();
+        let took = began.elapsed();
+        drop(client);
+        assert!(took < Duration::from_millis(600), "connect took {took:?}");
+    }
+}

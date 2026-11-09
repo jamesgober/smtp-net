@@ -40,6 +40,9 @@ const BODY_CHUNK: usize = 16 * 1024;
 const DEFAULT_MAX_MESSAGES: u32 = 100;
 /// The bound on the QUIT a dropped client attempts.
 const DROP_QUIT: Duration = Duration::from_secs(1);
+/// How long a loopback connect attempt runs alone before the next address
+/// starts (net-io's floor; 250 ms for other hosts, RFC 8305).
+const LOOPBACK_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
 /// Most further transactions for deferred recipients in one send.
 const MAX_DEFERRAL_ROUNDS: usize = 10;
 
@@ -721,7 +724,18 @@ impl Client {
             .min_rate(MinRate::off())
             .build()
             .map_err(|e| Error::new(ErrorKind::Connect(net_kind(e))).at(Stage::Connect))?;
-        let options = ConnectOptions::new().timeout(t.connect).limits(limits);
+        // The resolved addresses race (RFC 8305, D-107): a refused or silent
+        // first address no longer holds the connect for its share of the
+        // timeout. Windows retries a refused SYN for about 2 s, so `localhost`
+        // (`::1` first) to an MTA on 127.0.0.1 only waited 1 s per connect.
+        // Every winner still passes the loopback check below.
+        let mut options = ConnectOptions::new()
+            .timeout(t.connect)
+            .limits(limits)
+            .happy_eyeballs(true);
+        if is_loopback_host(&server.host) {
+            options = options.attempt_delay(LOOPBACK_ATTEMPT_DELAY);
+        }
         let tcp = TcpConnection::connect_host(&server.host, server.port, options)
             .map_err(|e| Error::new(ErrorKind::Connect(net_kind(e))).at(Stage::Connect))?;
         server.notify(&ObservedEvent::Connected {

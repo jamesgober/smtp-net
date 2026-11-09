@@ -79,13 +79,18 @@ Exit: 1 hour per fuzz target with no finding open; 24-hour soak passes (NFR-14);
 - [x] SCRAM timing: |t| at most 1.76 on Linux and 1.19 on Windows, against 4.5 (D-099).
 - [x] Defect found and fixed: an out-of-step reply was a permanent `Rejected` (D-096).
 
+## v0.7.1 - Platform notes
+Exit: `docs/PLATFORM-NOTES.md` checked against the code and measured where it gives a number; net-io 0.7.1 and tls-net 0.9.0; every gate green. Moved from 0.8 because 0.8 waits on the field test (D-108).
+- [x] `docs/PLATFORM-NOTES.md`.
+- [x] net-io 0.7.1 and tls-net 0.9.0 (D-105).
+- [x] Found writing the notes and fixed test-first: `localhost` on Windows cost 1 s per connect (D-107); `DomainLimit` lost a count after a backward clock step of a whole window (D-106).
+
 ## v0.8.0 - Alpha
 Exit: the first site sends verification and reset mail through task-io and smtp-net in production for two weeks with every failure classified correctly; interop matrix (Exim, Postfix, Mailpit, Microsoft 365, Gmail) green.
 Depends on: task-io in production and the first site live (James).
 - [ ] Field test on the cPanel host's Exim on `127.0.0.1` (moved from 0.3, D-033), Microsoft 365 and Gmail submission; O-21 (what cPanel counts) and O-24 (`Auto-Submitted`) checked.
 - [ ] DKIM at public receivers (moved from 0.5, D-070): `Authentication-Results: dkim=pass` at Gmail and Outlook.com for RSA, and for Ed25519 where the receiver verifies it, from a domain with both keys published.
 - [ ] XOAUTH2 against Gmail and Microsoft 365 with real tokens.
-- [ ] `docs/PLATFORM-NOTES.md`.
 
 ## v0.9.x - Beta and the pre-1.0 polish pass
 Exit: no API change request open; every review finding closed test-first; the 1.0 readiness note written and handed to James.
