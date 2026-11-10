@@ -1087,3 +1087,5 @@ Each change is recorded in `dev/PLAN.md` section 19.
 | 0.7.0 | New: `DomainLimit` (feature `std`), `SendGate::{admit_envelope, refund_envelope}` (default methods), `(A, B)` as a gate; the client asks through `admit_envelope` | D-098 |
 | 0.7.0 | `ProtocolError::UnexpectedReply` also covers a reply whose class cannot answer its command (250 to DATA, 354 to MAIL): temporary, the session closes (was a permanent `Rejected`) | D-096 |
 | 0.7.0 | Test support: `TestServerBuilder::record`, `TestServer::messages` | D-095 |
+| 0.7.1 | Connects race the resolved addresses (250 ms, 100 ms for loopback); no API change | D-107 |
+| 0.7.1 | `DomainLimit` keeps a newer bucket's count after a backward clock step; no API change | D-106 |

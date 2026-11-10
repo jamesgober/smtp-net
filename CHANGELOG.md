@@ -13,6 +13,32 @@
 
 ---
 
+## [0.7.1] - 2026-11-09
+
+Platform notes, two fixes found writing them, and the current net-io and
+tls-net.
+
+### Added
+
+- `docs/PLATFORM-NOTES.md`: builds, loopback and `localhost`, trust
+  anchors, clocks, and randomness on Linux, macOS, and Windows.
+
+### Changed
+
+- net-io 0.7.1 and tls-net 0.9.0 (from 0.6.1 and 0.5).
+- The resolved addresses of a host race (RFC 8305): the next address starts
+  after 250 ms, 100 ms for a loopback host, or at once when one fails.
+
+### Fixed
+
+- On Windows, connecting to `localhost` when the server listened on
+  `127.0.0.1` only took 1 s: `localhost` resolves to `::1` first and
+  Windows retries a refused connect for about 2 s. It takes about 100 ms
+  now.
+- `DomainLimit` could lose a domain's count after the wall clock stepped
+  back by 65 minutes or more, and then admit more than its budget. The
+  count is kept, as `HourlyLimit` already did.
+
 ## [0.7.0] - 2026-11-08
 
 Hardening: every row of the threat table has a passing test
@@ -268,7 +294,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/smtp-net/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/smtp-net/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/jamesgober/smtp-net/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jamesgober/smtp-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/smtp-net/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/jamesgober/smtp-net/compare/v0.5.0...v0.5.1
