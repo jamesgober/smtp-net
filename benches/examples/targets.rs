@@ -8,10 +8,10 @@
 use std::hint::black_box as bb;
 use std::time::{Duration, Instant};
 
-use smtp_net::{
-    Address, BodyCanonicalizer, BodyFlags, Canonicalization, DkimKey, DkimSigner, Envelope, HourlyLimit, Message,
-    Millis, QpState, RandomSource, ReplyLimits, ReplyParser, SendGate, Session, SessionConfig, SessionSecurity,
-};
+use smtp_net::{Address, Canonicalization, DkimKey, DkimSigner, Envelope, HourlyLimit, Message, SendGate};
+use smtp_net::dkim::BodyCanonicalizer;
+use smtp_net::mime::{QuotedPrintableState, RandomSource};
+use smtp_net::protocol::{BodyFlags, Millis, ReplyLimits, ReplyParser, Session, SessionConfig, SessionSecurity};
 
 struct Fixed;
 impl RandomSource for Fixed {
@@ -103,7 +103,7 @@ fn main() {
         "base64, 76-column lines",
         "at least 2 GB/s",
         min_time(30, 4, || {
-            bb(smtp_net::base64_encode_lines(&data, &mut out).unwrap());
+            bb(smtp_net::mime::base64_encode_lines(&data, &mut out).unwrap());
         }),
         Some(data.len()),
     );
@@ -112,9 +112,9 @@ fn main() {
         "quoted-printable",
         "at least 800 MB/s",
         min_time(30, 2, || {
-            let mut st = QpState::new();
-            let n = smtp_net::quoted_printable_encode(text.as_bytes(), &mut out, &mut st).unwrap();
-            bb(n + smtp_net::quoted_printable_finish(&mut out[n..], &mut st).unwrap());
+            let mut st = QuotedPrintableState::new();
+            let n = smtp_net::mime::quoted_printable_encode(text.as_bytes(), &mut out, &mut st).unwrap();
+            bb(n + smtp_net::mime::quoted_printable_finish(&mut out[n..], &mut st).unwrap());
         }),
         Some(text.len()),
     );
@@ -123,7 +123,7 @@ fn main() {
         "Header value check, 4 KiB",
         "at least 4 GB/s",
         min_time(300, 50, || {
-            bb(smtp_net::check_header_value("Subject", bb(&value)).unwrap());
+            bb(smtp_net::mime::check_header_value("Subject", bb(&value)).unwrap());
         }),
         Some(value.len()),
     );
@@ -219,13 +219,18 @@ fn main() {
     );
 
     let limit = HourlyLimit::messages(u32::MAX);
+    let one = smtp_net::Envelope::new(
+        smtp_net::Address::parse("no-reply@example.com").unwrap(),
+        &[smtp_net::Address::parse("user@example.org").unwrap()],
+    )
+    .unwrap();
     let mut t = 1_700_000_000_000u64;
     show(
         "HourlyLimit::admit, uncontended",
         "at most 30 ns",
         min_time(300, 1000, || {
             t += 1;
-            bb(limit.admit(1, t));
+            bb(limit.admit(&one, t));
         }),
         None,
     );

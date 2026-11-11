@@ -24,7 +24,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use smtp_net::{Client, DomainLimit, Error, Fault, HourlyLimit, Message, Pool, Stage, TestServer};
+use smtp_net::testing::{Fault, TestServer};
+use smtp_net::{Client, DomainLimit, Error, HourlyLimit, Message, Pool, Stage};
 
 struct Counting;
 
@@ -253,7 +254,7 @@ fn soak() {
         .server_builder()
         .gate((
             HourlyLimit::recipients(u32::MAX),
-            DomainLimit::per_domain(u32::MAX).max_domains(256),
+            DomainLimit::recipients(u32::MAX).max_domains(256),
         ))
         .build()
         .unwrap();

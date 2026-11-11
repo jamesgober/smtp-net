@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>#![forbid(unsafe_code)]</code>.
     </p>
     <blockquote>
-        <strong>Status: feature complete, tuned, and hardened (<code>0.7.1</code>).</strong> Message building, the sans-IO session, submission to the local mail server, STARTTLS and implicit TLS relays, AUTH (SCRAM-SHA-256, PLAIN, LOGIN, XOAUTH2), DKIM signing with Ed25519 and RSA, job payloads, pacing, a connection pool, CHUNKING, and DSN work and are tested. Measured performance against lettre, mail-builder, mail-send, and mail-auth is in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>; every threat, its defence, and the test that proves it are in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>; what differs between Linux, macOS, and Windows is in <a href="./docs/PLATFORM-NOTES.md"><code>docs/PLATFORM-NOTES.md</code></a>; <code>0.8.0</code> is the alpha. The full API is in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: alpha (<code>0.8.0</code>): feature complete, tuned, hardened, and with the API simplified for the field test.</strong> Message building, the sans-IO session, submission to the local mail server, STARTTLS and implicit TLS relays, AUTH (SCRAM-SHA-256, PLAIN, LOGIN, XOAUTH2), DKIM signing with Ed25519 and RSA, job payloads, pacing, a connection pool, CHUNKING, and DSN work and are tested. Measured performance against lettre, mail-builder, mail-send, and mail-auth is in <a href="./docs/PERFORMANCE.md"><code>docs/PERFORMANCE.md</code></a>; every threat, its defence, and the test that proves it are in <a href="./docs/SECURITY.md"><code>docs/SECURITY.md</code></a>; what differs between Linux, macOS, and Windows is in <a href="./docs/PLATFORM-NOTES.md"><code>docs/PLATFORM-NOTES.md</code></a>. Coming from 0.7: the renames are listed in <a href="./docs/release/v0.8.0.md"><code>docs/release/v0.8.0.md</code></a>. The full API is in <a href="./docs/API.md"><code>docs/API.md</code></a>, the design and every decision in <a href="./dev/PLAN.md"><code>dev/PLAN.md</code></a>, the schedule in <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -40,85 +40,70 @@
 
 ```toml
 [dependencies]
-smtp-net = "0.7"
+smtp-net = "0.8"
 ```
 
 The default features include TLS through tls-net (rustls). For submission to a mail server on the same machine only, without building rustls:
 
 ```toml
-smtp-net = { version = "0.7", default-features = false, features = ["client"] }
+smtp-net = { version = "0.8", default-features = false, features = ["client"] }
 ```
 
 With DKIM signing and SCRAM-SHA-256:
 
 ```toml
-smtp-net = { version = "0.7", features = ["dkim", "scram"] }
+smtp-net = { version = "0.8", features = ["dkim", "scram"] }
 ```
 
 ## Quick start
 
 Send a plain-text email through the mail server on this machine (for example cPanel's Exim on `127.0.0.1:25`):
 
-```rust
-let msg = smtp_net::Message::text(
-    "Example <no-reply@example.com>",
-    "user@example.org",
-    "Confirm your email address",
-    "Open this link to confirm: https://example.com/confirm/abc123",
-)?;
-let report = smtp_net::send_local(&msg)?;
-println!("accepted as {}", report.message_id());
+```rust,no_run
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let msg = smtp_net::Message::text(
+        "Example <no-reply@example.com>",
+        "user@example.org",
+        "Confirm your email address",
+        "Open this link to confirm: https://example.com/confirm/abc123",
+    )?;
+    smtp_net::send_local(&msg)?;
+    Ok(())
+}
 ```
 
-Text plus HTML through a relay with STARTTLS on 587 and AUTH (certificate verification always on):
+Or through a relay, with STARTTLS on port 587 and a password (certificate verification is always on):
 
-```rust
-let msg = smtp_net::Message::html(from, to, "Reset your password", html, text)?;
-let server = smtp_net::Server::starttls("mail.example.com").login("no-reply@example.com", password);
-let report = smtp_net::send(&server, &msg)?;
-assert!(report.was_secure());
+```rust,no_run
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let msg = smtp_net::Message::text("no-reply@example.com", "user@example.org", "Hello", "Sent through a relay.")?;
+    let relay = smtp_net::Server::starttls("smtp.example.com").login("no-reply@example.com", "app-password");
+    smtp_net::send(&relay, &msg)?;
+    Ok(())
+}
 ```
 
-DKIM: sign every message a server sends, with Ed25519 and RSA under two selectors; `DkimKey::dns_record()` gives the TXT record to publish (see [`docs/DELIVERABILITY.md`](./docs/DELIVERABILITY.md) for SPF, DKIM, and DMARC):
+`Server::implicit_tls(host)` is the same on port 465. Text plus HTML is `Message::html(from, to, subject, html, text)`.
 
-```rust
-let rsa = smtp_net::DkimKey::rsa_from_pem(&std::fs::read_to_string("dkim-rsa.pem")?)?;
-let ed = smtp_net::DkimKey::ed25519_from_pkcs8_pem(&std::fs::read_to_string("dkim-ed25519.pem")?)?;
-let server = smtp_net::Server::starttls("mail.example.com")
-    .login("no-reply@example.com", password)       // SCRAM-SHA-256 when offered, else PLAIN
-    .to_builder()
-    .dkim(smtp_net::DkimSigner::new("example.com", "rsa2026", rsa)?)
-    .dkim(smtp_net::DkimSigner::new("example.com", "ed2026", ed)?)
-    .build()?;
+Every error says whether it is **temporary** (retry later) or **permanent** (do not retry), and whether the message was **possibly delivered** (the connection was lost after the end of the data), so a job system can retry, dead-letter, or flag a possible duplicate without reading SMTP reply codes:
+
+```rust,no_run
+# let msg = smtp_net::Message::text("no-reply@example.com", "user@example.org", "Hi", "Hello")?;
+match smtp_net::send_local(&msg) {
+    Ok(report) => println!("accepted as {}", report.message_id()),
+    Err(e) if e.possibly_delivered() => eprintln!("the server may have it; do not resend blindly: {e}"),
+    Err(e) if e.is_temporary() => eprintln!("retry later: {e}"),
+    Err(e) => eprintln!("do not retry: {e}"),
+}
+# Ok::<(), smtp_net::Error>(())
 ```
 
-OAuth 2.0 (Gmail, Microsoft 365): pass the access token; getting and refreshing it is the caller's job, and `Error::auth_detail()` gives the server's status (`"401"` for an expired token):
+## More
 
-```rust
-let server = smtp_net::Server::starttls("smtp.gmail.com")
-    .to_builder()
-    .credentials(smtp_net::Credentials::oauth2("no-reply@example.com", access_token))
-    .build()?;
-```
+Attachments, inline images, Cc, Bcc, and custom headers use the builder; every setter refuses CR, LF, and other control characters instead of stripping them:
 
-Many threads, a few connections: `Pool` reuses connections and replaces ones that failed or sat idle:
-
-```rust
-let pool = std::sync::Arc::new(smtp_net::Pool::new(server, 4)?);
-pool.send(&msg)?;                                   // from any thread
-```
-
-For a job system, build once in the request handler and send the stored payload from the worker; retries send the same bytes and `Message-ID`:
-
-```rust
-let payload = msg.prepare_signed(&signers, now_unix)?.encode(); // stored with the job
-let prepared = smtp_net::PreparedMessage::decode(&payload)?;  // a damaged payload is refused
-smtp_net::send_prepared(&server, &prepared)?;
-```
-
-Text plus HTML, attachments, and inline images use the builder; every setter refuses CR, LF, and other control characters instead of stripping them:
-
-```rust
+```rust,no_run
+# let pdf_bytes: Vec<u8> = Vec::new();
 let msg = smtp_net::Message::builder()
     .from("Billing <billing@example.com>")?
     .to("customer@example.org")?
@@ -128,20 +113,65 @@ let msg = smtp_net::Message::builder()
     .html("<p>Thank you for your order.</p>")?
     .attachment(smtp_net::Attachment::new("receipt.pdf", "application/pdf", pdf_bytes)?)?
     .build()?;
+# Ok::<(), smtp_net::Error>(())
 ```
 
-Every error says whether it is **temporary** (retry later) or **permanent** (do not retry), and whether the message was **possibly delivered** (the connection was lost after the end of the data), so a job system can retry, dead-letter, or flag a possible duplicate without reading SMTP reply codes:
+DKIM: sign every message a server sends, with Ed25519 and RSA under two selectors; `DkimKey::dns_record()` gives the TXT record to publish (see [`docs/DELIVERABILITY.md`](./docs/DELIVERABILITY.md) for SPF, DKIM, and DMARC):
 
-```rust
-match smtp_net::send_local(&msg) {
-    Ok(report) => log_sent(report.message_id()),
-    Err(e) if e.possibly_delivered() => flag_possible_duplicate(&e),
-    Err(e) if e.is_temporary() => retry_later(&e),
-    Err(e) => dead_letter(&e),
-}
+```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let rsa = smtp_net::DkimKey::rsa_from_pem(&std::fs::read_to_string("dkim-rsa.pem")?)?;
+let ed = smtp_net::DkimKey::ed25519_from_pkcs8_pem(&std::fs::read_to_string("dkim-ed25519.pem")?)?;
+let server = smtp_net::Server::builder("smtp.example.com", smtp_net::Security::StartTls)
+    .credentials(smtp_net::Credentials::password("no-reply@example.com", "app-password"))
+    .dkim(smtp_net::DkimSigner::new("example.com", "rsa2026", rsa)?)
+    .dkim(smtp_net::DkimSigner::new("example.com", "ed2026", ed)?)
+    .build()?;
+# let _ = server; Ok(()) }
 ```
 
-The protocol core is a sans-IO `Session` (bytes in, bytes out, events and deadlines out), so it runs under any transport; see [`examples/sans_io_driver.rs`](./examples/sans_io_driver.rs).
+OAuth 2.0 (Gmail, Microsoft 365): pass the access token; getting and refreshing it is the caller's job, and `Error::auth_detail()` gives the server's status (`"401"` for an expired token):
+
+```rust,no_run
+# let access_token = String::new();
+let server = smtp_net::Server::builder("smtp.gmail.com", smtp_net::Security::StartTls)
+    .credentials(smtp_net::Credentials::oauth2("no-reply@example.com", access_token))
+    .build()?;
+# let _ = server;
+# Ok::<(), smtp_net::Error>(())
+```
+
+Many threads, a few connections: `Pool` reuses connections and replaces ones that failed or sat idle:
+
+```rust,no_run
+# let msg = smtp_net::Message::text("no-reply@example.com", "user@example.org", "Hi", "Hello")?;
+let relay = smtp_net::Server::starttls("smtp.example.com").login("no-reply@example.com", "app-password");
+let pool = std::sync::Arc::new(smtp_net::Pool::new(relay, 4)?);
+pool.send(&msg)?;                                   // from any thread
+# Ok::<(), smtp_net::Error>(())
+```
+
+For a job system, build (and sign) once in the request handler and send the stored payload from the worker; retries send the same bytes and `Message-ID`:
+
+```rust,no_run
+# let msg = smtp_net::Message::text("no-reply@example.com", "user@example.org", "Hi", "Hello")?;
+let payload = msg.prepare()?.encode();                        // stored with the job
+let prepared = smtp_net::PreparedMessage::decode(&payload)?;  // a damaged payload is refused
+smtp_net::send_prepared(&smtp_net::Server::local(), &prepared)?;
+# Ok::<(), smtp_net::Error>(())
+```
+
+Stay under a host's hourly cap (cPanel accepts mail over its cap, then queues or drops it):
+
+```rust,no_run
+let server = smtp_net::Server::builder("127.0.0.1", smtp_net::Security::PlaintextLoopback)
+    .gate((smtp_net::HourlyLimit::recipients(450), smtp_net::DomainLimit::recipients(100)))
+    .build()?;
+# let _ = server;
+# Ok::<(), smtp_net::Error>(())
+```
+
+Below the crate root, `smtp_net::protocol` is the sans-IO `Session` (bytes in, bytes out, events and deadlines out) for a driver over any transport (see [`examples/sans_io_driver.rs`](./examples/sans_io_driver.rs)); `smtp_net::mime` holds MIME parts, the encoders, and the serialization sinks; `smtp_net::testing` is the test server. Every public item, with examples, is in [`docs/API.md`](./docs/API.md).
 
 ## Features
 
@@ -152,7 +182,7 @@ The protocol core is a sans-IO `Session` (bytes in, bytes out, events and deadli
 | `tls` | yes | STARTTLS and implicit TLS with tls-net (rustls, Mozilla roots or a private CA) |
 | `dkim` | no | DKIM signing with Ed25519-SHA256 and RSA-SHA256 through crypt-io (AWS-LC; needs a C compiler) |
 | `scram` | no | SCRAM-SHA-256 (pure Rust, `no_std`); first in the default mechanism list when on |
-| `testing` | no | `TestServer` (loopback SMTP server with fault injection, AUTH, BDAT, TLS), `ScriptedServer`, `Transcript` |
+| `testing` | no | `smtp_net::testing`: `TestServer` (loopback SMTP server with fault injection, AUTH, BDAT, TLS), `ScriptedServer`, `Transcript` |
 
 Without default features the core (addresses, messages, the session, the DKIM canonicalizers) is `no_std` with `alloc`.
 

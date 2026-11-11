@@ -6,7 +6,8 @@
 //! cargo run --example send_with_dkim --features testing,dkim
 //! ```
 
-use smtp_net::{DkimKey, DkimSigner, Message, TestServer};
+use smtp_net::testing::TestServer;
+use smtp_net::{DkimKey, DkimSigner, Message};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In production: DkimKey::ed25519_from_pkcs8_pem(&std::fs::read_to_string(...)?)

@@ -41,7 +41,7 @@ pub const fn base64_encoded_len(n: u64) -> u64 {
 ///
 /// ```
 /// let mut out = [0u8; 16];
-/// let n = smtp_net::base64_encode_lines(b"hello", &mut out)?;
+/// let n = smtp_net::mime::base64_encode_lines(b"hello", &mut out)?;
 /// assert_eq!(&out[..n], b"aGVsbG8=");
 /// # Ok::<(), smtp_net::Error>(())
 /// ```
@@ -294,7 +294,7 @@ const CRC32C_TABLE: [u32; 256] = {
 /// if a line break follows it, the start of a line that may turn out to be
 /// `From `, and a CR that may start a CRLF.
 #[derive(Clone, Debug, Default)]
-pub struct QpState {
+pub struct QuotedPrintableState {
     col: usize,
     pending_ws: Option<u8>,
     pending_cr: bool,
@@ -303,11 +303,11 @@ pub struct QpState {
     mid_line: bool,
 }
 
-impl QpState {
+impl QuotedPrintableState {
     /// A state for the start of a text.
     #[must_use]
-    pub fn new() -> QpState {
-        QpState::default()
+    pub fn new() -> QuotedPrintableState {
+        QuotedPrintableState::default()
     }
 }
 
@@ -332,8 +332,8 @@ impl QpState {
 /// # Examples
 ///
 /// ```
-/// use smtp_net::{quoted_printable_encode, quoted_printable_finish, QpState};
-/// let mut state = QpState::new();
+/// use smtp_net::mime::{quoted_printable_encode, quoted_printable_finish, QuotedPrintableState};
+/// let mut state = QuotedPrintableState::new();
 /// let mut out = [0u8; 64];
 /// let mut n = quoted_printable_encode("Caf\u{e9} = ok \n.end".as_bytes(), &mut out, &mut state)?;
 /// n += quoted_printable_finish(&mut out[n..], &mut state)?;
@@ -343,7 +343,7 @@ impl QpState {
 pub fn quoted_printable_encode(
     input: &[u8],
     out: &mut [u8],
-    state: &mut QpState,
+    state: &mut QuotedPrintableState,
 ) -> Result<usize, Error> {
     let mut w = SliceWriter {
         out,
@@ -360,7 +360,10 @@ pub fn quoted_printable_encode(
 ///
 /// [`ErrorKind::BufferTooSmall`] when `out` is shorter than 16 octets and the
 /// state holds output.
-pub fn quoted_printable_finish(out: &mut [u8], state: &mut QpState) -> Result<usize, Error> {
+pub fn quoted_printable_finish(
+    out: &mut [u8],
+    state: &mut QuotedPrintableState,
+) -> Result<usize, Error> {
     let mut w = SliceWriter {
         out,
         at: 0,
@@ -398,7 +401,7 @@ impl SliceWriter<'_> {
 
 const SOFT_LIMIT: usize = MIME_LINE_LENGTH - 1;
 
-fn qp_token(state: &mut QpState, token: &[u8], emit: &mut impl FnMut(&[u8])) {
+fn qp_token(state: &mut QuotedPrintableState, token: &[u8], emit: &mut impl FnMut(&[u8])) {
     if state.col + token.len() > SOFT_LIMIT {
         emit(b"=\r\n");
         state.col = 0;
@@ -408,7 +411,7 @@ fn qp_token(state: &mut QpState, token: &[u8], emit: &mut impl FnMut(&[u8])) {
     state.mid_line = true;
 }
 
-fn qp_hex(state: &mut QpState, b: u8, emit: &mut impl FnMut(&[u8])) {
+fn qp_hex(state: &mut QuotedPrintableState, b: u8, emit: &mut impl FnMut(&[u8])) {
     let t = [
         b'=',
         HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0'),
@@ -417,7 +420,7 @@ fn qp_hex(state: &mut QpState, b: u8, emit: &mut impl FnMut(&[u8])) {
     qp_token(state, &t, emit);
 }
 
-fn qp_flush_from(state: &mut QpState, emit: &mut impl FnMut(&[u8])) {
+fn qp_flush_from(state: &mut QuotedPrintableState, emit: &mut impl FnMut(&[u8])) {
     let held = usize::from(state.from);
     state.from = 0;
     for &b in b"From".get(..held).unwrap_or(&[]) {
@@ -425,7 +428,7 @@ fn qp_flush_from(state: &mut QpState, emit: &mut impl FnMut(&[u8])) {
     }
 }
 
-fn qp_flush_ws(state: &mut QpState, encode: bool, emit: &mut impl FnMut(&[u8])) {
+fn qp_flush_ws(state: &mut QuotedPrintableState, encode: bool, emit: &mut impl FnMut(&[u8])) {
     if let Some(ws) = state.pending_ws.take() {
         if encode {
             qp_hex(state, ws, emit);
@@ -435,7 +438,7 @@ fn qp_flush_ws(state: &mut QpState, encode: bool, emit: &mut impl FnMut(&[u8])) 
     }
 }
 
-fn qp_line_break(state: &mut QpState, emit: &mut impl FnMut(&[u8])) {
+fn qp_line_break(state: &mut QuotedPrintableState, emit: &mut impl FnMut(&[u8])) {
     qp_flush_from(state, emit);
     qp_flush_ws(state, true, emit);
     emit(b"\r\n");
@@ -443,7 +446,7 @@ fn qp_line_break(state: &mut QpState, emit: &mut impl FnMut(&[u8])) {
     state.mid_line = false;
 }
 
-fn qp_byte(state: &mut QpState, b: u8, emit: &mut impl FnMut(&[u8])) {
+fn qp_byte(state: &mut QuotedPrintableState, b: u8, emit: &mut impl FnMut(&[u8])) {
     if b == b'\n' {
         qp_line_break(state, emit);
         return;
@@ -486,7 +489,11 @@ fn qp_byte(state: &mut QpState, b: u8, emit: &mut impl FnMut(&[u8])) {
     }
 }
 
-pub(crate) fn qp_push(state: &mut QpState, input: &[u8], emit: &mut impl FnMut(&[u8])) {
+pub(crate) fn qp_push(
+    state: &mut QuotedPrintableState,
+    input: &[u8],
+    emit: &mut impl FnMut(&[u8]),
+) {
     let mut i = 0usize;
     while i < input.len() {
         if state.mid_line && !state.pending_cr && state.pending_ws.is_none() && state.from == 0 {
@@ -543,7 +550,11 @@ const QP_CLASS: [u8; 256] = {
 /// input, escapes as three-octet tokens. Stops at a line end, at whitespace
 /// whose fate is not known yet, and before an octet that would pass the
 /// soft line limit, leaving those to [`qp_byte`]. Returns the octets taken.
-fn qp_mid_line(state: &mut QpState, input: &[u8], emit: &mut impl FnMut(&[u8])) -> usize {
+fn qp_mid_line(
+    state: &mut QuotedPrintableState,
+    input: &[u8],
+    emit: &mut impl FnMut(&[u8]),
+) -> usize {
     let mut j = 0usize;
     loop {
         let start = j;
@@ -579,7 +590,7 @@ fn qp_mid_line(state: &mut QpState, input: &[u8], emit: &mut impl FnMut(&[u8])) 
     j
 }
 
-pub(crate) fn qp_finish(state: &mut QpState, emit: &mut impl FnMut(&[u8])) {
+pub(crate) fn qp_finish(state: &mut QuotedPrintableState, emit: &mut impl FnMut(&[u8])) {
     if state.pending_cr {
         state.pending_cr = false;
         qp_flush_from(state, emit);
@@ -593,7 +604,7 @@ pub(crate) fn qp_finish(state: &mut QpState, emit: &mut impl FnMut(&[u8])) {
 /// Encoded length of `text` under [`qp_push`] and [`qp_finish`].
 pub(crate) fn qp_encoded_len(text: &[u8]) -> u64 {
     let mut n = 0u64;
-    let mut state = QpState::new();
+    let mut state = QuotedPrintableState::new();
     let mut count = |b: &[u8]| n += b.len() as u64;
     qp_push(&mut state, text, &mut count);
     qp_finish(&mut state, &mut count);
@@ -615,7 +626,7 @@ mod tests {
 
     fn qp(input: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut state = QpState::new();
+        let mut state = QuotedPrintableState::new();
         qp_push(&mut state, input, &mut |b| out.extend_from_slice(b));
         qp_finish(&mut state, &mut |b| out.extend_from_slice(b));
         assert_eq!(out.len() as u64, qp_encoded_len(input));
@@ -788,7 +799,7 @@ mod tests {
         let whole = qp(&input);
         for split in 0..=input.len() {
             let mut out = Vec::new();
-            let mut state = QpState::new();
+            let mut state = QuotedPrintableState::new();
             qp_push(&mut state, &input[..split], &mut |b| {
                 out.extend_from_slice(b)
             });
@@ -802,10 +813,10 @@ mod tests {
 
     #[test]
     fn test_qp_public_slice_api_and_overflow() {
-        let mut state = QpState::new();
+        let mut state = QuotedPrintableState::new();
         let mut out = [0u8; 4];
         assert!(quoted_printable_encode(b"\xff\xff", &mut out, &mut state).is_err());
-        let mut state = QpState::new();
+        let mut state = QuotedPrintableState::new();
         let mut out = [0u8; 32];
         let n = quoted_printable_encode(b"ab ", &mut out, &mut state).unwrap();
         let m = quoted_printable_finish(&mut out[n..], &mut state).unwrap();
@@ -842,7 +853,7 @@ mod tests {
     /// The encoder before the run fast path: one octet at a time.
     fn qp_reference(input: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut state = QpState::new();
+        let mut state = QuotedPrintableState::new();
         let mut emit = |b: &[u8]| out.extend_from_slice(b);
         for &b in input {
             if state.pending_cr {
@@ -897,7 +908,7 @@ mod tests {
         for input in corpus(3000) {
             // Whole and in pieces: the run path must stop at every boundary.
             let mut pieces = Vec::new();
-            let mut state = QpState::new();
+            let mut state = QuotedPrintableState::new();
             for part in input.chunks(7) {
                 qp_push(&mut state, part, &mut |b| pieces.extend_from_slice(b));
             }

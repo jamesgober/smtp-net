@@ -1,6 +1,7 @@
 //! DKIM: canonicalization and signing (PLAN 11.1).
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
-use smtp_net::{BodyCanonicalizer, Canonicalization, DkimKey, DkimSigner};
+use smtp_net::{Canonicalization, DkimKey, DkimSigner};
+use smtp_net::dkim::BodyCanonicalizer;
 
 fn message(body_len: usize) -> Vec<u8> {
     let mut m = b"From: Example <no-reply@example.com>\r\nTo: user@example.org\r\nSubject: Confirm your email address\r\nDate: Tue, 14 Nov 2023 22:13:20 +0000\r\nMessage-ID: <abc@example.com>\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=\"utf-8\"\r\n\r\n".to_vec();

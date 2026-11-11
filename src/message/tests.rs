@@ -209,7 +209,7 @@ fn test_bcc_never_serialized_but_in_envelope() {
         rc,
         ["user@example.org", "seen@example.net", "hidden@example.net"]
     );
-    assert_eq!(env.from().unwrap().as_str(), "no-reply@example.com");
+    assert_eq!(env.return_path().unwrap().as_str(), "no-reply@example.com");
 }
 
 #[test]
@@ -237,7 +237,7 @@ fn test_envelope_uses_sender_and_dedups() {
         .build_with(&mut Counter(0), T)
         .unwrap();
     let env = m.envelope().unwrap();
-    assert_eq!(env.from().unwrap().as_str(), "bounces@example.com");
+    assert_eq!(env.return_path().unwrap().as_str(), "bounces@example.com");
     assert_eq!(env.recipients().len(), 2);
 }
 

@@ -1,11 +1,14 @@
 //! Property tests for the invariants in dev/PLAN.md 12.3.
 
 use proptest::prelude::*;
-use smtp_net::{
-    Address, BodyFlags, Envelope, Event, Message, Millis, QpState, RandomSource, ReplyLimits,
-    ReplyParser, Session, SessionConfig, SessionSecurity, base64_encode_lines, base64_encoded_len,
-    encode_word, quoted_printable_encode, quoted_printable_finish,
+use smtp_net::mime::{
+    QuotedPrintableState, RandomSource, base64_encode_lines, base64_encoded_len, encode_word,
+    quoted_printable_encode, quoted_printable_finish,
 };
+use smtp_net::protocol::{
+    BodyFlags, Event, Millis, ReplyLimits, ReplyParser, Session, SessionConfig, SessionSecurity,
+};
+use smtp_net::{Address, Envelope, Message};
 
 struct Counter(u8);
 impl RandomSource for Counter {
@@ -137,7 +140,7 @@ proptest! {
         let input: Vec<u8> = input.into_iter().filter(|&b| b != b'\r').collect();
         let split = split.min(input.len());
         let mut out = vec![0u8; input.len() * 4 + 64];
-        let mut state = QpState::new();
+        let mut state = QuotedPrintableState::new();
         let mut n = quoted_printable_encode(&input[..split], &mut out, &mut state).unwrap();
         n += quoted_printable_encode(&input[split..], &mut out[n..], &mut state).unwrap();
         n += quoted_printable_finish(&mut out[n..], &mut state).unwrap();

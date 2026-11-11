@@ -13,6 +13,54 @@
 
 ---
 
+## [0.8.0] - 2026-11-11
+
+The first alpha: the same features, with the API simplified before the
+field test. Every rename is mapped in `docs/release/v0.8.0.md`.
+
+### Added
+
+- `RejectedRecipient`: the address, reply, and disposition of a refused
+  recipient, returned by both `Report::rejected` and `Error::rejected`.
+- `ClientName::parse`, and `ConfigError::InvalidClientName`.
+- `dev/SIMPLICITY-AUDIT.md`.
+
+### Changed
+
+- The Tier 3 surface moved out of the crate root: `smtp_net::protocol`
+  (the sans-IO session), `smtp_net::mime` (parts, headers, encoders,
+  sinks, randomness), `smtp_net::dkim` (the canonicalizers), and
+  `smtp_net::testing`.
+- `SendGate` has one method pair, `admit(&Envelope, now)` and
+  `refund(&Envelope, now)`.
+- `ServerBuilder::tls` takes any `TlsConnector`; `tls_connector` is gone.
+- `ServerBuilder::mechanisms` and `ServerBuilder::client_name(&str)` return
+  `Self` and are checked by `build()`.
+- `Report::accepted` returns `&[Address]`.
+- Renamed: `PORT_SUBMISSION` and `PORT_SUBMISSIONS` to `PORT_STARTTLS` and
+  `PORT_IMPLICIT_TLS`; `DomainLimit::per_domain` to `recipients`;
+  `ReplyCode::is_transient` to `is_temporary`; `QpState` to
+  `QuotedPrintableState`; `Dsn::{ret, envelope_id, required,
+  envelope_id_value}` to `Dsn::{with_return_content, with_envelope_id,
+  with_policy, envelope_id}`; `Envelope::{return_path, dsn}` (setters) to
+  `with_return_path` and `with_dsn`, and `Envelope::{from, dsn_parameters}`
+  to `return_path` and `dsn`.
+- `docs/API.md` covers every public item by task; its examples and the
+  README's compile as doctests.
+
+### Removed
+
+- `Message::prepare_signed` (use `prepare()?.sign(..)`),
+  `RecipientFailure`, `Error::recipients`.
+
+### Fixed
+
+- A `DomainLimit` reached through the count-based `SendGate::admit`
+  admitted every message, so a caller or combinator that used that method
+  had no per-domain limit.
+
+---
+
 ## [0.7.1] - 2026-11-09
 
 Platform notes, two fixes found writing them, and the current net-io and
@@ -294,7 +342,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/smtp-net/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/jamesgober/smtp-net/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/smtp-net/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/jamesgober/smtp-net/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jamesgober/smtp-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/smtp-net/compare/v0.5.1...v0.6.0

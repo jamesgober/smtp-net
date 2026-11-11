@@ -2,9 +2,10 @@
 //! other test covers in full. `docs/SECURITY.md` maps every row to its
 //! tests, here and elsewhere.
 
+use smtp_net::testing::{Fault, TestServer};
 use smtp_net::{
-    Client, Credentials, ErrorKind, Fault, HeaderError, MechanismName, Message, Pool, Secret,
-    Stage, TestServer, TlsFailure,
+    Client, Credentials, ErrorKind, HeaderError, MechanismName, Message, Pool, Secret, Stage,
+    TlsFailure,
 };
 
 fn msg() -> Message {
@@ -107,7 +108,6 @@ fn t10_no_downgrade_outside_the_allowlist() {
         .server_builder()
         .credentials(Credentials::password("mailer", "pw"))
         .mechanisms(&[MechanismName::ScramSha256])
-        .unwrap()
         .build()
         .unwrap();
     let e = smtp_net::send(&s, &msg()).unwrap_err();

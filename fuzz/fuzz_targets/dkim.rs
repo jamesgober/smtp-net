@@ -5,7 +5,8 @@
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
-use smtp_net::{BodyCanonicalizer, Canonicalization, DkimKey, DkimSigner};
+use smtp_net::{Canonicalization, DkimKey, DkimSigner};
+use smtp_net::dkim::BodyCanonicalizer;
 
 fn body(mode: Canonicalization, pieces: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();

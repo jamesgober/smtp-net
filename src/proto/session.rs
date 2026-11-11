@@ -13,8 +13,8 @@ use super::{
 };
 use crate::{
     error::{
-        BuildError, ConfigError, Disposition, Error, ErrorKind, Extension, ProtocolError, Stage,
-        UsageError,
+        BuildError, ConfigError, Disposition, Error, ErrorKind, Extension, ProtocolError,
+        RejectedRecipient, Stage, UsageError,
     },
     message::prepared::{DsnPolicy, DsnReturn, Envelope, xtext},
 };
@@ -353,7 +353,7 @@ struct Txn {
 /// Driving a session by hand against scripted replies:
 ///
 /// ```
-/// use smtp_net::{Event, Millis, Session, SessionConfig, SessionSecurity};
+/// use smtp_net::protocol::{Event, Millis, Session, SessionConfig, SessionSecurity};
 /// let mut config = SessionConfig::default();
 /// config.security = SessionSecurity::Plaintext { peer_is_loopback: true };
 /// let mut s = Session::new(config, Millis(0))?;
@@ -978,13 +978,17 @@ impl Session {
                 txn.envelope
                     .recipients()
                     .get(*i)
-                    .map(|a| (a.clone(), r.clone(), *d))
+                    .map(|a| RejectedRecipient::new(a.clone(), r.clone(), *d))
             })
             .collect();
         for i in &txn.deferred {
             if let Some(a) = txn.envelope.recipients().get(*i) {
                 let reply = Reply::too_many();
-                recipients.push((a.clone(), reply, Disposition::Temporary));
+                recipients.push(RejectedRecipient::new(
+                    a.clone(),
+                    reply,
+                    Disposition::Temporary,
+                ));
             }
         }
         let e = Error::new(kind)
@@ -994,7 +998,7 @@ impl Session {
             } else {
                 Disposition::Permanent
             })
-            .with_recipients(recipients);
+            .with_rejected(recipients);
         txn.failed = Some(e);
     }
 
@@ -1082,7 +1086,7 @@ impl Session {
             return Ok(());
         };
         let mut l = Line::new(&mut self.out);
-        l.put(b"MAIL FROM:").path(txn.envelope.from());
+        l.put(b"MAIL FROM:").path(txn.envelope.return_path());
         if caps_size && txn.size > 0 {
             l.put(b" SIZE=").decimal(txn.size);
         }
@@ -1092,7 +1096,7 @@ impl Session {
         if txn.flags.smtputf8 {
             l.put(b" SMTPUTF8");
         }
-        if let Some(d) = txn.envelope.dsn_parameters().filter(|_| txn.dsn) {
+        if let Some(d) = txn.envelope.dsn().filter(|_| txn.dsn) {
             match d.return_content() {
                 Some(DsnReturn::Full) => {
                     l.put(b" RET=FULL");
@@ -1102,7 +1106,7 @@ impl Session {
                 }
                 None => {}
             }
-            if let Some(id) = d.envelope_id_value() {
+            if let Some(id) = d.envelope_id() {
                 let mut x = Vec::with_capacity(id.len() * 3);
                 xtext(id.as_bytes(), &mut x);
                 l.put(b" ENVID=").put(&x);
@@ -1123,7 +1127,7 @@ impl Session {
         let addr = txn.envelope.recipients().get(i);
         let mut l = Line::new(&mut self.out);
         l.put(b"RCPT TO:").path(addr);
-        if let Some(d) = txn.envelope.dsn_parameters().filter(|_| txn.dsn) {
+        if let Some(d) = txn.envelope.dsn().filter(|_| txn.dsn) {
             let n = d.notify();
             if n.bits() == 0 {
                 l.put(b" NOTIFY=NEVER");
@@ -1315,7 +1319,7 @@ impl Session {
                 return Err(Error::new(ErrorKind::MessageTooLarge { size, limit }).at(Stage::Mail));
             }
         }
-        let dsn = match envelope.dsn_parameters() {
+        let dsn = match envelope.dsn() {
             Some(d) if !has(Extension::Dsn) && d.policy() == DsnPolicy::Required => {
                 return Err(
                     Error::new(ErrorKind::ExtensionRequired(Extension::Dsn)).at(Stage::Mail)

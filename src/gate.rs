@@ -10,33 +10,54 @@ use crate::message::prepared::Envelope;
 ///
 /// A gate that already exists elsewhere (throttle-net inside a job runner,
 /// a database counter shared by several processes) implements this in a
-/// few lines. Two gates together are a gate: `(HourlyLimit, DomainLimit)`
-/// admits only what both admit.
+/// few lines; a gate that counts recipients reads
+/// `envelope.recipients().len()`. Two gates together are a gate:
+/// `(HourlyLimit, DomainLimit)` admits only what both admit.
+///
+/// # Examples
+///
+/// ```
+/// use smtp_net::{Admission, Envelope, SendGate};
+/// use std::sync::atomic::{AtomicU32, Ordering};
+///
+/// /// A fixed number of recipients for the life of the process.
+/// struct Budget { left: AtomicU32 }
+///
+/// impl SendGate for Budget {
+///     fn admit(&self, envelope: &Envelope, _now_unix_ms: u64) -> Admission {
+///         let n = envelope.recipients().len() as u32;
+///         match self.left.fetch_update(Ordering::AcqRel, Ordering::Acquire, |l| l.checked_sub(n)) {
+///             Ok(_) => Admission::Admit,
+///             Err(_) => Admission::RetryAfter(std::time::Duration::from_secs(3600)),
+///         }
+///     }
+///
+///     fn refund(&self, envelope: &Envelope, _now_unix_ms: u64) {
+///         self.left.fetch_add(envelope.recipients().len() as u32, Ordering::AcqRel);
+///     }
+/// }
+///
+/// let server = smtp_net::Server::builder("127.0.0.1", smtp_net::Security::PlaintextLoopback)
+///     .gate(Budget { left: AtomicU32::new(500) })
+///     .build()?;
+/// # let _ = server;
+/// # Ok::<(), smtp_net::Error>(())
+/// ```
 pub trait SendGate: Send + Sync {
-    /// Whether a message to `recipients` recipients may be sent at
-    /// `now_unix_ms` (wall clock, milliseconds).
-    fn admit(&self, recipients: u32, now_unix_ms: u64) -> Admission;
+    /// Whether a message with `envelope` may be sent at `now_unix_ms`
+    /// (wall clock, milliseconds). An admitted message counts against the
+    /// gate until [`refund`](SendGate::refund) gives it back.
+    fn admit(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission;
 
     /// An admitted message was then not sent (the connection failed before
-    /// the server accepted MAIL): give the allowance back.
-    fn refund(&self, recipients: u32, now_unix_ms: u64) {
-        let _ = (recipients, now_unix_ms);
-    }
-
-    /// What the client asks: [`admit`](SendGate::admit) with the number of
-    /// recipients, unless a gate needs the addresses themselves (a budget
-    /// per recipient domain).
-    fn admit_envelope(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission {
-        self.admit(recipient_count(envelope), now_unix_ms)
-    }
-
-    /// What the client gives back: [`refund`](SendGate::refund), unless
-    /// overridden with [`admit_envelope`](SendGate::admit_envelope).
-    fn refund_envelope(&self, envelope: &Envelope, now_unix_ms: u64) {
-        self.refund(recipient_count(envelope), now_unix_ms);
+    /// the server accepted MAIL): give its allowance back. The default
+    /// keeps the allowance.
+    fn refund(&self, envelope: &Envelope, now_unix_ms: u64) {
+        let _ = (envelope, now_unix_ms);
     }
 }
 
+#[cfg_attr(not(target_has_atomic = "64"), allow(dead_code))]
 fn recipient_count(envelope: &Envelope) -> u32 {
     u32::try_from(envelope.recipients().len()).unwrap_or(u32::MAX)
 }
@@ -44,12 +65,12 @@ fn recipient_count(envelope: &Envelope) -> u32 {
 /// Both gates: admitted only when both admit; when the second refuses, the
 /// first is given its allowance back.
 impl<A: SendGate, B: SendGate> SendGate for (A, B) {
-    fn admit(&self, recipients: u32, now_unix_ms: u64) -> Admission {
-        match self.0.admit(recipients, now_unix_ms) {
-            Admission::Admit => match self.1.admit(recipients, now_unix_ms) {
+    fn admit(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission {
+        match self.0.admit(envelope, now_unix_ms) {
+            Admission::Admit => match self.1.admit(envelope, now_unix_ms) {
                 Admission::Admit => Admission::Admit,
                 other => {
-                    self.0.refund(recipients, now_unix_ms);
+                    self.0.refund(envelope, now_unix_ms);
                     other
                 }
             },
@@ -57,27 +78,9 @@ impl<A: SendGate, B: SendGate> SendGate for (A, B) {
         }
     }
 
-    fn refund(&self, recipients: u32, now_unix_ms: u64) {
-        self.0.refund(recipients, now_unix_ms);
-        self.1.refund(recipients, now_unix_ms);
-    }
-
-    fn admit_envelope(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission {
-        match self.0.admit_envelope(envelope, now_unix_ms) {
-            Admission::Admit => match self.1.admit_envelope(envelope, now_unix_ms) {
-                Admission::Admit => Admission::Admit,
-                other => {
-                    self.0.refund_envelope(envelope, now_unix_ms);
-                    other
-                }
-            },
-            other => other,
-        }
-    }
-
-    fn refund_envelope(&self, envelope: &Envelope, now_unix_ms: u64) {
-        self.0.refund_envelope(envelope, now_unix_ms);
-        self.1.refund_envelope(envelope, now_unix_ms);
+    fn refund(&self, envelope: &Envelope, now_unix_ms: u64) {
+        self.0.refund(envelope, now_unix_ms);
+        self.1.refund(envelope, now_unix_ms);
     }
 }
 
@@ -118,7 +121,8 @@ mod hourly {
     #[cfg(smtp_net_loom)]
     use loom::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{Admission, CountUnit, SendGate};
+    use super::{Admission, CountUnit, SendGate, recipient_count};
+    use crate::message::prepared::Envelope;
 
     const MINUTE_MS: u64 = 60_000;
     const BUCKETS: usize = 60;
@@ -132,13 +136,28 @@ mod hourly {
     /// # Examples
     ///
     /// ```
-    /// use smtp_net::{Admission, HourlyLimit, SendGate};
+    /// use smtp_net::{Address, Admission, Envelope, HourlyLimit, SendGate};
     /// let gate = HourlyLimit::recipients(2);
+    /// let one = Envelope::new(Address::parse("no-reply@example.com")?, &[Address::parse("a@example.org")?])?;
     /// let t = 1_700_000_000_000;
-    /// assert_eq!(gate.admit(1, t), Admission::Admit);
-    /// assert_eq!(gate.admit(1, t + 1_000), Admission::Admit);
-    /// assert!(matches!(gate.admit(1, t + 2_000), Admission::RetryAfter(_)));
-    /// assert_eq!(gate.admit(1, t + 3_600_000), Admission::Admit);
+    /// assert_eq!(gate.admit(&one, t), Admission::Admit);
+    /// assert_eq!(gate.admit(&one, t + 1_000), Admission::Admit);
+    /// assert!(matches!(gate.admit(&one, t + 2_000), Admission::RetryAfter(_)));
+    /// assert_eq!(gate.admit(&one, t + 3_600_000), Admission::Admit);
+    /// assert_eq!(gate.remaining(t + 3_600_000), 1);
+    /// # Ok::<(), smtp_net::Error>(())
+    /// ```
+    ///
+    /// On a [`Server`](crate::Server):
+    ///
+    /// ```
+    /// # #[cfg(feature = "client")] {
+    /// let server = smtp_net::Server::builder("127.0.0.1", smtp_net::Security::PlaintextLoopback)
+    ///     .gate(smtp_net::HourlyLimit::recipients(450))
+    ///     .build()?;
+    /// # let _ = server;
+    /// # }
+    /// # Ok::<(), smtp_net::Error>(())
     /// ```
     #[derive(Debug)]
     pub struct HourlyLimit {
@@ -264,7 +283,17 @@ mod hourly {
     }
 
     impl SendGate for HourlyLimit {
-        fn admit(&self, recipients: u32, now_unix_ms: u64) -> Admission {
+        fn admit(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission {
+            self.admit_count(recipient_count(envelope), now_unix_ms)
+        }
+
+        fn refund(&self, envelope: &Envelope, now_unix_ms: u64) {
+            self.refund_count(recipient_count(envelope), now_unix_ms);
+        }
+    }
+
+    impl HourlyLimit {
+        fn admit_count(&self, recipients: u32, now_unix_ms: u64) -> Admission {
             let n = match self.unit {
                 CountUnit::Messages => 1,
                 CountUnit::Recipients => u64::from(recipients.max(1)),
@@ -288,7 +317,7 @@ mod hourly {
             Admission::Admit
         }
 
-        fn refund(&self, recipients: u32, now_unix_ms: u64) {
+        fn refund_count(&self, recipients: u32, now_unix_ms: u64) {
             let n = match self.unit {
                 CountUnit::Messages => 1,
                 CountUnit::Recipients => u64::from(recipients.max(1)),
@@ -329,48 +358,48 @@ mod hourly {
         #[test]
         fn test_limit_minus_one_limit_plus_one() {
             let g = HourlyLimit::messages(3);
-            assert_eq!(g.admit(10, T), Admission::Admit);
-            assert_eq!(g.admit(10, T), Admission::Admit);
+            assert_eq!(g.admit_count(10, T), Admission::Admit);
+            assert_eq!(g.admit_count(10, T), Admission::Admit);
             assert_eq!(g.remaining(T), 1);
-            assert_eq!(g.admit(10, T), Admission::Admit);
-            assert!(matches!(g.admit(10, T), Admission::RetryAfter(_)));
+            assert_eq!(g.admit_count(10, T), Admission::Admit);
+            assert!(matches!(g.admit_count(10, T), Admission::RetryAfter(_)));
         }
 
         #[test]
         fn test_retry_after_is_when_the_oldest_bucket_expires() {
             let g = HourlyLimit::recipients(5);
-            assert_eq!(g.admit(3, T), Admission::Admit);
-            assert_eq!(g.admit(2, T + 10 * MINUTE_MS), Admission::Admit);
-            let Admission::RetryAfter(d) = g.admit(1, T + 20 * MINUTE_MS) else {
+            assert_eq!(g.admit_count(3, T), Admission::Admit);
+            assert_eq!(g.admit_count(2, T + 10 * MINUTE_MS), Admission::Admit);
+            let Admission::RetryAfter(d) = g.admit_count(1, T + 20 * MINUTE_MS) else {
                 panic!()
             };
             assert_eq!(d, Duration::from_millis(40 * MINUTE_MS));
             // One millisecond before the first bucket leaves: still refused.
             assert!(matches!(
-                g.admit(1, T + 60 * MINUTE_MS - 1),
+                g.admit_count(1, T + 60 * MINUTE_MS - 1),
                 Admission::RetryAfter(_)
             ));
-            assert_eq!(g.admit(3, T + 60 * MINUTE_MS), Admission::Admit);
+            assert_eq!(g.admit_count(3, T + 60 * MINUTE_MS), Admission::Admit);
         }
 
         #[test]
         fn test_bucket_roll_over_at_minute_boundary() {
             let g = HourlyLimit::messages(1);
-            assert_eq!(g.admit(1, T + MINUTE_MS - 1), Admission::Admit);
+            assert_eq!(g.admit_count(1, T + MINUTE_MS - 1), Admission::Admit);
             assert!(matches!(
-                g.admit(1, T + MINUTE_MS),
+                g.admit_count(1, T + MINUTE_MS),
                 Admission::RetryAfter(_)
             ));
-            assert_eq!(g.admit(1, T + 61 * MINUTE_MS), Admission::Admit);
+            assert_eq!(g.admit_count(1, T + 61 * MINUTE_MS), Admission::Admit);
         }
 
         #[test]
         fn test_clock_going_backwards_is_no_time_passing() {
             let g = HourlyLimit::messages(2);
-            assert_eq!(g.admit(1, T + 30 * MINUTE_MS), Admission::Admit);
-            assert_eq!(g.admit(1, T), Admission::Admit);
+            assert_eq!(g.admit_count(1, T + 30 * MINUTE_MS), Admission::Admit);
+            assert_eq!(g.admit_count(1, T), Admission::Admit);
             assert!(matches!(
-                g.admit(1, T + 29 * MINUTE_MS),
+                g.admit_count(1, T + 29 * MINUTE_MS),
                 Admission::RetryAfter(_)
             ));
         }
@@ -381,24 +410,24 @@ mod hourly {
             // retires the hour's counts, as it does for a provider counting
             // on the same clock.
             let g = HourlyLimit::messages(2);
-            assert_eq!(g.admit(1, T), Admission::Admit);
-            assert_eq!(g.admit(1, T), Admission::Admit);
-            assert!(matches!(g.admit(1, T), Admission::RetryAfter(_)));
-            assert_eq!(g.admit(1, T + 60 * MINUTE_MS), Admission::Admit);
+            assert_eq!(g.admit_count(1, T), Admission::Admit);
+            assert_eq!(g.admit_count(1, T), Admission::Admit);
+            assert!(matches!(g.admit_count(1, T), Admission::RetryAfter(_)));
+            assert_eq!(g.admit_count(1, T + 60 * MINUTE_MS), Admission::Admit);
         }
 
         #[test]
         fn test_refund_gives_back_and_request_over_limit_waits_a_window() {
             let g = HourlyLimit::recipients(4);
-            assert_eq!(g.admit(4, T), Admission::Admit);
-            g.refund(4, T);
+            assert_eq!(g.admit_count(4, T), Admission::Admit);
+            g.refund_count(4, T);
             assert_eq!(g.remaining(T), 4);
             assert_eq!(
-                g.admit(9, T),
+                g.admit_count(9, T),
                 Admission::RetryAfter(Duration::from_millis(BUCKETS as u64 * MINUTE_MS))
             );
             let zero = HourlyLimit::messages(0);
-            assert!(matches!(zero.admit(1, T), Admission::RetryAfter(_)));
+            assert!(matches!(zero.admit_count(1, T), Admission::RetryAfter(_)));
         }
 
         #[test]
@@ -410,7 +439,8 @@ mod hourly {
                     let (g, a) = (g.clone(), admitted.clone());
                     std::thread::spawn(move || {
                         for k in 0..100u64 {
-                            if g.admit(1, T + (i * 100 + k) % (59 * MINUTE_MS)) == Admission::Admit
+                            if g.admit_count(1, T + (i * 100 + k) % (59 * MINUTE_MS))
+                                == Admission::Admit
                             {
                                 a.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
                             }
@@ -446,8 +476,8 @@ mod hourly {
             model(|| {
                 let g = loom::sync::Arc::new(HourlyLimit::messages(1));
                 let g2 = g.clone();
-                let t = loom::thread::spawn(move || g2.admit(1, 0) == Admission::Admit);
-                let a = g.admit(1, 0) == Admission::Admit;
+                let t = loom::thread::spawn(move || g2.admit_count(1, 0) == Admission::Admit);
+                let a = g.admit_count(1, 0) == Admission::Admit;
                 let b = t.join().unwrap();
                 assert!(a ^ b, "exactly one of two concurrent admissions wins");
             });
@@ -457,11 +487,11 @@ mod hourly {
         fn loom_retire_races_admission_without_double_subtract() {
             model(|| {
                 let g = loom::sync::Arc::new(HourlyLimit::messages(1));
-                assert_eq!(g.admit(1, 0), Admission::Admit);
+                assert_eq!(g.admit_count(1, 0), Admission::Admit);
                 let g2 = g.clone();
                 let later = 61 * MINUTE_MS;
-                let t = loom::thread::spawn(move || g2.admit(1, later) == Admission::Admit);
-                let a = g.admit(1, later) == Admission::Admit;
+                let t = loom::thread::spawn(move || g2.admit_count(1, later) == Admission::Admit);
+                let a = g.admit_count(1, later) == Admission::Admit;
                 let b = t.join().unwrap();
                 assert!(a ^ b);
                 assert_eq!(g.remaining(later), 0);
@@ -558,7 +588,7 @@ mod domain {
     /// one victim domain is stopped at the limit and shows up as `Throttled`
     /// errors, while mail to other domains goes on. Combine it with an
     /// [`HourlyLimit`](crate::HourlyLimit) for the total:
-    /// `.gate((HourlyLimit::recipients(500), DomainLimit::per_domain(100)))`.
+    /// `.gate((HourlyLimit::recipients(500), DomainLimit::recipients(100)))`.
     ///
     /// Domains are compared without regard to ASCII case. The table holds at
     /// most [`max_domains`](DomainLimit::max_domains) domains (default
@@ -574,15 +604,15 @@ mod domain {
     ///     Envelope::new(Address::parse("a@example.com").unwrap(), &[Address::parse(s).unwrap()])
     ///         .unwrap()
     /// };
-    /// let gate = DomainLimit::per_domain(2);
+    /// let gate = DomainLimit::recipients(2);
     /// let t = 1_700_000_000_000;
-    /// assert_eq!(gate.admit_envelope(&to("x@victim.example"), t), Admission::Admit);
-    /// assert_eq!(gate.admit_envelope(&to("y@victim.example"), t), Admission::Admit);
+    /// assert_eq!(gate.admit(&to("x@victim.example"), t), Admission::Admit);
+    /// assert_eq!(gate.admit(&to("y@victim.example"), t), Admission::Admit);
     /// assert!(matches!(
-    ///     gate.admit_envelope(&to("z@VICTIM.example"), t),
+    ///     gate.admit(&to("z@VICTIM.example"), t),
     ///     Admission::RetryAfter(_)
     /// ));
-    /// assert_eq!(gate.admit_envelope(&to("z@other.example"), t), Admission::Admit);
+    /// assert_eq!(gate.admit(&to("z@other.example"), t), Admission::Admit);
     /// ```
     #[derive(Debug)]
     pub struct DomainLimit {
@@ -594,7 +624,7 @@ mod domain {
     impl DomainLimit {
         /// At most `per_hour` recipients per recipient domain in any 60 minutes.
         #[must_use]
-        pub fn per_domain(per_hour: u32) -> DomainLimit {
+        pub fn recipients(per_hour: u32) -> DomainLimit {
             DomainLimit {
                 per_hour,
                 max_domains: 1024,
@@ -637,13 +667,7 @@ mod domain {
     }
 
     impl SendGate for DomainLimit {
-        /// Without the addresses there is no domain to count: admitted. The
-        /// client always asks through `admit_envelope`.
-        fn admit(&self, _recipients: u32, _now_unix_ms: u64) -> Admission {
-            Admission::Admit
-        }
-
-        fn admit_envelope(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission {
+        fn admit(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission {
             let bucket = now_unix_ms / BUCKET_MS;
             let counts = DomainLimit::per_domain_counts(envelope);
             let Ok(mut table) = self.table.lock() else {
@@ -687,7 +711,7 @@ mod domain {
             Admission::Admit
         }
 
-        fn refund_envelope(&self, envelope: &Envelope, now_unix_ms: u64) {
+        fn refund(&self, envelope: &Envelope, now_unix_ms: u64) {
             let bucket = now_unix_ms / BUCKET_MS;
             if let Ok(mut table) = self.table.lock() {
                 for (d, n) in DomainLimit::per_domain_counts(envelope) {
@@ -718,95 +742,80 @@ mod domain {
 
         #[test]
         fn test_per_domain_limit_and_other_domains() {
-            let g = DomainLimit::per_domain(3);
+            let g = DomainLimit::recipients(3);
             assert_eq!(
-                g.admit_envelope(&env(&["a@v.example", "b@v.example"]), T),
+                g.admit(&env(&["a@v.example", "b@v.example"]), T),
                 Admission::Admit
             );
             assert_eq!(g.remaining("V.example", T), 1);
             // Two more at v would pass the limit: the whole message waits,
             // its w recipient included.
-            assert!(refused(g.admit_envelope(
-                &env(&["c@v.example", "d@v.example", "x@w.example"]),
-                T
-            )));
+            assert!(refused(
+                g.admit(&env(&["c@v.example", "d@v.example", "x@w.example"]), T)
+            ));
             assert_eq!(g.remaining("w.example", T), 3);
             assert_eq!(
-                g.admit_envelope(&env(&["c@v.example", "x@w.example"]), T),
+                g.admit(&env(&["c@v.example", "x@w.example"]), T),
                 Admission::Admit
             );
-            assert!(refused(g.admit_envelope(&env(&["e@v.example"]), T)));
+            assert!(refused(g.admit(&env(&["e@v.example"]), T)));
         }
 
         #[test]
         fn test_clock_going_backwards_keeps_every_count() {
             // 13 buckets back lands on the slot that holds the newer bucket: its
             // count must stay counted, not be reset (D-058, D-106).
-            let g = DomainLimit::per_domain(3);
+            let g = DomainLimit::recipients(3);
             assert_eq!(
-                g.admit_envelope(&env(&["a@v.example", "b@v.example"]), T),
+                g.admit(&env(&["a@v.example", "b@v.example"]), T),
                 Admission::Admit
             );
             let back = T - 13 * BUCKET_MS;
             assert_eq!(g.remaining("v.example", back), 1);
-            assert_eq!(
-                g.admit_envelope(&env(&["c@v.example"]), back),
-                Admission::Admit
-            );
-            assert!(refused(g.admit_envelope(&env(&["d@v.example"]), back)));
-            assert!(refused(g.admit_envelope(&env(&["d@v.example"]), T)));
+            assert_eq!(g.admit(&env(&["c@v.example"]), back), Admission::Admit);
+            assert!(refused(g.admit(&env(&["d@v.example"]), back)));
+            assert!(refused(g.admit(&env(&["d@v.example"]), T)));
         }
 
         #[test]
         fn test_window_and_retry_after() {
-            let g = DomainLimit::per_domain(2);
+            let g = DomainLimit::recipients(2);
+            assert_eq!(g.admit(&env(&["a@v.example"]), T), Admission::Admit);
             assert_eq!(
-                g.admit_envelope(&env(&["a@v.example"]), T),
+                g.admit(&env(&["b@v.example"]), T + 20 * MIN),
                 Admission::Admit
             );
-            assert_eq!(
-                g.admit_envelope(&env(&["b@v.example"]), T + 20 * MIN),
-                Admission::Admit
-            );
-            let Admission::RetryAfter(d) = g.admit_envelope(&env(&["c@v.example"]), T + 30 * MIN)
-            else {
+            let Admission::RetryAfter(d) = g.admit(&env(&["c@v.example"]), T + 30 * MIN) else {
                 panic!("admitted over the limit")
             };
             // The first recipient's bucket leaves 65 minutes after it opened.
             assert_eq!(d, Duration::from_millis(35 * MIN));
-            assert!(refused(
-                g.admit_envelope(&env(&["c@v.example"]), T + 65 * MIN - 1)
-            ));
+            assert!(refused(g.admit(&env(&["c@v.example"]), T + 65 * MIN - 1)));
             assert_eq!(
-                g.admit_envelope(&env(&["c@v.example"]), T + 65 * MIN),
+                g.admit(&env(&["c@v.example"]), T + 65 * MIN),
                 Admission::Admit
             );
         }
 
         #[test]
         fn test_refund_and_oversized_message() {
-            let g = DomainLimit::per_domain(2);
+            let g = DomainLimit::recipients(2);
             let e = env(&["a@v.example", "b@v.example"]);
-            assert_eq!(g.admit_envelope(&e, T), Admission::Admit);
-            g.refund_envelope(&e, T);
+            assert_eq!(g.admit(&e, T), Admission::Admit);
+            g.refund(&e, T);
             assert_eq!(g.remaining("v.example", T), 2);
             let three = env(&["a@v.example", "b@v.example", "c@v.example"]);
-            assert!(refused(g.admit_envelope(&three, T)));
+            assert!(refused(g.admit(&three, T)));
         }
 
         #[test]
         fn test_table_is_bounded_and_keeps_the_busy_domain() {
-            let g = DomainLimit::per_domain(1).max_domains(4);
-            assert_eq!(
-                g.admit_envelope(&env(&["a@busy.example"]), T),
-                Admission::Admit
-            );
+            let g = DomainLimit::recipients(1).max_domains(4);
+            assert_eq!(g.admit(&env(&["a@busy.example"]), T), Admission::Admit);
             for i in 0..100u64 {
                 // The busy domain is mailed again each time, so it is never
                 // the one used least recently.
-                assert!(refused(
-                    g.admit_envelope(&env(&["b@busy.example"]), T + 2 * i + 1)
-                ));
+                assert!(refused(g.admit(&env(&["b@busy.example"]), T + 2 * i + 1)));
                 g.table
                     .lock()
                     .unwrap()
@@ -815,7 +824,7 @@ mod domain {
                     .last_used = T + 2 * i + 1;
                 let other = format!("x@d{i}.example");
                 assert_eq!(
-                    g.admit_envelope(&env(&[other.as_str()]), T + 2 * i + 2),
+                    g.admit(&env(&[other.as_str()]), T + 2 * i + 2),
                     Admission::Admit
                 );
                 assert!(g.table.lock().unwrap().len() <= 4);
@@ -826,14 +835,23 @@ mod domain {
         fn test_pair_refunds_the_first_when_the_second_refuses() {
             let g = (
                 crate::HourlyLimit::recipients(10),
-                DomainLimit::per_domain(1),
+                DomainLimit::recipients(1),
             );
-            assert_eq!(
-                g.admit_envelope(&env(&["a@v.example"]), T),
-                Admission::Admit
-            );
-            assert!(refused(g.admit_envelope(&env(&["b@v.example"]), T)));
+            assert_eq!(g.admit(&env(&["a@v.example"]), T), Admission::Admit);
+            assert!(refused(g.admit(&env(&["b@v.example"]), T)));
             assert_eq!(g.0.remaining(T), 9);
+        }
+
+        #[test]
+        fn test_domain_limit_behind_a_trait_object_still_counts_per_domain() {
+            // Before 0.8 the count-based `admit` of a DomainLimit admitted
+            // everything; any caller that used it bypassed the limit.
+            let g: alloc::sync::Arc<dyn SendGate> =
+                alloc::sync::Arc::new(DomainLimit::recipients(1));
+            assert_eq!(g.admit(&env(&["a@v.example"]), T), Admission::Admit);
+            assert!(refused(g.admit(&env(&["b@v.example"]), T)));
+            g.refund(&env(&["a@v.example"]), T);
+            assert_eq!(g.admit(&env(&["b@v.example"]), T), Admission::Admit);
         }
     }
 }

@@ -4,10 +4,8 @@
 //! up authenticated by SCRAM only got there with the server's proof, which
 //! random bytes cannot forge (so it never does here).
 use libfuzzer_sys::fuzz_target;
-use smtp_net::{
-    Auth, Credentials, Event, MechanismList, MechanismName, Millis, Session, SessionConfig,
-    SessionSecurity,
-};
+use smtp_net::{Credentials, MechanismName};
+use smtp_net::protocol::{Auth, Event, MechanismList, Millis, Session, SessionConfig, SessionSecurity};
 
 fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else { return };

@@ -3,11 +3,11 @@
 //! scanned again before it is queued).
 
 use alloc::vec::Vec;
-use core::net::IpAddr;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::{
     address::{Address, Domain},
-    error::{Error, ErrorKind, UsageError},
+    error::{AddressError, Error, ErrorKind, UsageError},
 };
 
 /// Longest command line, including CRLF (RFC 5321 4.5.3.1.4).
@@ -23,6 +23,47 @@ pub enum ClientName {
     Domain(Domain),
     /// An address literal, `[192.0.2.1]` or `[IPv6:2001:db8::1]` (D-011).
     AddressLiteral(IpAddr),
+}
+
+impl ClientName {
+    /// Parses an EHLO name: a domain (`mail.example.com`), or an IP address,
+    /// bare (`192.0.2.1`, `2001:db8::1`) or as an RFC 5321 literal
+    /// (`[192.0.2.1]`, `[IPv6:2001:db8::1]`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Domain::parse`] for a name; `AddressLiteralNotAllowed` for a
+    /// bracketed literal that is not an IPv4 address or `IPv6:` and an IPv6
+    /// address.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use smtp_net::protocol::ClientName;
+    /// assert!(matches!(ClientName::parse("mail.example.com")?, ClientName::Domain(_)));
+    /// assert!(matches!(ClientName::parse("[IPv6:2001:db8::1]")?, ClientName::AddressLiteral(_)));
+    /// assert!(ClientName::parse("[IPv6:192.0.2.1]").is_err());
+    /// assert!(ClientName::parse("not a name").is_err());
+    /// # Ok::<(), smtp_net::AddressError>(())
+    /// ```
+    pub fn parse(text: &str) -> Result<ClientName, AddressError> {
+        if let Some(inner) = text.strip_prefix('[') {
+            let inner = inner
+                .strip_suffix(']')
+                .ok_or(AddressError::AddressLiteralNotAllowed)?;
+            let ip = match inner.strip_prefix("IPv6:") {
+                Some(v6) => v6.parse::<Ipv6Addr>().map(IpAddr::V6).ok(),
+                None => inner.parse::<Ipv4Addr>().map(IpAddr::V4).ok(),
+            };
+            return ip
+                .map(ClientName::AddressLiteral)
+                .ok_or(AddressError::AddressLiteralNotAllowed);
+        }
+        if let Ok(ip) = text.parse::<IpAddr>() {
+            return Ok(ClientName::AddressLiteral(ip));
+        }
+        Domain::parse(text).map(ClientName::Domain)
+    }
 }
 
 impl Default for ClientName {
@@ -180,6 +221,56 @@ mod tests {
             } else {
                 assert_eq!(out, b"EHLO [127.0.0.1]\r\n");
             }
+        }
+    }
+
+    #[test]
+    fn test_client_name_parse_accepts_names_and_addresses() {
+        assert!(matches!(
+            ClientName::parse("mail.example.com"),
+            Ok(ClientName::Domain(_))
+        ));
+        for (text, ip) in [
+            ("192.0.2.1", "192.0.2.1"),
+            ("[192.0.2.1]", "192.0.2.1"),
+            ("2001:db8::1", "2001:db8::1"),
+            ("[IPv6:2001:db8::1]", "2001:db8::1"),
+        ] {
+            let want: IpAddr = ip.parse().unwrap();
+            assert_eq!(
+                ClientName::parse(text),
+                Ok(ClientName::AddressLiteral(want)),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_client_name_parse_refuses_bad_literals_and_names() {
+        for text in [
+            "",
+            "[2001:db8::1]",
+            "[IPv6:192.0.2.1]",
+            "[192.0.2.1",
+            "[]",
+            "[mail.example.com]",
+            "not a name",
+            "mail.example.com\r\nMAIL FROM:<x>",
+        ] {
+            assert!(ClientName::parse(text).is_err(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn test_parsed_client_name_formats_as_ehlo_argument() {
+        for (text, wire) in [
+            ("mail.example.com", "mail.example.com"),
+            ("192.0.2.1", "[192.0.2.1]"),
+            ("[IPv6:2001:db8::1]", "[IPv6:2001:db8::1]"),
+        ] {
+            let mut out = Vec::new();
+            Line::new(&mut out).client_name(&ClientName::parse(text).unwrap());
+            assert_eq!(out, wire.as_bytes(), "{text}");
         }
     }
 

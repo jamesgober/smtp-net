@@ -2,9 +2,8 @@
 //! sides, the fixture certificates in `tests/fixtures/` (a test CA and a
 //! `localhost` certificate it signed; never use them elsewhere).
 
-use smtp_net::{
-    ErrorKind, Message, Server, TestServer, TestServerBuilder, TlsFailure, TlsProtocol,
-};
+use smtp_net::testing::{TestServer, TestServerBuilder};
+use smtp_net::{ErrorKind, Message, Server, TlsFailure, TlsProtocol};
 
 const CA: &[u8] = include_bytes!("fixtures/ca.pem");
 const OTHER_CA: &[u8] = include_bytes!("fixtures/other-ca.pem");

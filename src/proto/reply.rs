@@ -43,9 +43,9 @@ impl ReplyCode {
         self.0 < 400
     }
 
-    /// `4yz`: transient failure.
+    /// `4yz`: a temporary failure (RFC 5321 calls it transient); retrying later can succeed.
     #[must_use]
-    pub const fn is_transient(self) -> bool {
+    pub const fn is_temporary(self) -> bool {
         self.0 >= 400 && self.0 < 500
     }
 
@@ -262,7 +262,7 @@ impl Default for ReplyLimits {
 /// # Examples
 ///
 /// ```
-/// use smtp_net::{ReplyLimits, ReplyParser};
+/// use smtp_net::protocol::{ReplyLimits, ReplyParser};
 /// let mut p = ReplyParser::new(ReplyLimits::default(), false);
 /// let (used, reply) = p.push(b"250-mail.example.com\r\n250 SIZE 1000\r\n221 bye\r\n")?;
 /// let reply = reply.unwrap();

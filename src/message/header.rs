@@ -54,7 +54,8 @@ const RESERVED: &[&str] = &[
 /// # Examples
 ///
 /// ```
-/// use smtp_net::{check_header_value, HeaderError};
+/// use smtp_net::HeaderError;
+/// use smtp_net::mime::check_header_value;
 /// assert!(check_header_value("Subject", "Hello\tthere").is_ok());
 /// assert_eq!(
 ///     check_header_value("Subject", "Hi\r\nBcc: victim@example.com"),
@@ -202,10 +203,10 @@ impl Headers {
 ///
 /// ```
 /// let mut out = String::new();
-/// smtp_net::encode_word("Caf\u{e9}", &mut out)?;
+/// smtp_net::mime::encode_word("Caf\u{e9}", &mut out)?;
 /// assert_eq!(out, "=?UTF-8?Q?Caf=C3=A9?=");
 /// out.clear();
-/// smtp_net::encode_word("\u{4f1a}\u{8b70}\u{306e}\u{304a}\u{77e5}\u{3089}\u{305b}", &mut out)?;
+/// smtp_net::mime::encode_word("\u{4f1a}\u{8b70}\u{306e}\u{304a}\u{77e5}\u{3089}\u{305b}", &mut out)?;
 /// assert_eq!(out, "=?UTF-8?B?5Lya6K2w44Gu44GK55+l44KJ44Gb?=");
 /// # Ok::<(), smtp_net::HeaderError>(())
 /// ```
@@ -254,7 +255,7 @@ pub(crate) fn encode_shorter(
 ///
 /// ```
 /// let mut out = Vec::new();
-/// smtp_net::fold_header("X-Note", &"word ".repeat(30), &mut out)?;
+/// smtp_net::mime::fold_header("X-Note", &"word ".repeat(30), &mut out)?;
 /// assert!(out.split(|&b| b == b'\n').all(|line| line.len() <= 79));
 /// # Ok::<(), smtp_net::HeaderError>(())
 /// ```

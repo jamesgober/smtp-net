@@ -1,6 +1,7 @@
 //! Message build and serialization (PLAN 11.1, NFR-6).
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use smtp_net::{Attachment, Message, RandomSource};
+use smtp_net::{Attachment, Message};
+use smtp_net::mime::RandomSource;
 
 struct Fixed;
 impl RandomSource for Fixed {

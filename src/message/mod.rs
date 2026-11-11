@@ -242,6 +242,19 @@ impl Message {
     /// # Errors
     ///
     /// As `envelope` and `to_bytes`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let msg = smtp_net::Message::text("no-reply@example.com", "user@example.org", "Hi", "Hello.")?;
+    /// let prepared = msg.prepare()?;
+    /// assert_eq!(prepared.envelope().recipients().len(), 1);
+    /// assert!(prepared.bytes().ends_with(b"Hello."));
+    /// # Ok::<(), smtp_net::Error>(())
+    /// ```
+    ///
+    /// To DKIM-sign, follow with `PreparedMessage::sign` (feature `dkim`): sign once,
+    /// before the payload is stored, so retries send the same signed bytes.
     pub fn prepare(&self) -> Result<PreparedMessage, Error> {
         let envelope = self.envelope()?;
         let bytes = self.to_bytes()?;
@@ -255,35 +268,6 @@ impl Message {
             self.needs_smtputf8,
             eight_bit,
         ))
-    }
-
-    /// As [`prepare`](Self::prepare), then each signer adds its
-    /// `DKIM-Signature` header, in the order given (RFC 8463 section 6:
-    /// one RSA and one Ed25519 signature is the usual pair). `now_unix` is
-    /// the `t=` time. Sign once, before the payload is stored: retries send
-    /// the same signed bytes.
-    ///
-    /// # Errors
-    ///
-    /// As `prepare`, plus `Dkim(...)`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use smtp_net::{DkimKey, DkimSigner, Message};
-    /// let signer = DkimSigner::new("example.com", "s2026", DkimKey::ed25519_from_seed(&[7; 32])?)?;
-    /// let msg = Message::text("no-reply@example.com", "user@example.org", "Hi", "Hello.")?;
-    /// let prepared = msg.prepare_signed(&[signer], 1_700_000_000)?;
-    /// assert!(prepared.bytes().starts_with(b"DKIM-Signature: v=1; a=ed25519-sha256;"));
-    /// # Ok::<(), smtp_net::Error>(())
-    /// ```
-    #[cfg(feature = "dkim")]
-    pub fn prepare_signed(
-        &self,
-        signers: &[crate::DkimSigner],
-        now_unix: u64,
-    ) -> Result<PreparedMessage, Error> {
-        self.prepare()?.sign(signers, now_unix)
     }
 }
 

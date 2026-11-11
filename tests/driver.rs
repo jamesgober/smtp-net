@@ -2,9 +2,9 @@
 
 use std::time::Duration;
 
+use smtp_net::testing::{Fault, TestServer};
 use smtp_net::{
-    Attachment, Client, ErrorKind, Fault, Message, RecipientPolicy, Security, Server, Stage,
-    TestServer, Timeouts,
+    Attachment, Client, ErrorKind, Message, RecipientPolicy, Security, Server, Stage, Timeouts,
 };
 
 fn msg(to: &str) -> Message {
@@ -38,7 +38,7 @@ fn test_send_delivers_exact_bytes_after_unstuffing() {
     let m = msg("user@example.org");
     let report = smtp_net::send(&server.server(), &m).unwrap();
     assert_eq!(report.message_id(), m.message_id());
-    assert_eq!(report.accepted().count(), 1);
+    assert_eq!(report.accepted().len(), 1);
     assert!(!report.was_secure());
     let got = server.received();
     assert_eq!(got.len(), 1);
@@ -146,11 +146,11 @@ fn test_rejected_recipient_reported_and_others_delivered() {
         .build()
         .unwrap();
     let report = smtp_net::send(&server.server(), &m).unwrap();
-    assert_eq!(report.accepted().count(), 1);
-    let rejected: Vec<_> = report.rejected().collect();
+    assert_eq!(report.accepted().len(), 1);
+    let rejected = report.rejected();
     assert_eq!(rejected.len(), 1);
-    assert_eq!(rejected[0].0.as_str(), "c@example.org");
-    assert!(rejected[0].2 == smtp_net::Disposition::Permanent);
+    assert_eq!(rejected[0].address().as_str(), "c@example.org");
+    assert!(rejected[0].is_permanent());
     assert_eq!(server.received()[0].recipients, ["b@example.org"]);
 }
 
@@ -178,7 +178,7 @@ fn test_policy_all_refuses_partial_delivery() {
         .unwrap();
     let e = smtp_net::send(&s, &m).unwrap_err();
     assert!(e.is_permanent());
-    assert_eq!(e.recipients().len(), 1);
+    assert_eq!(e.rejected().len(), 1);
     assert!(server.received().is_empty());
 }
 
@@ -194,7 +194,7 @@ fn test_all_recipients_rejected() {
         "{e:?}"
     );
     assert!(e.is_permanent());
-    assert_eq!(e.recipients()[0].0.as_str(), "a@example.org");
+    assert_eq!(e.rejected()[0].address().as_str(), "a@example.org");
 }
 
 #[test]
@@ -492,4 +492,49 @@ fn test_localhost_connects_quickly_when_the_server_listens_on_ipv4_only() {
         drop(client);
         assert!(took < Duration::from_millis(600), "connect took {took:?}");
     }
+}
+
+#[test]
+fn test_client_name_is_checked_by_build_and_sent_in_ehlo() {
+    let server = TestServer::start().unwrap();
+    let bad = server.server_builder().client_name("not a name").build();
+    assert!(matches!(
+        bad.unwrap_err().kind(),
+        ErrorKind::Config(smtp_net::ConfigError::InvalidClientName)
+    ));
+    let named = server
+        .server_builder()
+        .client_name("app-1.example.com")
+        .build()
+        .unwrap();
+    smtp_net::send(&named, &msg("a@example.org")).unwrap();
+    assert!(server.transcript().contains("C: EHLO app-1.example.com"));
+}
+
+#[test]
+fn test_mechanism_list_is_checked_by_build() {
+    let server = TestServer::start().unwrap();
+    let empty = server
+        .server_builder()
+        .credentials(smtp_net::Credentials::password("u", "p"))
+        .mechanisms(&[])
+        .build();
+    assert!(matches!(
+        empty.unwrap_err().kind(),
+        ErrorKind::Config(smtp_net::ConfigError::TooManyMechanisms)
+    ));
+}
+
+#[test]
+fn test_rejected_recipient_accessors_agree_with_the_error() {
+    let server = TestServer::builder()
+        .fault(Fault::RejectRecipient(0))
+        .start()
+        .unwrap();
+    let e = smtp_net::send(&quick(&server), &msg("gone@example.org")).unwrap_err();
+    let r = &e.rejected()[0];
+    assert_eq!(r.address().as_str(), "gone@example.org");
+    assert_eq!(r.reply().code().get() / 100, 5);
+    assert!(r.is_permanent() && !r.is_temporary());
+    assert_eq!(r.disposition(), smtp_net::Disposition::Permanent);
 }

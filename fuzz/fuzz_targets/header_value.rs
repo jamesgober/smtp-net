@@ -2,7 +2,7 @@
 //! The header gate and encoders: no panic; accepted values produce no CR or
 //! LF except the CRLF SP of a fold.
 use libfuzzer_sys::fuzz_target;
-use smtp_net::{check_header_value, encode_word, fold_header};
+use smtp_net::mime::{check_header_value, encode_word, fold_header};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(s) = std::str::from_utf8(data) else { return };

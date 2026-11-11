@@ -215,7 +215,8 @@ impl fmt::Display for MechanismName {
 /// # Examples
 ///
 /// ```
-/// use smtp_net::{MechanismList, MechanismName};
+/// use smtp_net::MechanismName;
+/// use smtp_net::protocol::MechanismList;
 /// let list = MechanismList::new(&[MechanismName::Login])?;
 /// assert_eq!(list.iter().count(), 1);
 /// assert!(MechanismList::default().iter().any(|m| m == MechanismName::Plain));

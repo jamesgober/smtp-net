@@ -1,5 +1,5 @@
 use super::*;
-use crate::dkim::DkimAlgorithm;
+use crate::DkimAlgorithm;
 
 const RFC8463_SEED: &str = "nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=";
 

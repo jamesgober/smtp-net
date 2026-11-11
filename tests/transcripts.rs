@@ -11,10 +11,11 @@
 
 use std::{fs, path::Path};
 
+use smtp_net::protocol::{Auth, MechanismList, Millis, Session, SessionConfig, SessionSecurity};
+use smtp_net::testing::{ScriptedServer, Transcript};
 use smtp_net::{
-    Address, Auth, Credentials, Dsn, DsnNotify, DsnReturn, Envelope, MechanismList, MechanismName,
-    Millis, PreparedMessage, RecipientPolicy, ScriptedServer, Session, SessionConfig,
-    SessionSecurity, Transcript,
+    Address, Credentials, Dsn, DsnNotify, DsnPolicy, DsnReturn, Envelope, MechanismName,
+    PreparedMessage, RecipientPolicy,
 };
 
 struct Case {
@@ -111,17 +112,17 @@ fn load(path: &Path) -> Option<Case> {
         let mut dsn = Dsn::new(notify);
         for w in words {
             match w {
-                "hdrs" => dsn = dsn.ret(DsnReturn::Headers),
-                "full" => dsn = dsn.ret(DsnReturn::Full),
-                "required" => dsn = dsn.required(),
+                "hdrs" => dsn = dsn.with_return_content(DsnReturn::Headers),
+                "full" => dsn = dsn.with_return_content(DsnReturn::Full),
+                "required" => dsn = dsn.with_policy(DsnPolicy::Required),
                 other => {
                     dsn = dsn
-                        .envelope_id(other.strip_prefix("envid=").unwrap())
+                        .with_envelope_id(other.strip_prefix("envid=").unwrap())
                         .unwrap()
                 }
             }
         }
-        envelope = envelope.dsn(dsn);
+        envelope = envelope.with_dsn(dsn);
     }
     let body: &[u8] = if header(&text, "raw:") == Some("8bit") {
         b"caf\xc3\xa9\r\n"

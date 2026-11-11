@@ -118,9 +118,9 @@ pub enum DsnPolicy {
 ///
 /// ```
 /// use smtp_net::{Dsn, DsnNotify, DsnReturn};
-/// let dsn = Dsn::new(DsnNotify::FAILURE | DsnNotify::DELAY).ret(DsnReturn::Headers).envelope_id("order-1234")?;
-/// assert_eq!(dsn.envelope_id_value(), Some("order-1234"));
-/// assert!(Dsn::new(DsnNotify::NEVER).envelope_id(&"x".repeat(101)).is_err());
+/// let dsn = Dsn::new(DsnNotify::FAILURE | DsnNotify::DELAY).with_return_content(DsnReturn::Headers).with_envelope_id("order-1234")?;
+/// assert_eq!(dsn.envelope_id(), Some("order-1234"));
+/// assert!(Dsn::new(DsnNotify::NEVER).with_envelope_id(&"x".repeat(101)).is_err());
 /// # Ok::<(), smtp_net::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,9 +147,9 @@ impl Dsn {
         }
     }
 
-    /// Sets `RET`.
+    /// Sets `RET`: what a failure notice carries.
     #[must_use]
-    pub fn ret(mut self, ret: DsnReturn) -> Dsn {
+    pub fn with_return_content(mut self, ret: DsnReturn) -> Dsn {
         self.ret = Some(ret);
         self
     }
@@ -159,7 +159,7 @@ impl Dsn {
     /// # Errors
     ///
     /// `Build(InvalidDsn)`.
-    pub fn envelope_id(mut self, id: &str) -> Result<Dsn, Error> {
+    pub fn with_envelope_id(mut self, id: &str) -> Result<Dsn, Error> {
         if id.is_empty() || id.len() > MAX_ENVID || !id.bytes().all(|b| (32..127).contains(&b)) {
             return Err(BuildError::InvalidDsn.into());
         }
@@ -167,10 +167,11 @@ impl Dsn {
         Ok(self)
     }
 
-    /// Makes DSN required.
+    /// Sets the policy: [`DsnPolicy::Required`] fails the send when the
+    /// server does not offer DSN, instead of sending without it.
     #[must_use]
-    pub fn required(mut self) -> Dsn {
-        self.policy = DsnPolicy::Required;
+    pub fn with_policy(mut self, policy: DsnPolicy) -> Dsn {
+        self.policy = policy;
         self
     }
 
@@ -182,7 +183,7 @@ impl Dsn {
 
     /// The `ENVID` value.
     #[must_use]
-    pub fn envelope_id_value(&self) -> Option<&str> {
+    pub fn envelope_id(&self) -> Option<&str> {
         self.envelope_id.as_deref()
     }
 
@@ -259,9 +260,9 @@ impl Envelope {
         })
     }
 
-    /// The reverse-path; `None` is the null sender `<>`.
+    /// The reverse-path, where bounces go; `None` is the null sender `<>`.
     #[must_use]
-    pub fn from(&self) -> Option<&Address> {
+    pub fn return_path(&self) -> Option<&Address> {
         self.data.from.as_ref()
     }
 
@@ -273,7 +274,7 @@ impl Envelope {
 
     /// Replaces the reverse-path: the address bounces go to, distinct from From.
     #[must_use]
-    pub fn return_path(mut self, address: Address) -> Envelope {
+    pub fn with_return_path(mut self, address: Address) -> Envelope {
         alloc::sync::Arc::make_mut(&mut self.data).from = Some(address);
         self
     }
@@ -290,14 +291,14 @@ impl Envelope {
 
     /// Adds DSN parameters (RFC 3461).
     #[must_use]
-    pub fn dsn(mut self, dsn: Dsn) -> Envelope {
+    pub fn with_dsn(mut self, dsn: Dsn) -> Envelope {
         alloc::sync::Arc::make_mut(&mut self.data).dsn = Some(dsn);
         self
     }
 
     /// The DSN parameters, when set.
     #[must_use]
-    pub fn dsn_parameters(&self) -> Option<&Dsn> {
+    pub fn dsn(&self) -> Option<&Dsn> {
         self.data.dsn.as_ref()
     }
 
@@ -492,13 +493,27 @@ impl PreparedMessage {
     /// Adds a `DKIM-Signature` header from each signer, in the order given,
     /// in front of the message. Works on any bytes [`from_raw`](Self::from_raw)
     /// accepted, not only on messages this crate built (FR-53). The
-    /// signatures are independent of each other.
+    /// signatures are independent of each other (RFC 8463 section 6: one
+    /// RSA and one Ed25519 signature is the usual pair). `now_unix` is the
+    /// `t=` time. Sign once, before the payload is stored: retries send the
+    /// same signed bytes.
     ///
     /// # Errors
     ///
     /// `Dkim(...)`.
     ///
     /// # Examples
+    ///
+    /// ```
+    /// use smtp_net::{DkimKey, DkimSigner, Message};
+    /// let signer = DkimSigner::new("example.com", "s2026", DkimKey::ed25519_from_seed(&[7; 32])?)?;
+    /// let msg = Message::text("no-reply@example.com", "user@example.org", "Hi", "Hello.")?;
+    /// let signed = msg.prepare()?.sign(&[signer], 1_700_000_000)?;
+    /// assert!(signed.bytes().starts_with(b"DKIM-Signature: v=1; a=ed25519-sha256;"));
+    /// # Ok::<(), smtp_net::Error>(())
+    /// ```
+    ///
+    /// Raw bytes from elsewhere:
     ///
     /// ```
     /// use smtp_net::{Address, DkimKey, DkimSigner, Envelope, PreparedMessage};
@@ -703,7 +718,7 @@ impl PreparedMessage {
             };
             if !id.is_empty() {
                 let id = core::str::from_utf8(id).map_err(|_| PayloadError::Corrupt)?;
-                d = d.envelope_id(id)?;
+                d = d.with_envelope_id(id)?;
             }
             Some(d)
         } else {
@@ -881,8 +896,8 @@ mod tests {
         assert!(Envelope::new(a.clone(), &many[..100]).is_ok());
         let e = Envelope::new(a.clone(), core::slice::from_ref(&a))
             .unwrap()
-            .return_path(Address::parse("bounce@example.com").unwrap());
-        assert_eq!(e.from().unwrap().as_str(), "bounce@example.com");
+            .with_return_path(Address::parse("bounce@example.com").unwrap());
+        assert_eq!(e.return_path().unwrap().as_str(), "bounce@example.com");
     }
 
     fn sample() -> PreparedMessage {
@@ -892,10 +907,10 @@ mod tests {
         ];
         let env = Envelope::new(Address::parse("a@example.com").unwrap(), &to)
             .unwrap()
-            .dsn(
+            .with_dsn(
                 Dsn::new(DsnNotify::FAILURE)
-                    .ret(DsnReturn::Full)
-                    .envelope_id("x")
+                    .with_return_content(DsnReturn::Full)
+                    .with_envelope_id("x")
                     .unwrap(),
             );
         PreparedMessage::from_raw(
@@ -987,18 +1002,26 @@ mod tests {
 
     #[test]
     fn test_dsn_envelope_id_rules() {
-        assert!(Dsn::new(DsnNotify::NEVER).envelope_id("").is_err());
+        assert!(Dsn::new(DsnNotify::NEVER).with_envelope_id("").is_err());
         assert!(
             Dsn::new(DsnNotify::NEVER)
-                .envelope_id(&"x".repeat(100))
+                .with_envelope_id(&"x".repeat(100))
                 .is_ok()
         );
         assert!(
             Dsn::new(DsnNotify::NEVER)
-                .envelope_id(&"x".repeat(101))
+                .with_envelope_id(&"x".repeat(101))
                 .is_err()
         );
-        assert!(Dsn::new(DsnNotify::NEVER).envelope_id("caf\u{e9}").is_err());
-        assert!(Dsn::new(DsnNotify::NEVER).envelope_id("a\r\nb").is_err());
+        assert!(
+            Dsn::new(DsnNotify::NEVER)
+                .with_envelope_id("caf\u{e9}")
+                .is_err()
+        );
+        assert!(
+            Dsn::new(DsnNotify::NEVER)
+                .with_envelope_id("a\r\nb")
+                .is_err()
+        );
     }
 }

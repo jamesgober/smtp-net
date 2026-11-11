@@ -2,7 +2,8 @@
 //! error document of an expired token), SCRAM-SHA-256 with server
 //! verification (feature `scram`), and the ASCII rule for SCRAM (O-12).
 
-use smtp_net::{Credentials, ErrorKind, Message, TestServer};
+use smtp_net::testing::TestServer;
+use smtp_net::{Credentials, ErrorKind, Message};
 
 fn msg() -> Message {
     Message::text(
@@ -70,7 +71,8 @@ fn test_password_never_goes_to_xoauth2() {
 
 #[cfg(feature = "scram")]
 mod scram {
-    use smtp_net::{Fault, MechanismName, SaslError, Server};
+    use smtp_net::testing::Fault;
+    use smtp_net::{MechanismName, SaslError, Server};
 
     use super::*;
 
@@ -140,7 +142,6 @@ mod scram {
         let only_scram = server
             .server_builder()
             .mechanisms(&[MechanismName::ScramSha256])
-            .unwrap()
             .build()
             .unwrap();
         let e = smtp_net::send(&only_scram, &msg()).unwrap_err();
@@ -201,7 +202,7 @@ fn test_observer_sees_codes_and_outcomes_never_secrets() {
     let s = smtp_net::Server::starttls("localhost")
         .to_builder()
         .port(plain.port())
-        .tls_connector(smtp_net::TestTls)
+        .tls(smtp_net::testing::TestTls)
         .observer(Shared(log.clone()))
         .build()
         .unwrap();

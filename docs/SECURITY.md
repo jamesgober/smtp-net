@@ -132,7 +132,7 @@ The first version timed the whole server-final step, base64 decoding included, a
 ### Added in 0.7
 
 - `MessageBuilder::allow_bidi_controls` (bidi controls refused by default) and `refuse_address_like_display_names` (T-25, T-35).
-- `DomainLimit`, gate pairs, and `SendGate::admit_envelope` (PLAN 10.3).
+- `DomainLimit`, gate pairs, and `SendGate::admit`, which sees the whole envelope (PLAN 10.3).
 - `TestServerBuilder::record(false)` and `TestServer::messages` for long runs.
 
 ## What smtp-net does not defend against
@@ -148,7 +148,7 @@ The first version timed the whole server-final step, base64 decoding included, a
 
 - Never put untrusted text in the From display name. If any display name comes from users, turn on `refuse_address_like_display_names`.
 - Leave `allow_bidi_controls` off unless a known sender needs the controls.
-- Combine the gates: `.gate((HourlyLimit::recipients(cap), DomainLimit::per_domain(n)))`. `Throttled` errors are temporary and carry `retry_after`.
+- Combine the gates: `.gate((HourlyLimit::recipients(cap), DomainLimit::recipients(n)))`. `Throttled` errors are temporary and carry `retry_after`.
 - Treat `possibly_delivered` errors as "do not resend automatically, or resend the same `PreparedMessage`": the receiver can then deduplicate on Message-ID.
 - Watch `ObservedEvent::SecurityEvent` (STARTTLS missing or injected, protocol violations): a change on a relay that used to behave is worth an alert.
 - Run on Linux in production (`docs/PERFORMANCE.md`): the signing backend is several times faster there.

@@ -22,13 +22,13 @@ pub use tls::{TlsConnector, TlsSetupError};
 
 use crate::{
     address::{Address, Domain},
-    error::{ConfigError, Disposition, Error, ErrorKind, Stage},
+    error::{ConfigError, Disposition, Error, ErrorKind, RejectedRecipient, Stage},
     gate::{Admission, SendGate},
     message::{Message, prepared::PreparedMessage},
     proto::{
-        Auth, BodyFlags, Capabilities, ClientName, Credentials, Event, MechanismList, Millis,
-        RecipientPolicy, Reply, Secret, Session, SessionConfig, SessionSecurity, SessionState,
-        Timeouts, TlsProtocol,
+        Auth, BodyFlags, Capabilities, ClientName, Credentials, Event, MechanismList,
+        MechanismName, Millis, RecipientPolicy, Reply, Secret, Session, SessionConfig,
+        SessionSecurity, SessionState, Timeouts, TlsProtocol,
     },
 };
 
@@ -64,8 +64,8 @@ impl Security {
     fn default_port(self) -> u16 {
         match self {
             Security::PlaintextLoopback => crate::PORT_SMTP,
-            Security::StartTls => crate::PORT_SUBMISSION,
-            Security::ImplicitTls => crate::PORT_SUBMISSIONS,
+            Security::StartTls => crate::PORT_STARTTLS,
+            Security::ImplicitTls => crate::PORT_IMPLICIT_TLS,
         }
     }
 }
@@ -137,7 +137,7 @@ impl core::fmt::Debug for Server {
             .field("port", &self.port)
             .field("security", &self.security)
             .field("auth", &self.auth)
-            .field("tls_connector", &self.tls.is_some())
+            .field("tls", &self.tls.is_some())
             .field("insecure", &self.insecure)
             .field("gate", &self.gate.is_some())
             .field("observer", &self.observer.is_some());
@@ -183,7 +183,7 @@ impl Server {
     fn prepare(&self, message: &Message) -> Result<PreparedMessage, Error> {
         #[cfg(feature = "dkim")]
         if !self.dkim.is_empty() {
-            return message.prepare_signed(&self.dkim, now_unix_ms() / 1000);
+            return message.prepare()?.sign(&self.dkim, now_unix_ms() / 1000);
         }
         message.prepare()
     }
@@ -228,7 +228,7 @@ impl Server {
     /// A relay with STARTTLS on port 587, certificate verification on, RFC
     /// 5321 timeouts. The TLS engine is tls-net's (feature `tls`, on by
     /// default); without the feature, set one with
-    /// [`ServerBuilder::tls_connector`] (a server without one fails at
+    /// [`ServerBuilder::tls`] (a server without one fails at
     /// connect with `Config(TlsConnectorMissing)`, nothing sent, D-025).
     #[must_use]
     pub fn starttls(host: &str) -> Server {
@@ -256,6 +256,7 @@ impl Server {
             server: Server::base(host, security),
             credentials: None,
             mechanisms: None,
+            client_name: None,
             insecure_remote: false,
         }
     }
@@ -266,6 +267,7 @@ impl Server {
             server: self.clone(),
             credentials: None,
             mechanisms: None,
+            client_name: None,
             insecure_remote: false,
         }
     }
@@ -301,7 +303,8 @@ impl Server {
 pub struct ServerBuilder {
     server: Server,
     credentials: Option<Credentials>,
-    mechanisms: Option<MechanismList>,
+    mechanisms: Option<Vec<MechanismName>>,
+    client_name: Option<String>,
     insecure_remote: bool,
 }
 
@@ -326,19 +329,19 @@ impl ServerBuilder {
         self
     }
 
-    /// The mechanism allowlist, in order of preference (FR-35).
-    ///
-    /// # Errors
-    ///
-    /// `Config(TooManyMechanisms)` for an empty list or more than 8.
-    pub fn mechanisms(mut self, list: &[crate::proto::MechanismName]) -> Result<Self, Error> {
-        self.mechanisms = Some(MechanismList::new(list)?);
-        Ok(self)
+    /// The mechanism allowlist, in order of preference (FR-35): 1 to 8
+    /// names, checked by [`build`](ServerBuilder::build).
+    pub fn mechanisms(mut self, list: &[MechanismName]) -> Self {
+        self.mechanisms = Some(list.to_vec());
+        self
     }
 
-    /// The EHLO argument; the default is the local socket's address literal.
-    pub fn client_name(mut self, name: ClientName) -> Self {
-        self.server.client_name = Some(name);
+    /// The EHLO name: a domain or an IP address (see
+    /// [`ClientName::parse`](crate::protocol::ClientName::parse)), checked
+    /// by [`build`](ServerBuilder::build). The default is the local
+    /// socket's address as a literal, which every server accepts (D-011).
+    pub fn client_name(mut self, name: &str) -> Self {
+        self.client_name = Some(String::from(name));
         self
     }
 
@@ -348,17 +351,14 @@ impl ServerBuilder {
         self
     }
 
-    /// The TLS engine for STARTTLS and implicit TLS.
-    pub fn tls_connector(mut self, connector: impl TlsConnector + 'static) -> Self {
+    /// The TLS engine for STARTTLS and implicit TLS, in place of the
+    /// default (tls-net with the Mozilla roots, feature `tls`). A
+    /// `tls_net::TlsClient` is one, for example a client that trusts only a
+    /// private CA (`tls_net::client_with_ca_pem`); any other engine
+    /// implements [`TlsConnector`].
+    pub fn tls(mut self, connector: impl TlsConnector + 'static) -> Self {
         self.server.tls = Some(Arc::new(connector));
         self
-    }
-
-    /// A tls-net client as the TLS engine: for example one that trusts only
-    /// a private CA (`tls_net::client_with_ca_pem`).
-    #[cfg(feature = "tls")]
-    pub fn tls(self, client: tls_net::TlsClient) -> Self {
-        self.tls_connector(client)
     }
 
     /// Turns certificate verification off. For test relays only: accepted
@@ -410,7 +410,7 @@ impl ServerBuilder {
     /// A DKIM signer applied by [`send`] and [`Client::send`] to every
     /// message built here; repeat for several signatures (at most 4).
     /// [`send_prepared`] never signs: sign before storing the payload
-    /// ([`Message::prepare_signed`]).
+    /// (`message.prepare()?.sign(..)`).
     #[cfg(feature = "dkim")]
     pub fn dkim(mut self, signer: crate::DkimSigner) -> Self {
         self.server.dkim.push(signer);
@@ -428,9 +428,19 @@ impl ServerBuilder {
     /// # Errors
     ///
     /// `Config(PortZero)`, `Config(InvalidHost)`, `Config(PlaintextHostNotLoopback)`,
-    /// `Config(TlsConnectorMissing)`, `Config(InsecureNotAllowed)`.
+    /// `Config(TlsConnectorMissing)`, `Config(InsecureNotAllowed)`,
+    /// `Config(TooManyMechanisms)`, `Config(InvalidClientName)`,
+    /// `Config(TooManyDkimSigners)`.
     pub fn build(self) -> Result<Server, Error> {
         let mut s = self.server;
+        if let Some(name) = &self.client_name {
+            s.client_name =
+                Some(ClientName::parse(name).map_err(|_| ConfigError::InvalidClientName)?);
+        }
+        let mechanisms = match &self.mechanisms {
+            Some(list) => Some(MechanismList::new(list)?),
+            None => None,
+        };
         if s.port == 0 {
             return Err(ConfigError::PortZero.into());
         }
@@ -457,7 +467,7 @@ impl ServerBuilder {
         if let Some(c) = self.credentials {
             s.auth = Some(Auth::new(c));
         }
-        if let (Some(m), Some(a)) = (self.mechanisms, s.auth.as_mut()) {
+        if let (Some(m), Some(a)) = (mechanisms, s.auth.as_mut()) {
             a.mechanisms = m;
         }
         Ok(s)
@@ -469,7 +479,7 @@ impl ServerBuilder {
 pub struct Report {
     message_id: String,
     accepted: Vec<Address>,
-    rejected: Vec<(Address, Reply, Disposition)>,
+    rejected: Vec<RejectedRecipient>,
     final_reply: Reply,
     secure: bool,
     tls_protocol: Option<TlsProtocol>,
@@ -483,14 +493,18 @@ impl Report {
         &self.message_id
     }
 
-    /// Recipients the server accepted.
-    pub fn accepted(&self) -> impl Iterator<Item = &Address> {
-        self.accepted.iter()
+    /// Recipients the server accepted, in envelope order.
+    #[must_use]
+    pub fn accepted(&self) -> &[Address] {
+        &self.accepted
     }
 
-    /// Recipients the server refused, with its reply and whether retrying can help.
-    pub fn rejected(&self) -> impl Iterator<Item = (&Address, &Reply, Disposition)> {
-        self.rejected.iter().map(|(a, r, d)| (a, r, *d))
+    /// Recipients the server refused while it accepted others (the default
+    /// [`RecipientPolicy::Any`]), each with its reply and whether retrying
+    /// can help.
+    #[must_use]
+    pub fn rejected(&self) -> &[RejectedRecipient] {
+        &self.rejected
     }
 
     /// The reply to the end of the data (of the last transaction, when
@@ -529,7 +543,7 @@ fn admit(server: &Server, message: &PreparedMessage) -> Result<(), Error> {
     let Some(gate) = &server.gate else {
         return Ok(());
     };
-    match gate.admit_envelope(message.envelope(), now_unix_ms()) {
+    match gate.admit(message.envelope(), now_unix_ms()) {
         Admission::RetryAfter(d) => Err(Error::new(ErrorKind::Throttled).with_retry_after(d)),
         _ => Ok(()),
     }
@@ -538,7 +552,7 @@ fn admit(server: &Server, message: &PreparedMessage) -> Result<(), Error> {
 fn refund_on(server: &Server, message: &PreparedMessage, e: &Error) {
     if let Some(gate) = &server.gate {
         if !e.possibly_delivered() && !matches!(e.kind(), ErrorKind::Throttled) {
-            gate.refund_envelope(message.envelope(), now_unix_ms());
+            gate.refund(message.envelope(), now_unix_ms());
         }
     }
 }
@@ -997,7 +1011,7 @@ impl Client {
                 if reused
                     && e.is_temporary()
                     && !e.possibly_delivered()
-                    && e.recipients().is_empty()
+                    && e.rejected().is_empty()
                     && Client::nothing_accepted(&e) =>
             {
                 self.reconnect()?;
@@ -1027,9 +1041,11 @@ impl Client {
             // Recipients still deferred: reported as temporary refusals.
             for i in deferred {
                 if let Some(a) = envelope.recipients().get(i) {
-                    report
-                        .rejected
-                        .push((a.clone(), Reply::too_many(), Disposition::Temporary));
+                    report.rejected.push(RejectedRecipient::new(
+                        a.clone(),
+                        Reply::too_many(),
+                        Disposition::Temporary,
+                    ));
                 }
             }
         }
@@ -1118,7 +1134,7 @@ impl Client {
                         disposition,
                     } => {
                         if let Some(a) = envelope.recipients().get(index) {
-                            rejected.push((a.clone(), reply, disposition));
+                            rejected.push(RejectedRecipient::new(a.clone(), reply, disposition));
                         }
                     }
                     Event::BodyWanted => in_body = true,
