@@ -1052,9 +1052,11 @@ impl Client {
     }
 
     fn reconnect(&mut self) -> Result<(), Error> {
+        // QUIT only from a clean session: anything still queued would go out before it.
+        let idle = self.idle();
         if let Some(mut c) = self.conn.take() {
             let now = self.now();
-            if self.session.quit(now).is_ok() {
+            if idle && self.session.quit(now).is_ok() {
                 let out = self.session.transmit().to_vec();
                 match c.tls.as_mut() {
                     Some(tls) => {
@@ -1177,10 +1179,19 @@ impl Client {
         Ok(())
     }
 
-    /// True while the connection is up and the session can take a transaction.
+    /// True while the connection is up and the session can take a
+    /// transaction: ready, with no command waiting to be written and no
+    /// reply outstanding. A connection that fails this is never reused.
     #[must_use]
     pub fn is_open(&self) -> bool {
-        self.conn.is_some() && self.session.state() == SessionState::Ready
+        self.conn.is_some() && self.idle()
+    }
+
+    /// The session is ready and holds nothing of an earlier exchange.
+    fn idle(&self) -> bool {
+        self.session.state() == SessionState::Ready
+            && self.session.transmit().is_empty()
+            && !self.session.wants_read()
     }
 
     /// The capabilities from the latest EHLO.
@@ -1200,6 +1211,12 @@ impl Client {
 
     fn quit_and_close(&mut self, bound: Option<Duration>) -> Result<(), Error> {
         if self.conn.is_none() || self.session.state() == SessionState::Closed {
+            self.drop_conn();
+            return Ok(());
+        }
+        if !self.idle() {
+            // Commands or replies of an unfinished exchange are queued: a
+            // QUIT would go out behind them. Drop the connection instead.
             self.drop_conn();
             return Ok(());
         }

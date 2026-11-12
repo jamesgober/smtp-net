@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "smtp-net"
-version = "0.7.1"
+version = "0.7.2"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -138,6 +138,10 @@ required-features = ["testing"]
 
 [[test]]
 name = "pool"
+required-features = ["testing"]
+
+[[test]]
+name = "crosstalk"
 required-features = ["testing"]
 
 [[test]]

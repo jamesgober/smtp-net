@@ -41,7 +41,7 @@
 //!
 //! ## Status
 //!
-//! `0.7.1`, feature complete, tuned, and hardened: messages, the session,
+//! `0.7.2`, feature complete, tuned, and hardened: messages, the session,
 //! local submission, STARTTLS and implicit TLS relays, AUTH (SCRAM-SHA-256,
 //! PLAIN, LOGIN, XOAUTH2, custom mechanisms), DKIM signing (Ed25519 and RSA),
 //! CHUNKING, DSN, pacing per hour and per recipient domain, job payloads, a
