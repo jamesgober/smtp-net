@@ -201,13 +201,15 @@ fn test_body_bare_lf_refused_and_session_closed() {
     let mut s = ready(b"250 mx\r\n");
     s.begin(&envelope(1), BodyFlags::default(), 10, Millis(3))
         .unwrap();
+    // Without PIPELINING each reply comes after its command is written.
     drain(&mut s);
-    s.receive(b"250 ok\r\n250 ok\r\n", Millis(4)).unwrap();
+    s.receive(b"250 ok\r\n", Millis(4)).unwrap();
     drain(&mut s);
-    s.receive(b"250 ok\r\n", Millis(4)).ok();
+    s.receive(b"250 ok\r\n", Millis(4)).unwrap();
     drain(&mut s);
-    s.receive(b"354 go\r\n", Millis(5)).ok();
-    if s.state() == SessionState::Body {
+    s.receive(b"354 go\r\n", Millis(5)).unwrap();
+    assert_eq!(s.state(), SessionState::Body);
+    {
         let e = s
             .body(b"x\n.\nRCPT TO:<evil@x>\r\n", Millis(6))
             .unwrap_err();
@@ -282,6 +284,7 @@ impl Session {
             exchange: None,
             authenticated: self.authenticated,
             secret_out: self.secret_out,
+            written: self.written,
             txn: self.txn.clone(),
             body_deadline: self.body_deadline,
             group: self.group,
@@ -568,4 +571,32 @@ fn test_ehlo_reply_over_1_kib_keeps_every_capability() {
     let caps = s.capabilities().unwrap();
     assert_eq!(caps.size_limit(), Some(35_882_577));
     assert!(caps.has(Extension::Pipelining));
+}
+
+#[test]
+fn test_reply_before_its_command_is_written_closes_the_session() {
+    // N-1: a 220 that arrives with the EHLO reply, while STARTTLS is still
+    // unsent, is an injected reply, not the answer to STARTTLS.
+    let mut c = loopback();
+    c.security = SessionSecurity::StartTlsRequired;
+    let mut s = Session::new(c, Millis(0)).unwrap();
+    s.receive(b"220 mx ESMTP\r\n", Millis(1)).unwrap();
+    drain(&mut s);
+    let e = s
+        .receive(b"250-mx\r\n250 STARTTLS\r\n220 go ahead\r\n", Millis(2))
+        .unwrap_err();
+    assert!(matches!(e.kind(), ErrorKind::StartTlsInjection), "{e}");
+    assert_eq!(s.state(), SessionState::Closed);
+
+    // Without PIPELINING, an RCPT reply that arrives with the MAIL reply.
+    let mut s = ready(b"250 mx\r\n");
+    s.begin(&envelope(1), BodyFlags::default(), 10, Millis(3))
+        .unwrap();
+    drain(&mut s);
+    let e = s.receive(b"250 ok\r\n250 ok\r\n", Millis(4)).unwrap_err();
+    assert!(matches!(
+        e.kind(),
+        ErrorKind::Protocol(ProtocolError::UnexpectedReply)
+    ));
+    assert_eq!(s.state(), SessionState::Closed);
 }

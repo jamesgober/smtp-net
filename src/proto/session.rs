@@ -324,6 +324,9 @@ impl Expect {
 struct Pending {
     what: Expect,
     deadline: Millis,
+    /// Octets written in all, counting from the start of the session, once
+    /// the command this reply answers has been written.
+    ends_at: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -379,6 +382,8 @@ pub struct Session {
     authenticated: bool,
     /// The output holds an AUTH response: wiped once it is transmitted.
     secret_out: bool,
+    /// Octets acknowledged through `transmitted` since the session began.
+    written: u64,
     txn: Option<Txn>,
     body_deadline: Option<Millis>,
     /// Bytes counted into the current pipelined group.
@@ -430,6 +435,7 @@ impl Session {
             exchange: None,
             authenticated: false,
             secret_out: false,
+            written: 0,
             txn: None,
             body_deadline: None,
             group: 0,
@@ -457,6 +463,7 @@ impl Session {
         self.pending.push_back(Pending {
             what,
             deadline: now.after(d),
+            ends_at: self.written + self.out.len() as u64,
         });
     }
 
@@ -490,6 +497,22 @@ impl Session {
 
     /// Clears the output; when it held an AUTH response, overwrites the
     /// buffer first (best effort without unsafe code).
+    /// Appends an AUTH line and its CRLF. When the output must grow for
+    /// it, the old buffer is wiped before it is freed, so no copy of an
+    /// earlier response is left behind by the reallocation (N-4).
+    fn push_secret(&mut self, line: &[u8]) {
+        let need = self.out.len() + line.len() + 2;
+        if need > self.out.capacity() {
+            let mut grown = Vec::with_capacity(need.max(self.out.capacity().saturating_mul(2)));
+            grown.extend_from_slice(&self.out);
+            let old = core::mem::replace(&mut self.out, grown);
+            drop(crypt_io::Zeroizing::new(old));
+        }
+        self.out.extend_from_slice(line);
+        self.out.extend_from_slice(b"\r\n");
+        self.secret_out = true;
+    }
+
     fn wipe_output(&mut self) {
         if self.secret_out {
             let cap = self.out.capacity();
@@ -583,6 +606,16 @@ impl Session {
                 .with_disposition(Disposition::Temporary)
                 .at(stage);
             self.pending.push_front(p);
+            return Err(self.close(e));
+        }
+        if p.ends_at > self.written {
+            // A reply to a command not yet written: the server (or something
+            // between) answered ahead, as an injected reply would (N-1).
+            let e = if p.what == Expect::StartTls {
+                Error::new(ErrorKind::StartTlsInjection).at(Stage::StartTls)
+            } else {
+                Error::from(ProtocolError::UnexpectedReply).at(stage)
+            };
             return Err(self.close(e));
         }
         if !p.what.allows(code) {
@@ -761,9 +794,7 @@ impl Session {
             Ok(x) => x,
             Err(e) => return Err(self.close(Error::from(e).at(Stage::Auth))),
         };
-        self.out.extend_from_slice(&line);
-        self.out.extend_from_slice(b"\r\n");
-        self.secret_out = true;
+        self.push_secret(&line);
         self.exchange = Some(exchange);
         self.state = SessionState::Authenticating;
         self.expect(Expect::Auth, now);
@@ -813,9 +844,7 @@ impl Session {
                 };
                 match step {
                     Ok(Some(response)) if response.len() + 2 <= MAX_AUTH_LINE => {
-                        self.out.extend_from_slice(&response);
-                        self.out.extend_from_slice(b"\r\n");
-                        self.secret_out = true;
+                        self.push_secret(&response);
                         self.expect(Expect::Auth, now);
                         Ok(())
                     }
@@ -1158,6 +1187,7 @@ impl Session {
     /// AUTH response is overwritten once it is all written.
     pub fn transmitted(&mut self, n: usize) {
         let n = n.min(self.out.len());
+        self.written += n as u64;
         self.out.drain(..n);
         if self.out.is_empty() {
             self.wipe_output();

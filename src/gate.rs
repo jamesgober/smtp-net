@@ -635,7 +635,11 @@ mod domain {
             }
         }
 
-        /// Most domains remembered at once (at least 1).
+        /// Most domains remembered at once (at least 1, default 1,024). A
+        /// domain is forgotten only once it has no count left in the window,
+        /// so a sender cannot reset a domain's count by mailing many others:
+        /// while every remembered domain still has counts, a message to a new
+        /// domain waits (`RetryAfter`) instead.
         #[must_use]
         pub fn max_domains(mut self, n: usize) -> DomainLimit {
             self.max_domains = n.max(1);
@@ -697,13 +701,31 @@ mod domain {
             if !wait.is_zero() {
                 return Admission::RetryAfter(wait);
             }
+            let new = counts
+                .iter()
+                .filter(|(d, _)| !table.contains_key(d))
+                .count();
+            if table.len() + new > self.max_domains {
+                // Room comes only from domains with nothing left in the
+                // window (N-5): evicting a busy one would reset its count.
+                let idle = table
+                    .values_mut()
+                    .map(|e| e.used(bucket))
+                    .filter(|&u| u == 0)
+                    .count();
+                if table.len() + new - idle > self.max_domains {
+                    return Admission::RetryAfter(Duration::from_millis(BUCKET_MS));
+                }
+            }
             for (d, n) in counts {
                 if !table.contains_key(&d) && table.len() >= self.max_domains {
-                    let lru = table
-                        .iter()
-                        .min_by_key(|(_, v)| v.last_used)
-                        .map(|(k, _)| k.clone());
-                    if let Some(k) = lru {
+                    let idle = table
+                        .iter_mut()
+                        .filter_map(|(k, v)| {
+                            (v.used(bucket) == 0).then(|| (v.last_used, k.clone()))
+                        })
+                        .min();
+                    if let Some((_, k)) = idle {
                         table.remove(&k);
                     }
                 }
@@ -812,26 +834,31 @@ mod domain {
         }
 
         #[test]
-        fn test_table_is_bounded_and_keeps_the_busy_domain() {
+        fn test_table_is_bounded_and_never_forgets_a_counted_domain() {
+            // N-5: mailing many other domains cannot push a counted domain
+            // out of the table (which would reset its count); a new domain
+            // waits until a remembered one has nothing left in the window.
             let g = DomainLimit::recipients(1).max_domains(4);
             assert_eq!(g.admit(&env(&["a@busy.example"]), T), Admission::Admit);
-            for i in 0..100u64 {
-                // The busy domain is mailed again each time, so it is never
-                // the one used least recently.
-                assert!(refused(g.admit(&env(&["b@busy.example"]), T + 2 * i + 1)));
-                g.table
-                    .lock()
-                    .unwrap()
-                    .get_mut("busy.example")
-                    .unwrap()
-                    .last_used = T + 2 * i + 1;
+            for i in 0..3u64 {
                 let other = format!("x@d{i}.example");
                 assert_eq!(
-                    g.admit(&env(&[other.as_str()]), T + 2 * i + 2),
+                    g.admit(&env(&[other.as_str()]), T + i + 1),
                     Admission::Admit
                 );
-                assert!(g.table.lock().unwrap().len() <= 4);
             }
+            for i in 3..100u64 {
+                let other = format!("x@d{i}.example");
+                assert!(refused(g.admit(&env(&[other.as_str()]), T + i + 1)));
+                assert!(refused(g.admit(&env(&["b@busy.example"]), T + i + 1)));
+                assert_eq!(g.table.lock().unwrap().len(), 4);
+            }
+            // Once the window (13 buckets of 5 minutes) has passed, every
+            // count has left it: room again.
+            let later = T + 70 * MIN;
+            assert_eq!(g.admit(&env(&["x@new.example"]), later), Admission::Admit);
+            assert_eq!(g.admit(&env(&["b@busy.example"]), later), Admission::Admit);
+            assert!(g.table.lock().unwrap().len() <= 4);
         }
 
         #[test]

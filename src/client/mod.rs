@@ -123,6 +123,10 @@ pub struct Server {
     observer: Option<Arc<dyn Observer>>,
     #[cfg(feature = "dkim")]
     dkim: Vec<crate::DkimSigner>,
+    /// A host refused by the checks `ServerBuilder::build` makes, found by a
+    /// Tier 1 constructor (which returns no `Result`): reported by the
+    /// first connect, before anything is sent.
+    refused: Option<ConfigError>,
 }
 
 /// Most DKIM signers on one server (an RSA and an Ed25519 pair, twice
@@ -189,7 +193,10 @@ impl Server {
     }
 
     fn base(host: &str, security: Security) -> Server {
+        let refused = (host.parse::<IpAddr>().is_err() && Domain::parse(host).is_err())
+            .then_some(ConfigError::InvalidHost);
         Server {
+            refused,
             host: String::from(host),
             port: security.default_port(),
             security,
@@ -246,6 +253,21 @@ impl Server {
     #[must_use]
     pub fn login(mut self, user: &str, password: impl Into<Secret>) -> Server {
         self.auth = Some(Auth::new(Credentials::password(user, password)));
+        self
+    }
+
+    /// Sets a user name and an OAuth 2.0 access token for XOAUTH2 (Gmail,
+    /// Microsoft 365): `Server::starttls("smtp.gmail.com").oauth2(user, token)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let server = smtp_net::Server::starttls("smtp.gmail.com").oauth2("me@gmail.com", "ya29.token");
+    /// assert_eq!(server.port(), smtp_net::PORT_STARTTLS);
+    /// ```
+    #[must_use]
+    pub fn oauth2(mut self, user: &str, token: impl Into<Secret>) -> Server {
+        self.auth = Some(Auth::new(Credentials::oauth2(user, token)));
         self
     }
 
@@ -447,6 +469,7 @@ impl ServerBuilder {
         if s.host.parse::<IpAddr>().is_err() && Domain::parse(&s.host).is_err() {
             return Err(ConfigError::InvalidHost.into());
         }
+        s.refused = None;
         let loopback = is_loopback_host(&s.host);
         match s.security {
             Security::PlaintextLoopback if !loopback => {
@@ -733,6 +756,9 @@ impl Client {
     }
 
     fn open(server: &Server, total: Option<Instant>) -> Result<(Conn, Session), Error> {
+        if let Some(e) = server.refused {
+            return Err(Error::from(e).at(Stage::Connect));
+        }
         let t = &server.timeouts;
         let connect_timeout = match total {
             Some(end) => {

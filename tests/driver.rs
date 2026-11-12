@@ -718,3 +718,39 @@ fn test_refund_gives_back_to_the_admission_time() {
         *times.admitted.lock().unwrap()
     );
 }
+
+#[test]
+fn test_tier1_constructors_check_the_host_like_the_builder() {
+    // N-7: Server::starttls has no Result to return, so a bad host is
+    // reported by the first connect as Config(InvalidHost), as `build`
+    // would have, before anything is resolved or sent.
+    let start = std::time::Instant::now();
+    for server in [
+        Server::starttls("not a host"),
+        Server::implicit_tls("bad..example"),
+    ] {
+        let e = smtp_net::send(&server, &msg("b@example.org")).unwrap_err();
+        assert!(
+            matches!(
+                e.kind(),
+                ErrorKind::Config(smtp_net::ConfigError::InvalidHost)
+            ),
+            "{e}"
+        );
+        assert!(e.is_permanent());
+        assert!(Client::connect(&server).is_err());
+    }
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(Server::starttls("not a host").to_builder().build().is_err());
+}
+
+#[test]
+fn test_oauth2_one_liner_authenticates() {
+    let server = TestServer::builder()
+        .oauth2("me@example.com", "ya29.token")
+        .start()
+        .unwrap();
+    let s = server.server().oauth2("me@example.com", "ya29.token");
+    smtp_net::send(&s, &msg("b@example.org")).unwrap();
+    assert_eq!(server.received()[0].user.as_deref(), Some("me@example.com"));
+}

@@ -131,6 +131,10 @@ pub struct Dsn {
     policy: DsnPolicy,
 }
 
+/// Recipients up to this many are deduplicated by a scan (no allocation);
+/// more go through a sorted set.
+const SCAN_DEDUP: usize = 32;
+
 /// Longest ENVID on the wire, in characters, after xtext encoding (RFC
 /// 3461 4.4: "The ENVID parameter MAY be up to 100 characters").
 const MAX_ENVID: usize = 100;
@@ -255,7 +259,8 @@ impl Envelope {
         Envelope::from_refs(from, to.iter(), limit)
     }
 
-    /// Deduplicates `to` (by mailbox) while copying each address once.
+    /// Deduplicates `to` (by mailbox, as `Address::same_mailbox`) while
+    /// copying each address once.
     pub(crate) fn from_refs<'a>(
         from: Option<Address>,
         to: impl ExactSizeIterator<Item = &'a Address>,
@@ -265,9 +270,24 @@ impl Envelope {
             return Err(BuildError::NoRecipients.into());
         }
         let mut recipients: Vec<Address> = Vec::with_capacity(to.len());
-        for a in to {
-            if !recipients.iter().any(|r| r.same_mailbox(a)) {
-                recipients.push(a.clone());
+        if to.len() <= SCAN_DEDUP {
+            for a in to {
+                if !recipients.iter().any(|r| r.same_mailbox(a)) {
+                    recipients.push(a.clone());
+                }
+            }
+        } else {
+            // Many recipients (a decoded payload may hold 65,535): a sorted
+            // set keeps this O(n log n), where the scan would be O(n^2).
+            let mut seen = alloc::collections::BTreeSet::new();
+            for a in to {
+                let key = (
+                    String::from(a.local_part()),
+                    a.domain().as_str().to_ascii_lowercase(),
+                );
+                if seen.insert(key) {
+                    recipients.push(a.clone());
+                }
             }
         }
         if recipients.len() > usize::from(limit) {
@@ -1013,6 +1033,33 @@ mod tests {
             PreparedMessage::decode(&body).unwrap_err().kind(),
             crate::ErrorKind::Payload(PayloadError::TooLarge)
         ));
+    }
+
+    #[test]
+    fn test_many_recipients_dedup_like_the_scan_and_round_trip() {
+        // N-3: past 32 recipients the set is used; it must agree with the
+        // scan (local part exact, domain case ignored), and a payload of
+        // 20,000 recipients decodes.
+        let mut to: Vec<Address> = (0..20_000)
+            .map(|i| Address::parse(&alloc::format!("u{i}@example.org")).unwrap())
+            .collect();
+        to.push(Address::parse("u7@EXAMPLE.org").unwrap());
+        to.push(Address::parse("U7@example.org").unwrap());
+        let from = Address::parse("a@example.com").unwrap();
+        let env = Envelope::with_limit(Some(from.clone()), &to, u16::MAX).unwrap();
+        assert_eq!(env.recipients().len(), 20_001);
+        assert!(
+            env.recipients()
+                .iter()
+                .any(|a| a.as_str() == "U7@example.org")
+        );
+        let few = [to[7].clone(), to[20_000].clone(), to[20_001].clone()];
+        let small = Envelope::with_limit(Some(from), &few, u16::MAX).unwrap();
+        assert_eq!(small.recipients().len(), 2);
+        let raw = b"From: a@example.com\r\nSubject: x\r\n\r\nbody\r\n".to_vec();
+        let p = PreparedMessage::from_raw(env, raw).unwrap();
+        let back = PreparedMessage::decode(&p.encode()).unwrap();
+        assert_eq!(back.envelope().recipients().len(), 20_001);
     }
 
     #[test]

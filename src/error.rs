@@ -153,6 +153,14 @@ pub enum AddressError {
         /// Byte offset of the problem in the input.
         position: usize,
     },
+    /// A quoted local part holding a space, a tab, or one of `<`, `>`, `@`,
+    /// `=`, `;`, `,`. RFC 5321 allows them, but on a MAIL or RCPT line they
+    /// can read as ESMTP parameters to software that ends the path at the
+    /// first `>` (`"x> NOTIFY=SUCCESS"@example.com`).
+    RiskyQuotedLocalPart {
+        /// Byte offset of the character in the input.
+        position: usize,
+    },
 }
 
 impl fmt::Display for AddressError {
@@ -201,6 +209,10 @@ impl fmt::Display for AddressError {
             AddressError::DisplayNameInvalid { position } => write!(
                 f,
                 "the display name is not valid at byte {position}; quote names that contain punctuation such as , ; : < > @ ( )"
+            ),
+            AddressError::RiskyQuotedLocalPart { position } => write!(
+                f,
+                "the quoted local part holds a space or one of < > @ = ; , at byte {position}, which a relay could read as an ESMTP parameter"
             ),
         }
     }
@@ -1331,6 +1343,7 @@ mod tests {
             AddressError::ControlCharacter { position: 0 }.into(),
             AddressError::InternationalDomainUnsupported.into(),
             AddressError::DisplayNameInvalid { position: 0 }.into(),
+            AddressError::RiskyQuotedLocalPart { position: 0 }.into(),
             HeaderError::ControlCharacter {
                 field: "Subject",
                 position: 3

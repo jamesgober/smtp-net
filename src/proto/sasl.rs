@@ -30,8 +30,38 @@ const MAX_OAUTH_ERROR: usize = 1024;
 /// assert_eq!(format!("{s:?}"), "Secret(<redacted>)");
 /// assert!(!format!("{s}").contains("hunter2"));
 /// ```
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Secret(Zeroizing<Vec<u8>>);
+
+/// Compared in time that depends only on the lengths, not on where the
+/// contents differ (N-4).
+impl PartialEq for Secret {
+    fn eq(&self, other: &Secret) -> bool {
+        let (a, b) = (self.expose(), other.expose());
+        if a.len() != b.len() {
+            return false;
+        }
+        let diff = a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y));
+        core::hint::black_box(diff) == 0
+    }
+}
+impl Eq for Secret {}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::Secret;
+    use alloc::vec;
+
+    #[test]
+    fn test_secret_equality_compares_whole_contents() {
+        let a = Secret::new(vec![1, 2, 3]);
+        assert!(a == Secret::new(vec![1, 2, 3]));
+        assert!(a != Secret::new(vec![1, 2, 4]));
+        assert!(a != Secret::new(vec![0, 2, 3]));
+        assert!(a != Secret::new(vec![1, 2]));
+        assert!(Secret::new(vec![]) == Secret::new(vec![]));
+    }
+}
 
 impl Secret {
     /// A secret holding `bytes`.
