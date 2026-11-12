@@ -34,7 +34,7 @@ const DEFAULT_HEADERS: [&str; 15] = [
 /// the signature (RFC 6376 section 5.4.2; T-20): every default header. A
 /// verifier hashes the bottom-most instances named in `h=`, so a header
 /// that is signed but not oversigned can be added above the signed one
-/// (a second Content-Type, say) and the signature still verifies (D-121).
+/// (a second Content-Type, say) and the signature still verifies.
 const DEFAULT_OVERSIGN: [&str; 15] = DEFAULT_HEADERS;
 
 /// Largest header block signed (64 KiB) **[budget]**.

@@ -132,11 +132,11 @@ The first version timed the whole server-final step, base64 decoding included, a
 
 ### Fixed in 0.7.2
 
-- A send refused while its MAIL and RCPT lines were being queued (DSN parameters that pushed an RCPT line past 512 octets) left the lines already queued. They went out with the next message on the same `Client` or `Pool` connection, and a server that keeps the open transaction on a nested MAIL, as Postfix does, delivered that message to the refused message's recipients as well, while the client reported it failed (T-37). `TestServer` reset the transaction on every MAIL, so the suite could not see it. Found by an independent review.
+- A send refused while its MAIL and RCPT lines were being queued (DSN parameters that pushed an RCPT line past 512 octets) left the lines already queued. They went out with the next message on the same `Client` or `Pool` connection, and a server that keeps the open transaction on a nested MAIL, as Postfix does, delivered that message to the refused message's recipients as well, while the client reported it failed (T-37). `TestServer` reset the transaction on every MAIL, so the suite could not see it.
 
 ### Fixed in 0.8.0
 
-An independent review of 0.7.1 found these, each fixed with a test that failed first:
+Each fixed with a test that failed first:
 
 - Body writes ran under the deadline of the last reply read (`data_init`), not under `data_block`, so a large message over a slow but steady link timed out on every retry (T-13).
 - `Timeouts::total` was documented and never read. It now bounds the whole send, connect and TLS included (T-13).

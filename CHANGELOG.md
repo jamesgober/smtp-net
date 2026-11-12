@@ -13,11 +13,11 @@
 
 ---
 
-## [0.8.0] - 2026-11-11
+## [0.8.0] - 2026-11-12
 
 The first alpha: the same features, with the API simplified before the
-field test, and the findings of an independent review of 0.7.1 fixed.
-Every rename is mapped in `docs/release/v0.8.0.md`.
+field test and a set of bugs fixed. Every rename is mapped in
+`docs/release/v0.8.0.md`.
 
 ### Added
 
@@ -26,7 +26,7 @@ Every rename is mapped in `docs/release/v0.8.0.md`.
 - `ClientName::parse`, and `ConfigError::InvalidClientName`.
 - `Server::oauth2(user, token)`: XOAUTH2 in one line.
 - `AddressError::RiskyQuotedLocalPart`.
-- `dev/SIMPLICITY-AUDIT.md`.
+- `dev/API-0.8.md`: what changed in the API and why.
 
 ### Changed
 

@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_quoted_display_name_may_hold_angle_brackets() {
-        // N-6: the address is the angle address at the end, not whatever
+        // The address is the angle address at the end, not whatever
         // follows the first `<`.
         let m = Mailbox::parse("\"Sales <EU>\" <sales@example.com>").unwrap();
         assert_eq!(m.display_name(), Some("Sales <EU>"));

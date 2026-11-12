@@ -575,7 +575,7 @@ fn test_ehlo_reply_over_1_kib_keeps_every_capability() {
 
 #[test]
 fn test_reply_before_its_command_is_written_closes_the_session() {
-    // N-1: a 220 that arrives with the EHLO reply, while STARTTLS is still
+    // A 220 that arrives with the EHLO reply, while STARTTLS is still
     // unsent, is an injected reply, not the answer to STARTTLS.
     let mut c = loopback();
     c.security = SessionSecurity::StartTlsRequired;

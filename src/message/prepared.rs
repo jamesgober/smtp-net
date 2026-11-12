@@ -1037,7 +1037,7 @@ mod tests {
 
     #[test]
     fn test_many_recipients_dedup_like_the_scan_and_round_trip() {
-        // N-3: past 32 recipients the set is used; it must agree with the
+        // Past 32 recipients the set is used; it must agree with the
         // scan (local part exact, domain case ignored), and a payload of
         // 20,000 recipients decodes.
         let mut to: Vec<Address> = (0..20_000)

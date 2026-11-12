@@ -707,7 +707,7 @@ mod domain {
                 .count();
             if table.len() + new > self.max_domains {
                 // Room comes only from domains with nothing left in the
-                // window (N-5): evicting a busy one would reset its count.
+                // window: evicting a busy one would reset its count.
                 let idle = table
                     .values_mut()
                     .map(|e| e.used(bucket))
@@ -835,7 +835,7 @@ mod domain {
 
         #[test]
         fn test_table_is_bounded_and_never_forgets_a_counted_domain() {
-            // N-5: mailing many other domains cannot push a counted domain
+            // Mailing many other domains cannot push a counted domain
             // out of the table (which would reset its count); a new domain
             // waits until a remembered one has nothing left in the window.
             let g = DomainLimit::recipients(1).max_domains(4);

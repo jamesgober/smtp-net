@@ -721,7 +721,7 @@ fn test_refund_gives_back_to_the_admission_time() {
 
 #[test]
 fn test_tier1_constructors_check_the_host_like_the_builder() {
-    // N-7: Server::starttls has no Result to return, so a bad host is
+    // Server::starttls has no Result to return, so a bad host is
     // reported by the first connect as Config(InvalidHost), as `build`
     // would have, before anything is resolved or sent.
     let start = std::time::Instant::now();

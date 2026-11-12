@@ -34,7 +34,7 @@ const MAX_OAUTH_ERROR: usize = 1024;
 pub struct Secret(Zeroizing<Vec<u8>>);
 
 /// Compared in time that depends only on the lengths, not on where the
-/// contents differ (N-4).
+/// contents differ.
 impl PartialEq for Secret {
     fn eq(&self, other: &Secret) -> bool {
         let (a, b) = (self.expose(), other.expose());

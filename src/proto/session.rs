@@ -499,7 +499,7 @@ impl Session {
     /// buffer first (best effort without unsafe code).
     /// Appends an AUTH line and its CRLF. When the output must grow for
     /// it, the old buffer is wiped before it is freed, so no copy of an
-    /// earlier response is left behind by the reallocation (N-4).
+    /// earlier response is left behind by the reallocation.
     fn push_secret(&mut self, line: &[u8]) {
         let need = self.out.len() + line.len() + 2;
         if need > self.out.capacity() {
@@ -610,7 +610,7 @@ impl Session {
         }
         if p.ends_at > self.written {
             // A reply to a command not yet written: the server (or something
-            // between) answered ahead, as an injected reply would (N-1).
+            // between) answered ahead, as an injected reply would.
             let e = if p.what == Expect::StartTls {
                 Error::new(ErrorKind::StartTlsInjection).at(Stage::StartTls)
             } else {
