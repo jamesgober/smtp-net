@@ -59,7 +59,32 @@ field test. Every rename is mapped in `docs/release/v0.8.0.md`.
   admitted every message, so a caller or combinator that used that method
   had no per-domain limit.
 
----
+## [0.7.2] - 2026-11-11
+
+A security fix. Versions 0.4.0 to 0.7.1 are affected when DSN parameters
+are set on an envelope; upgrade. 0.7.0 and 0.7.1 are yanked.
+
+### Fixed
+
+- A failed transaction could leave commands queued on a pooled
+  connection; the connection is now reset or discarded. A send refused
+  while its MAIL and RCPT lines were being queued (with DSN on, an RCPT
+  line over 512 octets) left the lines already queued, and the next
+  message on the same `Client` or `Pool` connection could be delivered to
+  the refused message's recipients as well, and be reported failed. Every
+  line is now checked before any is queued, and a connection is reused
+  only when nothing is queued or outstanding.
+
+### Changed
+
+- A command line over 512 octets is `Build(CommandTooLong)` (new),
+  permanent, instead of `Usage(Closed)`; `Build(CommandHasControl)` (new)
+  is the last check for CR, LF, or NUL.
+- `Client::is_open` is false while commands or replies are outstanding.
+- `TestServer` answers a MAIL inside an open transaction with `503 5.5.1`
+  and keeps the transaction, as Postfix does.
+- DSN parameters are written straight into the command line, so
+  `Session::begin` allocates nothing with DSN either.
 
 ## [0.7.1] - 2026-11-09
 
@@ -343,7 +368,8 @@ The scaffold and the plan. No functional code yet.
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
 [Unreleased]: https://github.com/jamesgober/smtp-net/compare/v0.8.0...HEAD
-[0.8.0]: https://github.com/jamesgober/smtp-net/compare/v0.7.1...v0.8.0
+[0.8.0]: https://github.com/jamesgober/smtp-net/compare/v0.7.2...v0.8.0
+[0.7.2]: https://github.com/jamesgober/smtp-net/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/jamesgober/smtp-net/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/jamesgober/smtp-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/smtp-net/compare/v0.5.1...v0.6.0

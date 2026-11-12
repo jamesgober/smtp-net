@@ -368,6 +368,13 @@ pub enum BuildError {
     EncodingMismatch,
     /// An invalid DSN parameter.
     InvalidDsn,
+    /// A command line (MAIL or RCPT with its parameters) would pass the
+    /// 512-octet limit of RFC 5321 4.5.3.1.4. Nothing of the transaction
+    /// was sent.
+    CommandTooLong,
+    /// A command line held CR, LF, or NUL. Validated types cannot produce
+    /// one; this is the last check before a line is queued (T-2).
+    CommandHasControl,
 }
 
 impl fmt::Display for BuildError {
@@ -425,6 +432,12 @@ impl fmt::Display for BuildError {
                 f.write_str("the forced transfer encoding does not fit the content")
             }
             BuildError::InvalidDsn => f.write_str("a DSN parameter is not valid"),
+            BuildError::CommandTooLong => f.write_str(
+                "a command line would be longer than 512 octets; shorten the address or leave out the DSN parameters",
+            ),
+            BuildError::CommandHasControl => {
+                f.write_str("a command line held CR, LF, or NUL; nothing was sent")
+            }
         }
     }
 }
@@ -1356,6 +1369,8 @@ mod tests {
             .into(),
             BuildError::EncodingMismatch.into(),
             BuildError::InvalidDsn.into(),
+            BuildError::CommandTooLong.into(),
+            BuildError::CommandHasControl.into(),
             ConfigError::PortZero.into(),
             ConfigError::InvalidHost.into(),
             ConfigError::PlaintextHostNotLoopback.into(),

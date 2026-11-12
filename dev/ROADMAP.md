@@ -85,6 +85,10 @@ Exit: `docs/PLATFORM-NOTES.md` checked against the code and measured where it gi
 - [x] net-io 0.7.1 and tls-net 0.9.0 (D-105).
 - [x] Found writing the notes and fixed test-first: `localhost` on Windows cost 1 s per connect (D-107); `DomainLimit` lost a count after a backward clock step of a whole window (D-106).
 
+## v0.7.2 - Security fix
+Exit: the defect fixed test-first through `Client` and `Pool` against a server that keeps the transaction on a nested MAIL; every gate green; 0.7.0 and 0.7.1 yanked.
+- [x] A refused send left MAIL and RCPT lines queued for the next message on the connection (D-119, T-37).
+
 ## v0.8.x - Alpha
 Exit: the first site sends verification and reset mail through task-io and smtp-net in production for two weeks with every failure classified correctly; interop matrix (Exim, Postfix, Mailpit, Microsoft 365, Gmail) green.
 Depends on: task-io in production and the first site live (James).

@@ -202,6 +202,41 @@ fn test_session_body_and_positive_replies_allocate_nothing() {
 }
 
 #[test]
+fn test_begin_with_dsn_parameters_allocates_nothing() {
+    // ENVID and ORCPT are written as xtext straight into the output, and
+    // every line is measured before any is queued, without a buffer.
+    let mut c = SessionConfig::default();
+    c.security = SessionSecurity::Plaintext {
+        peer_is_loopback: true,
+    };
+    let mut s = Session::new(c, Millis(0)).unwrap();
+    s.receive(b"220 x\r\n", Millis(1)).unwrap();
+    s.transmitted(s.transmit().len());
+    s.receive(b"250-x\r\n250-PIPELINING\r\n250 DSN\r\n", Millis(1))
+        .unwrap();
+    while s.poll_event().is_some() {}
+    let env = Envelope::new(
+        Address::parse("a@example.com").unwrap(),
+        &[
+            Address::parse("b+1@example.org").unwrap(),
+            Address::parse("c=2@example.org").unwrap(),
+        ],
+    )
+    .unwrap()
+    .with_dsn(
+        smtp_net::Dsn::new(smtp_net::DsnNotify::FAILURE)
+            .with_envelope_id("order+42")
+            .unwrap(),
+    );
+    let (n, _) = count(|| s.begin(&env, BodyFlags::default(), 10, Millis(2)).unwrap());
+    assert_eq!(n, 0, "begin with DSN");
+    assert!(
+        s.transmit()
+            .starts_with(b"MAIL FROM:<a@example.com> ENVID=order+2B42\r\n")
+    );
+}
+
+#[test]
 fn test_reply_parser_allocates_once_per_owned_reply() {
     let mut p = ReplyParser::new(ReplyLimits::default(), true);
     let (n, r) = count(|| p.push(b"250-a\r\n250-b\r\n250 2.0.0 c\r\n").unwrap());

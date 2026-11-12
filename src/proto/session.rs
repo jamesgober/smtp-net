@@ -16,7 +16,7 @@ use crate::{
         BuildError, ConfigError, Disposition, Error, ErrorKind, Extension, ProtocolError,
         RejectedRecipient, Stage, UsageError,
     },
-    message::prepared::{DsnPolicy, DsnReturn, Envelope, xtext},
+    message::prepared::{DsnPolicy, DsnReturn, Envelope},
 };
 
 /// Largest pipelined command group written before its replies are read (RFC
@@ -942,7 +942,10 @@ impl Session {
             _ => {}
         }
         if self.pending.is_empty() && self.state == SessionState::InTransaction {
-            self.advance(now)?;
+            if let Err(e) = self.advance(now) {
+                // The server holds an open transaction: never reuse the connection.
+                return Err(self.close(e));
+            }
         }
         Ok(())
     }
@@ -1085,34 +1088,7 @@ impl Session {
         let Some(txn) = self.txn.as_mut() else {
             return Ok(());
         };
-        let mut l = Line::new(&mut self.out);
-        l.put(b"MAIL FROM:").path(txn.envelope.return_path());
-        if caps_size && txn.size > 0 {
-            l.put(b" SIZE=").decimal(txn.size);
-        }
-        if txn.flags.eight_bit {
-            l.put(b" BODY=8BITMIME");
-        }
-        if txn.flags.smtputf8 {
-            l.put(b" SMTPUTF8");
-        }
-        if let Some(d) = txn.envelope.dsn().filter(|_| txn.dsn) {
-            match d.return_content() {
-                Some(DsnReturn::Full) => {
-                    l.put(b" RET=FULL");
-                }
-                Some(DsnReturn::Headers) => {
-                    l.put(b" RET=HDRS");
-                }
-                None => {}
-            }
-            if let Some(id) = d.envelope_id() {
-                let mut x = Vec::with_capacity(id.len() * 3);
-                xtext(id.as_bytes(), &mut x);
-                l.put(b" ENVID=").put(&x);
-            }
-        }
-        l.end()?;
+        write_mail(&mut self.out, txn, caps_size)?;
         txn.mail_queued = true;
         self.group += self.out.len() - start;
         self.expect(Expect::Mail, now);
@@ -1124,42 +1100,34 @@ impl Session {
         let Some(txn) = self.txn.as_mut() else {
             return Ok(());
         };
-        let addr = txn.envelope.recipients().get(i);
-        let mut l = Line::new(&mut self.out);
-        l.put(b"RCPT TO:").path(addr);
-        if let Some(d) = txn.envelope.dsn().filter(|_| txn.dsn) {
-            let n = d.notify();
-            if n.bits() == 0 {
-                l.put(b" NOTIFY=NEVER");
-            } else {
-                l.put(b" NOTIFY=");
-                let mut first = true;
-                for (on, word) in [
-                    (n.success(), &b"SUCCESS"[..]),
-                    (n.failure(), b"FAILURE"),
-                    (n.delay(), b"DELAY"),
-                ] {
-                    if on {
-                        if !first {
-                            l.put(b",");
-                        }
-                        l.put(word);
-                        first = false;
-                    }
-                }
-            }
-            // ORCPT carries the address as given; UTF-8 addresses need RFC 6533 types: omitted.
-            if let Some(a) = addr.filter(|a| !a.needs_smtputf8()) {
-                let mut x = Vec::with_capacity(a.as_str().len() + 8);
-                xtext(a.as_str().as_bytes(), &mut x);
-                l.put(b" ORCPT=rfc822;").put(&x);
-            }
-        }
-        l.end()?;
+        write_rcpt(&mut self.out, txn, i)?;
         txn.next_rcpt = i + 1;
         self.group += self.out.len() - start;
         self.expect(Expect::Rcpt(i), now);
         Ok(())
+    }
+
+    /// Formats the MAIL line and every RCPT line of the transaction and
+    /// removes them again, so a line that cannot be sent is found before
+    /// any line of the transaction is queued. Without this, a refusal half
+    /// way through a pipelined group would leave the earlier lines queued,
+    /// and the next transaction on the connection would join them.
+    fn check_lines(&mut self) -> Result<(), Error> {
+        let caps_size = self.caps.as_ref().is_some_and(|c| c.has(Extension::Size));
+        let Some(txn) = self.txn.as_ref() else {
+            return Ok(());
+        };
+        let start = self.out.len();
+        let mut result = write_mail(&mut self.out, txn, caps_size).map_err(|e| e.at(Stage::Mail));
+        self.out.truncate(start);
+        for i in 0..txn.envelope.recipients().len() {
+            if result.is_err() {
+                break;
+            }
+            result = write_rcpt(&mut self.out, txn, i).map_err(|e| e.at(Stage::Rcpt));
+            self.out.truncate(start);
+        }
+        result
     }
 
     fn finish_transaction(&mut self) {
@@ -1289,8 +1257,11 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// `MessageTooLarge`, `ExtensionRequired(..)` (permanent, nothing sent),
-    /// `Usage(WrongState)`.
+    /// `MessageTooLarge`, `ExtensionRequired(..)`, `Build(CommandTooLong)`
+    /// when the MAIL line or any RCPT line would pass 512 octets (all
+    /// permanent, nothing queued), `Usage(WrongState)`. Every line of the
+    /// transaction is measured before the first is queued, so a refused
+    /// `begin` leaves the session as it found it.
     pub fn begin(
         &mut self,
         envelope: &Envelope,
@@ -1354,8 +1325,17 @@ impl Session {
             },
             end_unsent: None,
         });
+        if let Err(e) = self.check_lines() {
+            self.txn = None;
+            return Err(e);
+        }
         self.state = SessionState::InTransaction;
+        let (out_len, pending_len, group) = (self.out.len(), self.pending.len(), self.group);
         if let Err(e) = self.advance(now) {
+            // Nothing of this transaction may stay queued (see check_lines).
+            self.out.truncate(out_len);
+            self.pending.truncate(pending_len);
+            self.group = group;
             self.txn = None;
             self.state = SessionState::Ready;
             return Err(e);
@@ -1549,6 +1529,71 @@ impl Session {
                 SessionState::Body | SessionState::NeedTls | SessionState::Closed
             )
     }
+}
+
+/// Appends the MAIL line of `txn` to `out`; on refusal nothing is appended.
+fn write_mail(out: &mut Vec<u8>, txn: &Txn, caps_size: bool) -> Result<(), Error> {
+    let mut l = Line::new(out);
+    l.put(b"MAIL FROM:").path(txn.envelope.return_path());
+    if caps_size && txn.size > 0 {
+        l.put(b" SIZE=").decimal(txn.size);
+    }
+    if txn.flags.eight_bit {
+        l.put(b" BODY=8BITMIME");
+    }
+    if txn.flags.smtputf8 {
+        l.put(b" SMTPUTF8");
+    }
+    if let Some(d) = txn.envelope.dsn().filter(|_| txn.dsn) {
+        match d.return_content() {
+            Some(DsnReturn::Full) => {
+                l.put(b" RET=FULL");
+            }
+            Some(DsnReturn::Headers) => {
+                l.put(b" RET=HDRS");
+            }
+            None => {}
+        }
+        if let Some(id) = d.envelope_id() {
+            l.put(b" ENVID=").xtext(id.as_bytes());
+        }
+    }
+    l.end()
+}
+
+/// Appends the RCPT line for recipient `i` of `txn` to `out`; on refusal
+/// nothing is appended.
+fn write_rcpt(out: &mut Vec<u8>, txn: &Txn, i: usize) -> Result<(), Error> {
+    let addr = txn.envelope.recipients().get(i);
+    let mut l = Line::new(out);
+    l.put(b"RCPT TO:").path(addr);
+    if let Some(d) = txn.envelope.dsn().filter(|_| txn.dsn) {
+        let n = d.notify();
+        if n.bits() == 0 {
+            l.put(b" NOTIFY=NEVER");
+        } else {
+            l.put(b" NOTIFY=");
+            let mut first = true;
+            for (on, word) in [
+                (n.success(), &b"SUCCESS"[..]),
+                (n.failure(), b"FAILURE"),
+                (n.delay(), b"DELAY"),
+            ] {
+                if on {
+                    if !first {
+                        l.put(b",");
+                    }
+                    l.put(word);
+                    first = false;
+                }
+            }
+        }
+        // ORCPT carries the address as given; UTF-8 addresses need RFC 6533 types: omitted.
+        if let Some(a) = addr.filter(|a| !a.needs_smtputf8()) {
+            l.put(b" ORCPT=rfc822;").xtext(a.as_str().as_bytes());
+        }
+    }
+    l.end()
 }
 
 /// Appends a constant command line.

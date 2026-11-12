@@ -521,7 +521,7 @@ reused connection fails before anything was accepted.
 | `send(&mut self, &Message) -> Result<Report, Error>` | as the free `send`, on this connection | as `send` |
 | `send_prepared(&mut self, &PreparedMessage) -> Result<Report, Error>` | as the free `send_prepared` | as `send_prepared` |
 | `noop(&mut self) -> Result<(), Error>` | a NOOP, to check the connection | `Timeout`, `Rejected`, `Usage` |
-| `is_open(&self) -> bool`, `capabilities(&self) -> Option<&Capabilities>` | inspection | none |
+| `is_open(&self) -> bool`, `capabilities(&self) -> Option<&Capabilities>` | inspection; `is_open` is true only when the session is ready with nothing queued and no reply outstanding, the one state in which `Client` and `Pool` reuse a connection | none |
 | `close(self) -> Result<(), Error>` | QUIT and close (a dropped client tries QUIT for 1 s) | `Timeout`, `Io` |
 
 ```rust
@@ -674,7 +674,7 @@ All are `#[non_exhaustive]`; match with a `_` arm.
 | `AddressError` | `Empty`, `TooLong { part: AddressPart, length, limit }`, `InvalidLocalPart { position }`, `InvalidDomain { position }`, `LabelTooLong { label }`, `AddressLiteralNotAllowed`, `MissingAt`, `ControlCharacter { position }`, `InternationalDomainUnsupported`, `DisplayNameInvalid { position }` |
 | `AddressPart` | `LocalPart`, `Domain`, `Path` |
 | `HeaderError` | `ControlCharacter`, `InvalidName`, `Reserved`, `LineTooLong`, `InvalidMessageId`, `InvalidDate`, `InvalidUnsubscribe`, `InvalidFileName`, `InvalidContentType`, `InvalidContentId`, `BidiControl`, `AddressLikeDisplayName` |
-| `BuildError` | `MissingFrom`, `MultipleFrom`, `NoRecipients`, `TooManyRecipients { limit }`, `TooMany`, `TooManyParts`, `TooManyHeaders`, `TooLarge`, `DepthExceeded`, `InlineWithoutHtml`, `DuplicateContentId`, `BareCarriageReturn`, `BareLineFeed`, `LineTooLong`, `NoHeaderBlock`, `LengthMismatch`, `EncodingMismatch`, `InvalidDsn` |
+| `BuildError` | `MissingFrom`, `MultipleFrom`, `NoRecipients`, `TooManyRecipients { limit }`, `TooMany`, `TooManyParts`, `TooManyHeaders`, `TooLarge`, `DepthExceeded`, `InlineWithoutHtml`, `DuplicateContentId`, `BareCarriageReturn`, `BareLineFeed`, `LineTooLong`, `NoHeaderBlock`, `LengthMismatch`, `EncodingMismatch`, `InvalidDsn`, `CommandTooLong` (a MAIL or RCPT line over its limit; nothing of the transaction was queued), `CommandHasControl` (CR, LF, or NUL in a command line; the last check, T-2) |
 | `ConfigError` | `PortZero`, `InvalidHost`, `PlaintextHostNotLoopback`, `BufferTooSmall`, `TlsConnectorMissing`, `TooManyMechanisms`, `InsecureNotAllowed`, `AuthWithPlaintextRemote`, `TooManyDkimSigners`, `PoolSize`, `InvalidClientName` |
 | `UsageError` | `WrongState { state: SessionState }`, `Closed` |
 | `ProtocolError` | `MalformedReply`, `InconsistentReply`, `ReplyTooLong`, `BareLineFeed`, `Nul`, `UnexpectedReply`, `MalformedCapability` |
@@ -951,7 +951,7 @@ in milliseconds), writes out what it queues, and acts on its events.
 | `deadline(&self) -> Option<Millis>`, `on_timeout(&mut self, now: Millis)` | when the current stage times out, and the call when it has |
 | `connection_lost(&mut self, cause: ErrorKind) -> Error` | the transport closed or failed; returns the classified error |
 | `tls_established(&mut self, info: TlsInfo, now: Millis)` | the TLS handshake finished |
-| `begin(&mut self, envelope: &Envelope, flags: BodyFlags, size: u64, now: Millis)` | starts a transaction (`MessageTooLarge`, `ExtensionRequired`, `Usage`) |
+| `begin(&mut self, envelope: &Envelope, flags: BodyFlags, size: u64, now: Millis)` | starts a transaction; every MAIL and RCPT line is measured before the first is queued, so a refusal leaves the session as it was (`MessageTooLarge`, `ExtensionRequired`, `Build(CommandTooLong)`, `Usage`) |
 | `body(&mut self, chunk: &[u8], now: Millis) -> Result<usize, Error>`, `end_body(&mut self, now: Millis)` | the message bytes (dot-stuffed or chunked by the session) |
 | `reset`, `noop`, `quit` (each `(&mut self, now: Millis)`) | RSET, NOOP, QUIT |
 | `state`, `capabilities`, `is_secure`, `is_authenticated`, `tls_protocol`, `wants_read` | inspection |
@@ -1191,7 +1191,7 @@ Feature `testing`.
 
 | Item | Does |
 |---|---|
-| `TestServer::start()`, `TestServer::builder() -> TestServerBuilder` | a loopback SMTP server on a free port, in its own thread |
+| `TestServer::start()`, `TestServer::builder() -> TestServerBuilder` | a loopback SMTP server on a free port, in its own thread; like Postfix, it answers a MAIL inside an open transaction with `503 5.5.1` and keeps the transaction |
 | `TestServer::{port, server, server_builder}` | where it listens; a `Server` (or builder) pointing at it |
 | `TestServer::{received, transcript, messages, connections, client_waits}` | what it received and how |
 | `TestServerBuilder::{extensions(&[&str]), fault(Fault), refuse_ehlo, starttls, implicit_tls, tls_name, tls_engine, auth(user, password), oauth2(user, token), record(bool), start}` | what it offers and how it misbehaves |
@@ -1291,6 +1291,7 @@ Each change is recorded in `dev/PLAN.md` section 19.
 | 0.7.0 | Test support: `TestServerBuilder::record`, `TestServer::messages` | D-095 |
 | 0.7.1 | Connects race the resolved addresses (250 ms, 100 ms for loopback); no API change | D-107 |
 | 0.7.1 | `DomainLimit` keeps a newer bucket's count after a backward clock step; no API change | D-106 |
+| 0.7.2 | A refused MAIL or RCPT line queues nothing; new `BuildError::{CommandTooLong, CommandHasControl}` (were `Usage(Closed)`); `Client::is_open` is false while commands or replies are outstanding; `TestServer` answers a nested MAIL with `503` and keeps the transaction | D-119 |
 | 0.8.0 | The root keeps what an application uses; the sans-IO core moves to `protocol`, MIME parts, encoders, sinks, and randomness to `mime`, the canonicalizers to `dkim`, test support to `testing` | D-110 |
 | 0.8.0 | `SendGate` is `admit(&Envelope, now)` and `refund(&Envelope, now)` only (the count pair and `admit_envelope`/`refund_envelope` are gone) | D-111 |
 | 0.8.0 | `ServerBuilder::tls(impl TlsConnector)` replaces `tls(TlsClient)` and `tls_connector` | D-112 |

@@ -1700,6 +1700,12 @@ fn serve(
                     c.reply(stage, "535 5.7.8 authentication failed")?;
                 }
             }
+            Stage::Mail if from.is_some() => {
+                // RFC 5321 3.3: MAIL inside an open transaction. Answered as
+                // Postfix does, keeping the open transaction, so a client
+                // that leaves commands queued is caught.
+                c.reply(stage, "503 5.5.1 nested MAIL command")?;
+            }
             Stage::Mail => {
                 let path = between(&line, '<', '>');
                 let params: Vec<String> = line

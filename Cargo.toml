@@ -141,6 +141,10 @@ name = "pool"
 required-features = ["testing"]
 
 [[test]]
+name = "crosstalk"
+required-features = ["testing"]
+
+[[test]]
 name = "dkim"
 required-features = ["testing", "dkim"]
 

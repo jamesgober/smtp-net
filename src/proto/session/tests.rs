@@ -399,3 +399,111 @@ fn test_auth_output_wiped_after_transmit() {
     assert!(s.out.iter().all(|&b| b == 0) || s.out.is_empty());
     assert!(!s.secret_out);
 }
+
+/// 64 + 1 + 182 octets: with DSN its RCPT line passes 512 octets.
+fn long_address() -> Address {
+    let domain = format!(
+        "{}.{}.{}.com",
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(50)
+    );
+    Address::parse(&format!("{}@{domain}", "a".repeat(64))).unwrap()
+}
+
+fn dsn_envelope(to: &[Address]) -> Envelope {
+    use crate::message::prepared::{Dsn, DsnNotify};
+    Envelope::new(Address::parse("a@example.com").unwrap(), to)
+        .unwrap()
+        .with_dsn(Dsn::new(DsnNotify::FAILURE))
+}
+
+fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+#[test]
+fn test_begin_refusing_a_long_rcpt_queues_nothing() {
+    // A failed begin must leave no MAIL or RCPT line queued, or the next
+    // transaction on the connection joins it (with and without PIPELINING).
+    for caps in [
+        &b"250-mx\r\n250-PIPELINING\r\n250-CHUNKING\r\n250 DSN\r\n"[..],
+        b"250-mx\r\n250 DSN\r\n",
+    ] {
+        let mut s = ready(caps);
+        let to = [Address::parse("first@example.org").unwrap(), long_address()];
+        let e = s
+            .begin(&dsn_envelope(&to), BodyFlags::default(), 10, Millis(3))
+            .unwrap_err();
+        assert!(matches!(
+            e.kind(),
+            ErrorKind::Build(BuildError::CommandTooLong)
+        ));
+        assert_eq!(e.stage(), Some(Stage::Rcpt));
+        assert!(e.is_permanent());
+        assert!(s.transmit().is_empty());
+        assert!(!s.wants_read());
+        assert_eq!(s.state(), SessionState::Ready);
+        assert!(s.poll_event().is_none());
+
+        let next = Envelope::new(
+            Address::parse("a@example.com").unwrap(),
+            &[Address::parse("b@example.org").unwrap()],
+        )
+        .unwrap();
+        s.begin(&next, BodyFlags::default(), 10, Millis(4)).unwrap();
+        let out = drain(&mut s);
+        assert_eq!(count(&out, b"MAIL FROM:"), 1);
+        assert_eq!(count(&out, b"first@example.org"), 0);
+    }
+}
+
+#[test]
+fn test_begin_refusing_a_long_mail_line_queues_nothing() {
+    use crate::message::prepared::{Dsn, DsnNotify};
+    let mut s = ready(b"250-mx\r\n250-PIPELINING\r\n250 DSN\r\n");
+    let from = long_address();
+    // 100 characters that each need xtext: 300 octets of ENVID.
+    let dsn = Dsn::new(DsnNotify::FAILURE)
+        .with_envelope_id(&"+".repeat(100))
+        .unwrap();
+    let env = Envelope::new(from, &[Address::parse("b@example.org").unwrap()])
+        .unwrap()
+        .with_dsn(dsn);
+    let e = s
+        .begin(&env, BodyFlags::default(), 10, Millis(3))
+        .unwrap_err();
+    assert!(matches!(
+        e.kind(),
+        ErrorKind::Build(BuildError::CommandTooLong)
+    ));
+    assert_eq!(e.stage(), Some(Stage::Mail));
+    assert!(s.transmit().is_empty());
+    assert!(!s.wants_read());
+    assert_eq!(s.state(), SessionState::Ready);
+}
+
+#[test]
+fn test_dsn_parameters_are_written_as_xtext_into_the_line() {
+    // ENVID and ORCPT go through xtext straight into the line.
+    let mut s = ready(b"250-mx\r\n250-PIPELINING\r\n250 DSN\r\n");
+    let dsn = crate::message::prepared::Dsn::new(crate::message::prepared::DsnNotify::FAILURE)
+        .with_envelope_id("order+42")
+        .unwrap();
+    let env = Envelope::new(
+        Address::parse("a@example.com").unwrap(),
+        &[Address::parse("x+y@example.org").unwrap()],
+    )
+    .unwrap()
+    .with_dsn(dsn);
+    s.begin(&env, BodyFlags::default(), 10, Millis(3)).unwrap();
+    let out = drain(&mut s);
+    assert_eq!(
+        out,
+        b"MAIL FROM:<a@example.com> ENVID=order+2B42\r\nRCPT TO:<x+y@example.org> NOTIFY=FAILURE ORCPT=rfc822;x+2By@example.org\r\nDATA\r\n"
+            .as_slice()
+    );
+}

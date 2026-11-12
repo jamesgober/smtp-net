@@ -7,7 +7,8 @@ use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::{
     address::{Address, Domain},
-    error::{AddressError, Error, ErrorKind, UsageError},
+    error::{AddressError, BuildError, Error},
+    message::prepared::xtext,
 };
 
 /// Longest command line, including CRLF (RFC 5321 4.5.3.1.4).
@@ -128,6 +129,12 @@ impl<'a> Line<'a> {
         }
     }
 
+    /// Appends `bytes` as RFC 3461 xtext, written straight into the line.
+    pub(crate) fn xtext(&mut self, bytes: &[u8]) -> &mut Self {
+        xtext(bytes, self.out);
+        self
+    }
+
     pub(crate) fn path(&mut self, a: Option<&Address>) -> &mut Self {
         self.put(b"<");
         if let Some(a) = a {
@@ -138,14 +145,23 @@ impl<'a> Line<'a> {
 
     /// Ends the line with CRLF after the shadow check; on failure the line
     /// is removed and nothing is queued.
+    ///
+    /// # Errors
+    ///
+    /// `Build(CommandHasControl)` when the line holds CR, LF, or NUL;
+    /// `Build(CommandTooLong)` when it passes 512 octets. Both permanent.
     pub(crate) fn end(self) -> Result<(), Error> {
         let line = self.out.get(self.start..).unwrap_or(&[]);
-        let bad = line.iter().any(|&b| b == b'\r' || b == b'\n' || b == 0)
-            || line.len() + 2 > MAX_COMMAND_LINE;
-        if bad {
+        let refused = if line.iter().any(|&b| b == b'\r' || b == b'\n' || b == 0) {
+            Some(BuildError::CommandHasControl)
+        } else if line.len() + 2 > MAX_COMMAND_LINE {
+            Some(BuildError::CommandTooLong)
+        } else {
+            None
+        };
+        if let Some(b) = refused {
             self.out.truncate(self.start);
-            return Err(Error::new(ErrorKind::Usage(UsageError::Closed))
-                .with_disposition(crate::Disposition::Permanent));
+            return Err(Error::from(b).with_disposition(crate::Disposition::Permanent));
         }
         self.out.extend_from_slice(b"\r\n");
         Ok(())

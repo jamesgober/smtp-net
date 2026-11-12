@@ -71,6 +71,7 @@ Every row has at least one test that must fail to get through. Paths are relativ
 | T-34 | Reset links in transcripts | the test server's transcript never holds a body | `tests/threats.rs` `t34_transcript_omits_bodies` | none |
 | T-35 | Bidirectional overrides in Subject or names | U+202A to U+202E and U+2066 to U+2069 refused in the Subject and display names unless `allow_bidi_controls` | `tests/threats.rs` `t35_bidi_controls` | one scan |
 | T-36 | Over-long header lines split by receivers | hard 998 limit; folding only at whitespace; refusal when impossible | `src/message/header.rs` `test_unstructured_unbreakable_over_998_refused`; `src/message/tests.rs` `test_subject_long_folds_and_unbreakable_refused` | none |
+| T-37 | A refused transaction leaves commands queued, and the next message on the connection joins it (to the earlier recipients) | every MAIL and RCPT line is measured before the first is queued, and a refused `begin` restores the queue; a later refusal closes the session; a client reuses, or sends QUIT on, a connection only when nothing is queued or outstanding; `TestServer` keeps the open transaction on a nested MAIL, as Postfix does | `tests/crosstalk.rs` (client and pool, BDAT and DATA); `src/proto/session/tests.rs` `test_begin_refusing_a_long_rcpt_queues_nothing`, `test_begin_refusing_a_long_mail_line_queues_nothing` | each MAIL and RCPT line formatted twice: about 40 ns per line **[est.]**, no allocation |
 
 ## Hardening record (0.7)
 
@@ -128,6 +129,10 @@ The first version timed the whole server-final step, base64 decoding included, a
 
 - A reply whose class cannot answer its command was taken as a refusal. Under pipelining, an extra reply from a server put the replies out of step, and a `250` matched to DATA became a permanent `Rejected`, so a job queue would dead-letter a good message. It is now `Protocol(UnexpectedReply)`, temporary, the session closes, and after the end of data the message is possibly delivered (T-14).
 - The loom models of `HourlyLimit` and the pool's slot bitmap were never run in CI. They are now (job `loom`).
+
+### Fixed in 0.7.2
+
+- A send refused while its MAIL and RCPT lines were being queued (DSN parameters that pushed an RCPT line past 512 octets) left the lines already queued. They went out with the next message on the same `Client` or `Pool` connection, and a server that keeps the open transaction on a nested MAIL, as Postfix does, delivered that message to the refused message's recipients as well, while the client reported it failed (T-37). `TestServer` reset the transaction on every MAIL, so the suite could not see it. Found by an independent review.
 
 ### Added in 0.7
 
