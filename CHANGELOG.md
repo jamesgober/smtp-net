@@ -16,13 +16,16 @@
 ## [0.8.0] - 2026-11-11
 
 The first alpha: the same features, with the API simplified before the
-field test. Every rename is mapped in `docs/release/v0.8.0.md`.
+field test, and the findings of an independent review of 0.7.1 fixed.
+Every rename is mapped in `docs/release/v0.8.0.md`.
 
 ### Added
 
 - `RejectedRecipient`: the address, reply, and disposition of a refused
   recipient, returned by both `Report::rejected` and `Error::rejected`.
 - `ClientName::parse`, and `ConfigError::InvalidClientName`.
+- `Server::oauth2(user, token)`: XOAUTH2 in one line.
+- `AddressError::RiskyQuotedLocalPart`.
 - `dev/SIMPLICITY-AUDIT.md`.
 
 ### Changed
@@ -47,6 +50,22 @@ field test. Every rename is mapped in `docs/release/v0.8.0.md`.
   to `return_path` and `dsn`.
 - `docs/API.md` covers every public item by task; its examples and the
   README's compile as doctests.
+- `SendGate::refund` takes the time of the admission it refunds.
+- `Address::parse` refuses a quoted local part with a space or one of
+  `< > @ = ; ,`, which could read as ESMTP parameters on the RCPT line.
+- DKIM oversigns every default header (Content-Type, MIME-Version,
+  Sender, List-Unsubscribe and the rest), and signs Sender when present.
+- On MAIL and RCPT the 512-octet limit holds the command and path, and the
+  ESMTP parameters have their RFC allowances; an ORCPT over 500
+  characters is left out. ENVID's 100 characters are measured as sent.
+- Attachment file names refuse bidirectional overrides and zero-width
+  characters unless `allow_bidi_controls`; the address-like display-name
+  policy also refuses the full-width and small at signs.
+- A reply that arrives before its command was written closes the session.
+- `DomainLimit` forgets only domains with no count left; a new domain waits
+  while none is free.
+- `Mailbox` displays on one line.
+- net-io 0.7.2 and tls-net 0.9.1 (net-io 0.7.0 and 0.7.1 are yanked).
 
 ### Removed
 
@@ -58,6 +77,21 @@ field test. Every rename is mapped in `docs/release/v0.8.0.md`.
 - A `DomainLimit` reached through the count-based `SendGate::admit`
   admitted every message, so a caller or combinator that used that method
   had no per-domain limit.
+- Writing the body ran under the deadline of the last reply read, not under
+  `Timeouts::data_block`, so a large message over a slow link timed out on
+  every retry.
+- `Timeouts::total` was never applied; it now bounds the whole send.
+- A long display name gave a header line over 998 octets, and the job
+  payload of such a message could not be decoded.
+- An EHLO reply over 1 KiB was cut before its capabilities were read.
+- A gate refund in a later minute than its admission was lost.
+- `ReplyLimits::max_lines = u16::MAX` overflowed the line counter.
+- `Mailbox::parse` refused a quoted `<` in a display name.
+- Decoding a payload of many recipients took quadratic time.
+- The output buffer could be freed unwiped when it grew for an AUTH line;
+  `Secret` compared in variable time.
+- `Server::starttls` and the other one-line constructors did not check the
+  host; the first connect now returns `Config(InvalidHost)`.
 
 ## [0.7.2] - 2026-11-11
 

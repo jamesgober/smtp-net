@@ -45,15 +45,19 @@ pub struct Timeouts {
     pub rcpt: Duration,
     /// The `354` reply to DATA (2 min, 4.5.3.2.4).
     pub data_init: Duration,
-    /// Each block of body data written (3 min, 4.5.3.2.5).
+    /// Each block of body data written (3 min, 4.5.3.2.5): the deadline is
+    /// renewed for every block, so a slow but steady upload is not cut off.
     pub data_block: Duration,
     /// The reply to the end of the data (10 min, 4.5.3.2.6).
     pub data_end: Duration,
     /// How long a reused connection may sit idle before it is closed (60 s,
     /// below the server's 5 min of 4.5.3.2.7).
     pub idle: Duration,
-    /// An optional bound on a whole send; `None` by default (the job system's
-    /// deadline bounds it).
+    /// An optional bound on a whole send (connect, TLS, AUTH, and every
+    /// transaction; for a `Pool`, from before the connect); `None` by
+    /// default. When it runs out first the error is `Timeout` at
+    /// `Stage::Total`. The blocking client applies it; a sans-IO driver
+    /// applies its own.
     pub total: Option<Duration>,
 }
 

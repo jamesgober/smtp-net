@@ -222,8 +222,8 @@ assert!(!String::from_utf8_lossy(&msg.to_bytes()?).contains("archive@example.com
 | `auto_submitted(AutoSubmitted)` | `Auto-Submitted` (RFC 3834) | none |
 | `body(Part)` | a whole body tree in place of text, HTML, and attachments | none |
 | `allow_8bit(bool)` | send 8-bit text unencoded when the server offers 8BITMIME | none |
-| `allow_bidi_controls(bool)` | accept bidi overrides and isolates in the Subject and display names (refused by default) | none |
-| `refuse_address_like_display_names(bool)` | refuse a display name that looks like another address | none |
+| `allow_bidi_controls(bool)` | accept bidi overrides and isolates in the Subject and display names, and those and the zero-width and direction marks (U+200B to U+200F, U+FEFF) in attachment file names (all refused by default) | none |
+| `refuse_address_like_display_names(bool)` | refuse a display name holding `@`, `＠` (U+FF20), or `﹫` (U+FE6B), which looks like another address | none |
 | `limits(MessageLimits)` | the budgets below | none |
 | `build() -> Result<Message, Error>` | the message, with the OS clock and random source (`std`) | `Build(MissingFrom / NoRecipients / ...)`, `Random` |
 | `build_with(random: &mut dyn RandomSource, now_unix: u64)` | the same with caller-supplied randomness and time (`no_std`, deterministic tests) | as `build` |
@@ -341,7 +341,10 @@ assert!(matches!(err.kind(), smtp_net::ErrorKind::Build(smtp_net::BuildError::To
 | `Domain::parse(input: &str)` | a domain name (no literal) | `AddressError` |
 | `Domain::{as_str, is_ascii, is_literal, eq_ignore_case}` | inspection | none |
 
-`Address` and `Mailbox` also implement `TryFrom<&str>` and `Display`.
+`Address` and `Mailbox` also implement `TryFrom<&str>` and `Display`. A
+`Mailbox` displays in its header form on one line (no line breaks, so a
+log line stays one line). The angle address of `Mailbox::parse` is the
+last `<...>`, so a quoted display name may hold `<` (`"Sales <EU>" <s@example.com>`).
 Equality on `Address` compares the whole address; the local part is case
 sensitive (RFC 5321), the domain is not.
 
@@ -370,9 +373,15 @@ clone; build one and share it.
 | `Server::implicit_tls(host: &str)` | 465 | TLS from the first byte | `Timeouts::rfc5321()` |
 | `Server::builder(host: &str, security: Security) -> ServerBuilder` | by security | as given | by security |
 | `server.login(user: &str, password: impl Into<Secret>) -> Server` | | adds a password (SCRAM-SHA-256 when offered and built, else PLAIN, then LOGIN) | |
+| `server.oauth2(user: &str, token: impl Into<Secret>) -> Server` | | adds an OAuth 2.0 access token for XOAUTH2 (Gmail, Microsoft 365) | |
 | `server.to_builder() -> ServerBuilder` | | starts a builder from this server | |
 
 Accessors: `host()`, `port()`, `security()`, `timeouts()`.
+
+These constructors return a `Server`, not a `Result`, so they make the
+host check of `ServerBuilder::build` on the first connect instead: a host
+that is neither a domain name nor an IP address fails with
+`Config(InvalidHost)`, permanent, before anything is resolved or sent.
 
 `Security` is `PlaintextLoopback`, `StartTls`, or `ImplicitTls`. There is no
 opportunistic mode: TLS is required whenever the host is not loopback.
@@ -381,6 +390,9 @@ opportunistic mode: TLS is required whenever the host is not loopback.
 use smtp_net::{Security, Server};
 let relay = Server::starttls("smtp.example.com").login("no-reply@example.com", "app-password");
 assert_eq!((relay.port(), relay.security()), (587, Security::StartTls));
+# let access_token = String::from("ya29.token");
+let gmail = Server::starttls("smtp.gmail.com").oauth2("no-reply@example.com", access_token);
+assert_eq!(gmail.port(), 587);
 assert_eq!(Server::implicit_tls("smtp.example.com").port(), 465);
 assert!(Server::builder("smtp.example.com", Security::PlaintextLoopback).build().is_err());
 ```
@@ -445,10 +457,13 @@ The default allowlist depends on the credential kind: a password tries
 `AuthUnavailable` before anything is sent.
 
 ```rust
-use smtp_net::{Credentials, Security, Server};
+use smtp_net::{Credentials, MechanismName, Security, Server};
 # let access_token = String::from("ya29.token");
+// The one-line form is Server::starttls(host).oauth2(user, token); the
+// builder takes the same credentials with other settings.
 let gmail = Server::builder("smtp.gmail.com", Security::StartTls)
     .credentials(Credentials::oauth2("no-reply@example.com", access_token))
+    .mechanisms(&[MechanismName::XOAuth2])
     .build()?;
 # let _ = gmail;
 # Ok::<(), smtp_net::Error>(())
@@ -462,7 +477,13 @@ example `"401"` for an expired token: the cue to refresh it and retry.
 `Timeouts` holds one `Duration` per stage (public fields; the type is
 `#[non_exhaustive]`): `connect`, `greeting`, `command`, `tls_handshake`,
 `mail`, `rcpt`, `data_init`, `data_block`, `data_end`, `idle`, and
-`total: Option<Duration>`.
+`total: Option<Duration>`. Each stage deadline counts from the command
+and is not reset per byte; writing the body runs under `data_block`,
+renewed for every block written. `total`, when set, bounds the whole send
+(connect, TLS, AUTH, and every transaction, and for a `Pool` from before
+the connect): whichever deadline comes first applies, and when `total` is
+the one that runs out the error is `Timeout` at `Stage::Total`
+(temporary, `possibly_delivered` once the end of the data was written).
 
 | Constructor | Values |
 |---|---|
@@ -671,7 +692,7 @@ All are `#[non_exhaustive]`; match with a `_` arm.
 
 | Nested enum | Variants |
 |---|---|
-| `AddressError` | `Empty`, `TooLong { part: AddressPart, length, limit }`, `InvalidLocalPart { position }`, `InvalidDomain { position }`, `LabelTooLong { label }`, `AddressLiteralNotAllowed`, `MissingAt`, `ControlCharacter { position }`, `InternationalDomainUnsupported`, `DisplayNameInvalid { position }` |
+| `AddressError` | `Empty`, `TooLong { part: AddressPart, length, limit }`, `InvalidLocalPart { position }`, `InvalidDomain { position }`, `LabelTooLong { label }`, `AddressLiteralNotAllowed`, `MissingAt`, `ControlCharacter { position }`, `InternationalDomainUnsupported`, `DisplayNameInvalid { position }`, `RiskyQuotedLocalPart { position }` (a quoted local part with a space or one of `< > @ = ; ,`, which could read as ESMTP parameters on a MAIL or RCPT line) |
 | `AddressPart` | `LocalPart`, `Domain`, `Path` |
 | `HeaderError` | `ControlCharacter`, `InvalidName`, `Reserved`, `LineTooLong`, `InvalidMessageId`, `InvalidDate`, `InvalidUnsubscribe`, `InvalidFileName`, `InvalidContentType`, `InvalidContentId`, `BidiControl`, `AddressLikeDisplayName` |
 | `BuildError` | `MissingFrom`, `MultipleFrom`, `NoRecipients`, `TooManyRecipients { limit }`, `TooMany`, `TooManyParts`, `TooManyHeaders`, `TooLarge`, `DepthExceeded`, `InlineWithoutHtml`, `DuplicateContentId`, `BareCarriageReturn`, `BareLineFeed`, `LineTooLong`, `NoHeaderBlock`, `LengthMismatch`, `EncodingMismatch`, `InvalidDsn`, `CommandTooLong` (a MAIL or RCPT line over its limit; nothing of the transaction was queued), `CommandHasControl` (CR, LF, or NUL in a command line; the last check, T-2) |
@@ -782,7 +803,7 @@ RFC 3461 delivery status notification parameters.
 |---|---|
 | `Dsn::new(notify: DsnNotify) -> Dsn` | `NOTIFY` on every recipient, no `RET`, no `ENVID`, policy `IfSupported` |
 | `with_return_content(self, DsnReturn)`, `return_content(&self)` | `RET`: `Full` or `Headers` |
-| `with_envelope_id(self, &str) -> Result<Dsn, Error>`, `envelope_id(&self)` | `ENVID`: printable ASCII, at most 100 characters (`Build(InvalidDsn)`) |
+| `with_envelope_id(self, &str) -> Result<Dsn, Error>`, `envelope_id(&self)` | `ENVID`: printable ASCII, at most 100 characters as sent in xtext, where `+`, `=`, and a space take three each (`Build(InvalidDsn)`) |
 | `with_policy(self, DsnPolicy)`, `policy(&self)` | `IfSupported` sends without DSN when the server lacks it; `Required` fails with `ExtensionRequired(Dsn)` |
 | `notify(&self) -> DsnNotify` | |
 | `DsnNotify::{NEVER, SUCCESS, FAILURE, DELAY}`, combined with `\|`; `success()`, `failure()`, `delay()` | |
@@ -812,7 +833,7 @@ Feature `dkim`. Sign with Ed25519-SHA256 (RFC 8463) and RSA-SHA256 (RFC
 | `DkimKey::rsa_from_pem(&str)`, `rsa_from_der(&[u8])` | an RSA key (PKCS#1 or PKCS#8) | `KeyFormat`, `KeyTooSmall`, `KeyTooLarge` |
 | `DkimKey::{algorithm, rsa_bits}` | inspection | none |
 | `DkimKey::dns_record(&self) -> String` | the TXT record to publish at `<selector>._domainkey.<domain>` | none |
-| `DkimSigner::new(domain: &str, selector: &str, key: DkimKey)` | relaxed/relaxed, From and the usual headers signed and oversigned | `InvalidDomain`, `InvalidSelector` |
+| `DkimSigner::new(domain: &str, selector: &str, key: DkimKey)` | relaxed/relaxed; From, To, Cc, Subject, Date, Message-ID, Reply-To, Sender, In-Reply-To, References, MIME-Version, Content-Type, Content-Transfer-Encoding, List-Unsubscribe, and List-Unsubscribe-Post signed when present and all oversigned, so none can be added after signing | `InvalidDomain`, `InvalidSelector` |
 | `canonicalization(self, header: Canonicalization, body: Canonicalization)` | `Simple` or `Relaxed` | none |
 | `headers(self, &[&str])`, `oversign(self, &[&str])` | the signed and oversigned header names | `InvalidHeaderName` |
 | `expiry(self, seconds: u32)` | `x=` | none |
@@ -859,9 +880,13 @@ refusal fails the send with `Throttled` (temporary, nothing sent) and
 ```rust,ignore
 pub trait SendGate: Send + Sync {
     fn admit(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission;
-    fn refund(&self, envelope: &Envelope, now_unix_ms: u64) { /* keeps the allowance */ }
+    fn refund(&self, envelope: &Envelope, admitted_unix_ms: u64) { /* keeps the allowance */ }
 }
 ```
+
+`refund` gets the time that was passed to the `admit` it refunds, not the
+time of the failure, so the allowance goes back to the window it came
+from even when the send failed minutes later.
 
 `Admission` is `Admit` or `RetryAfter(Duration)`. A pair `(A, B)` is a gate
 that admits only what both admit, and refunds the first when the second
@@ -873,7 +898,7 @@ counts on the host's clock.
 | `HourlyLimit::messages(per_hour: u32)`, `HourlyLimit::recipients(per_hour: u32)` | a rolling 60-minute limit, lock-free; `unit() -> CountUnit` (`Messages` or `Recipients`) |
 | `HourlyLimit::remaining(&self, now_unix_ms: u64) -> u32` | what is left in the window |
 | `DomainLimit::recipients(per_hour: u32)` | at most `per_hour` recipients per recipient domain in any 60 minutes (feature `std`) |
-| `DomainLimit::max_domains(self, n: usize)` | most domains remembered (1,024); the least recently used is forgotten |
+| `DomainLimit::max_domains(self, n: usize)` | most domains remembered (1,024); only a domain with no count left in the window is forgotten, so while every remembered domain has counts a message to a new domain waits (`RetryAfter`) |
 | `DomainLimit::remaining(&self, domain: &str, now_unix_ms: u64) -> u32` | what `domain` has left |
 
 ```rust
@@ -1008,11 +1033,11 @@ assert!(matches!(s.poll_event(), Some(Event::Ready { secure: false, authenticate
 |---|---|
 | `ReplyParser::new(limits: ReplyLimits, enhanced: bool)` | a streaming parser (`enhanced`: the server advertised ENHANCEDSTATUSCODES) |
 | `ReplyParser::push(&mut self, input: &[u8]) -> Result<(usize, Option<Reply>), ProtocolError>`, `is_partial` | consumes input, returns a reply when one is complete |
-| `ReplyLimits { max_line: u16, max_lines: u16, max_total: u32 }` | 1000, 64, 8192 by default |
+| `ReplyLimits { max_line: u16, max_lines: u16, max_total: u32 }` | 1000, 64, 8192 by default; a reply keeps 1 KiB of text, an EHLO reply all of it up to `max_total` |
 | `TextLossy<'_>` | the `Display` from `Reply::text_lossy` |
 | `Capabilities::parse(ehlo: &Reply)` (at the root) | the EHLO capabilities |
 | `Capabilities::{has(Extension), size_limit, auth_mechanism_names, unknown, unknown_count}` | inspection |
-| `MAX_COMMAND_LINE` (512), `MAX_TEXT_LINE` (1000), `MAX_AUTH_LINE` (12,288) | RFC limits, in octets with CRLF |
+| `MAX_COMMAND_LINE` (512), `MAX_TEXT_LINE` (1000), `MAX_AUTH_LINE` (12,288) | RFC limits, in octets with CRLF; on MAIL and RCPT the 512 octets hold the command and its path, and the ESMTP parameters have their own allowance (166 on MAIL for SIZE, BODY, SMTPUTF8, RET, ENVID; 530 on RCPT for NOTIFY and ORCPT, RFC 3461 5.4); an ORCPT over 500 characters is left out |
 
 ```rust
 use smtp_net::{Capabilities, Extension, protocol::{ReplyLimits, ReplyParser}};
@@ -1247,6 +1272,10 @@ assert_eq!(e.stage(), Some(Stage::Mail));
 | `Dsn::envelope_id_value()` | `Dsn::envelope_id()` |
 | `Envelope::return_path(a)`, `Envelope::dsn(d)` (setters) | `Envelope::with_return_path(a)`, `Envelope::with_dsn(d)` |
 | `Envelope::from()`, `Envelope::dsn_parameters()` (getters) | `Envelope::return_path()`, `Envelope::dsn()` |
+| `SendGate::refund(&envelope, now)`: the time of the failure | `SendGate::refund(&envelope, admitted_unix_ms)`: the time given to the `admit` being refunded |
+| `Address::parse` accepted `"john doe"@example.com` | refused as `RiskyQuotedLocalPart` (a space or one of `< > @ = ; ,` in a quoted local part) |
+| `Server::builder(host, StartTls).credentials(Credentials::oauth2(u, t)).build()?` | also `Server::starttls(host).oauth2(u, t)` |
+| DKIM `h=` with seven oversigned names | every default header oversigned (verifiers need no change) |
 
 ## Changes since the design lock
 
@@ -1301,3 +1330,14 @@ Each change is recorded in `dev/PLAN.md` section 19.
 | 0.8.0 | `Dsn::{with_return_content, with_envelope_id, with_policy, envelope_id}`, `Envelope::{with_return_path, return_path, with_dsn, dsn}` replace `ret`, `envelope_id` (setter), `required`, `envelope_id_value`, `return_path` (setter), `from`, `dsn` (setter), `dsn_parameters` | D-116 |
 | 0.8.0 | `DomainLimit::recipients`, `ReplyCode::is_temporary`, `mime::QuotedPrintableState` replace `per_domain`, `is_transient`, `QpState` | D-117 |
 | 0.8.0 | `ServerBuilder::mechanisms` and `client_name(&str)` return `Self`, checked by `build`; new `ClientName::parse`, `ConfigError::InvalidClientName` | D-118 |
+| 0.8.0 | Writes run under the same deadline as reads: the body under `data_block` per block; `Timeouts::total` is enforced (`Timeout` at `Stage::Total`) | D-120 |
+| 0.8.0 | Every default DKIM header is oversigned; Sender is signed when present | D-121 |
+| 0.8.0 | Display names fold at their spaces (or go to RFC 2047 words when a word is too long for a line); a display name over `max_header_value` is `Build(TooLarge)`; `Mailbox` displays on one line | D-122 |
+| 0.8.0 | `SendGate::refund` takes the admission time | D-123 |
+| 0.8.0 | On MAIL and RCPT the 512 octets hold the command and path, and parameters have their RFC allowances; an ORCPT over 500 characters is left out; ENVID's 100 characters are measured as sent | D-124 |
+| 0.8.0 | An EHLO reply is kept whole up to `max_total`; the reply line counter cannot wrap | D-125 |
+| 0.8.0 | New: `AddressError::RiskyQuotedLocalPart`; `Address::parse` refuses a quoted local part with a space or one of `< > @ = ; ,` | D-126 |
+| 0.8.0 | `refuse_address_like_display_names` covers U+FF20 and U+FE6B; `allow_bidi_controls` also governs attachment file names, where bidi controls, U+200B to U+200F, and U+FEFF are refused by default | D-127 |
+| 0.8.0 | A reply to a command not yet written closes the session (`StartTlsInjection` for STARTTLS, `Protocol(UnexpectedReply)` otherwise) | D-128 |
+| 0.8.0 | `DomainLimit` forgets only domains with no count left; `Secret` equality takes time that depends only on the lengths; `Mailbox::parse` takes the last `<...>` as the address; many recipients deduplicate by a sorted set | D-129 |
+| 0.8.0 | New: `Server::oauth2`; `Server::{local, starttls, implicit_tls}` check the host at the first connect (`Config(InvalidHost)`) | D-130 |

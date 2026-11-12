@@ -134,10 +134,9 @@ OAuth 2.0 (Gmail, Microsoft 365): pass the access token; getting and refreshing 
 
 ```rust,no_run
 # let access_token = String::new();
-let server = smtp_net::Server::builder("smtp.gmail.com", smtp_net::Security::StartTls)
-    .credentials(smtp_net::Credentials::oauth2("no-reply@example.com", access_token))
-    .build()?;
-# let _ = server;
+# let msg = smtp_net::Message::text("no-reply@example.com", "user@example.org", "Hi", "Hello.")?;
+let gmail = smtp_net::Server::starttls("smtp.gmail.com").oauth2("no-reply@example.com", access_token);
+smtp_net::send(&gmail, &msg)?;
 # Ok::<(), smtp_net::Error>(())
 ```
 
