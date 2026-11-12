@@ -78,12 +78,37 @@ impl Default for ClientName {
 pub(crate) struct Line<'a> {
     out: &'a mut Vec<u8>,
     start: usize,
+    /// Where the ESMTP parameters begin, once marked.
+    params: Option<usize>,
 }
+
+/// Octets of ESMTP parameters allowed on a MAIL line on top of the
+/// 512-octet command (RFC 5321 4.5.3.1.4 lets extensions raise it): SIZE
+/// 26 (RFC 1870), SMTPUTF8 10 (RFC 6531), ` BODY=8BITMIME` 14, and DSN's
+/// ` RET=HDRS` and ` ENVID=` with its 100 characters (RFC 3461 4.4, 5.4),
+/// 116.
+pub(crate) const MAIL_PARAMETERS: usize = 26 + 10 + 14 + 116;
+/// Octets of ESMTP parameters allowed on a RCPT line: RFC 3461 5.4 allows
+/// 530 characters for NOTIFY and ORCPT on top of the 512, which holds the
+/// longest NOTIFY (28) and an ORCPT of 500, each with its space.
+pub(crate) const RCPT_PARAMETERS: usize = 530;
 
 impl<'a> Line<'a> {
     pub(crate) fn new(out: &'a mut Vec<u8>) -> Line<'a> {
         let start = out.len();
-        Line { out, start }
+        Line {
+            out,
+            start,
+            params: None,
+        }
+    }
+
+    /// Marks the start of the ESMTP parameters: what follows is measured
+    /// against the allowance given to [`end_with`](Line::end_with), not
+    /// against the 512 octets of the command itself.
+    pub(crate) fn params(&mut self) -> &mut Self {
+        self.params = Some(self.out.len());
+        self
     }
 
     pub(crate) fn put(&mut self, bytes: &[u8]) -> &mut Self {
@@ -151,10 +176,19 @@ impl<'a> Line<'a> {
     /// `Build(CommandHasControl)` when the line holds CR, LF, or NUL;
     /// `Build(CommandTooLong)` when it passes 512 octets. Both permanent.
     pub(crate) fn end(self) -> Result<(), Error> {
+        self.end_with(0)
+    }
+
+    /// As [`end`](Line::end), with `allowance` more octets for the ESMTP
+    /// parameters marked by [`params`](Line::params): the command and its
+    /// path stay within 512 octets, the parameters within `allowance`.
+    pub(crate) fn end_with(self, allowance: usize) -> Result<(), Error> {
         let line = self.out.get(self.start..).unwrap_or(&[]);
+        let command = self.params.map_or(line.len(), |p| p - self.start);
+        let parameters = line.len() - command;
         let refused = if line.iter().any(|&b| b == b'\r' || b == b'\n' || b == 0) {
             Some(BuildError::CommandHasControl)
-        } else if line.len() + 2 > MAX_COMMAND_LINE {
+        } else if command + 2 > MAX_COMMAND_LINE || parameters > allowance {
             Some(BuildError::CommandTooLong)
         } else {
             None

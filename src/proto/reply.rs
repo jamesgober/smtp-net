@@ -283,6 +283,9 @@ pub struct ReplyParser {
     truncated: bool,
     first_enhanced: Option<EnhancedCode>,
     done: bool,
+    /// Octets of reply text kept: `KEPT_TEXT`, or the whole reply budget
+    /// while an EHLO reply is read (its lines are the capabilities).
+    keep: usize,
 }
 
 impl ReplyParser {
@@ -301,7 +304,26 @@ impl ReplyParser {
             truncated: false,
             first_enhanced: None,
             done: false,
+            keep: KEPT_TEXT,
         }
+    }
+
+    /// Keeps the whole text of the next reply, up to the reply budget
+    /// (`max_total`), instead of the first 1,024 octets: set while an EHLO
+    /// reply is read, so no capability is cut off. Off again with `false`,
+    /// which also gives back the larger buffer.
+    pub(crate) fn keep_whole_text(&mut self, on: bool) {
+        if on {
+            self.keep = usize::try_from(self.limits.max_total).unwrap_or(usize::MAX);
+        } else if self.keep != KEPT_TEXT {
+            self.keep = KEPT_TEXT;
+            self.text.shrink_to(KEPT_TEXT + 64);
+        }
+    }
+
+    /// True when the text of the reply just completed was cut short.
+    pub(crate) fn text_truncated(&self) -> bool {
+        self.truncated
     }
 
     pub(crate) fn set_enhanced(&mut self, on: bool) {
@@ -391,10 +413,11 @@ impl ReplyParser {
         if self.total > self.limits.max_total {
             return Err(ProtocolError::ReplyTooLong);
         }
-        self.lines += 1;
-        if self.lines > self.limits.max_lines {
+        // Compared before counting, so `max_lines = u16::MAX` cannot wrap.
+        if self.lines >= self.limits.max_lines {
             return Err(ProtocolError::ReplyTooLong);
         }
+        self.lines += 1;
         let line = core::mem::take(&mut self.line);
         let digits = line.get(..3).ok_or(ProtocolError::MalformedReply)?;
         if !digits.iter().all(u8::is_ascii_digit) {
@@ -419,7 +442,7 @@ impl ReplyParser {
         if self.lines == 1 && self.enhanced {
             self.first_enhanced = EnhancedCode::parse(text).filter(|e| e.class == code.class());
         }
-        let room = KEPT_TEXT.saturating_sub(self.text.len());
+        let room = self.keep.saturating_sub(self.text.len());
         if !self.truncated {
             let keep = if text.len() < room {
                 text.len()
@@ -538,6 +561,36 @@ mod tests {
         assert!(p.push(&at).unwrap().1.is_some());
         let over = [&b"250 "[..], &[b'x'; 507], b"\r\n"].concat();
         assert!(p.push(&over).is_err());
+    }
+
+    #[test]
+    fn test_reply_parser_line_limit_at_u16_max_does_not_wrap() {
+        // 70,001 lines against max_lines = u16::MAX: refused at line
+        // 65,536 instead of overflowing the counter (a panic in a debug
+        // build, a wrap to zero in a release build).
+        let mut p = ReplyParser::new(
+            ReplyLimits {
+                max_line: 512,
+                max_lines: u16::MAX,
+                max_total: u32::MAX,
+            },
+            false,
+        );
+        let mut input = b"250-x\r\n".repeat(70_000);
+        input.extend_from_slice(b"250 x\r\n");
+        assert_eq!(p.push(&input).unwrap_err(), ProtocolError::ReplyTooLong);
+        let mut p = ReplyParser::new(
+            ReplyLimits {
+                max_line: 512,
+                max_lines: u16::MAX,
+                max_total: u32::MAX,
+            },
+            false,
+        );
+        let mut input = b"250-x\r\n".repeat(usize::from(u16::MAX) - 1);
+        input.extend_from_slice(b"250 x\r\n");
+        let reply = p.push(&input).unwrap().1.unwrap();
+        assert_eq!(reply.line_count(), u16::MAX);
     }
 
     #[test]

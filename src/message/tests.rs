@@ -624,6 +624,76 @@ fn test_subject_long_folds_and_unbreakable_refused() {
 }
 
 #[test]
+fn test_long_display_names_fold_and_the_payload_decodes() {
+    // T-36: a display name is folded at its spaces (atoms or one quoted
+    // string), or written as RFC 2047 words when a word is too long for a
+    // line, so no line of From, To, or Cc passes 998 octets, and the job
+    // payload of the message decodes again.
+    let quoted = format!("{}x", "x, ".repeat(400));
+    let atoms = "word ".repeat(300);
+    let one_word = "y".repeat(1200);
+    let escaped = format!("{}z", "a \\ \" b ".repeat(150));
+    let unicode = format!("{}\u{e9}", "J\u{f6}rg ".repeat(200));
+    for name in [
+        quoted.as_str(),
+        atoms.trim_end(),
+        one_word.as_str(),
+        escaped.as_str(),
+        unicode.as_str(),
+    ] {
+        let mailbox = Mailbox::new(Some(name), Address::parse("a@example.com").unwrap()).unwrap();
+        let m = Message::builder()
+            .from(mailbox.clone())
+            .unwrap()
+            .to(mailbox.clone())
+            .unwrap()
+            .cc(mailbox.clone())
+            .unwrap()
+            .text("hello")
+            .unwrap()
+            .build_with(&mut Counter(0), T)
+            .unwrap();
+        let s = bytes(&m);
+        check_wire_rules(&s);
+        let payload = m.prepare().unwrap().encode();
+        let back = super::prepared::PreparedMessage::decode(&payload).unwrap();
+        assert_eq!(back.bytes(), s.as_bytes());
+        // The unfolded To header reads back as the same mailbox.
+        let to = m.headers().get("To").unwrap();
+        if name.is_ascii() && name.len() < 900 {
+            let parsed = Mailbox::parse(to).unwrap();
+            assert_eq!(parsed.display_name(), Some(name), "{to}");
+        }
+        assert!(!mailbox.to_string().contains('\r'));
+        assert!(!mailbox.to_string().contains('\n'));
+    }
+}
+
+#[test]
+fn test_display_name_over_the_header_value_budget_is_refused() {
+    let name = "n ".repeat(9000);
+    let e = Message::builder()
+        .from(
+            Mailbox::new(
+                Some(name.trim_end()),
+                Address::parse("a@example.com").unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .to("b@example.org")
+        .unwrap()
+        .text("hello")
+        .unwrap()
+        .build_with(&mut Counter(0), T)
+        .unwrap_err();
+    assert!(matches!(
+        e.kind(),
+        ErrorKind::Build(BuildError::TooLarge { .. })
+    ));
+}
+
+#[test]
 fn test_every_utf8_width_at_every_split_in_subject() {
     for ch in ['a', '\u{e9}', '\u{20ac}', '\u{1f600}'] {
         for n in 1..40 {

@@ -442,3 +442,60 @@ fn t35_bidi_controls() {
         assert!(b().subject(fine).unwrap().build().is_ok(), "{fine:?}");
     }
 }
+
+/// T-25: the full-width and small at signs read as `@` too.
+#[test]
+fn t25_full_width_and_small_at_signs_are_address_like() {
+    for at in ['@', '\u{FF20}', '\u{FE6B}'] {
+        let r = Message::builder()
+            .refuse_address_like_display_names(true)
+            .from(format!("\"support{at}bank.example\" <a@example.com>").as_str())
+            .unwrap()
+            .to("b@example.org")
+            .unwrap()
+            .text("x")
+            .unwrap()
+            .build();
+        assert_eq!(
+            header_error(r),
+            HeaderError::AddressLikeDisplayName { field: "From" },
+            "{at:?}"
+        );
+    }
+}
+
+/// T-24, T-35: a file name with a bidirectional override, a zero-width
+/// character, or a direction mark is refused unless bidi controls are
+/// allowed: `invoice\u{202E}fdp.exe` shows as `invoiceexe.pdf`.
+#[test]
+fn t24_file_names_with_bidi_or_invisible_characters_are_refused() {
+    let b = |name: &str, allow: bool| {
+        Message::builder()
+            .from("a@example.com")
+            .unwrap()
+            .to("b@example.org")
+            .unwrap()
+            .text("x")
+            .unwrap()
+            .attachment(smtp_net::Attachment::new(name, "application/pdf", vec![1, 2, 3]).unwrap())
+            .unwrap()
+            .allow_bidi_controls(allow)
+            .build()
+    };
+    for c in [
+        '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{200B}', '\u{200C}', '\u{200D}',
+        '\u{200E}', '\u{200F}', '\u{FEFF}',
+    ] {
+        let name = format!("invoice{c}fdp.exe");
+        assert_eq!(
+            header_error(b(&name, false)),
+            HeaderError::BidiControl {
+                field: "attachment file name",
+                position: 7
+            },
+            "{c:?}"
+        );
+        assert!(b(&name, true).is_ok(), "{c:?}");
+    }
+    assert!(b("\u{5d3}\u{5d5}\u{5d7}.pdf", false).is_ok());
+}

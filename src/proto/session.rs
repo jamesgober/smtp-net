@@ -7,7 +7,7 @@ use core::fmt;
 use super::{
     Capabilities, ClientName, Millis, Reply, ReplyLimits, ReplyParser, Timeouts,
     classify::{auth_error, rejected_disposition, reply_error},
-    command::Line,
+    command::{Line, MAIL_PARAMETERS, RCPT_PARAMETERS},
     sasl::{Auth, Exchange, MAX_AUTH_LINE, MechanismName},
     stuff::DotStuffer,
 };
@@ -16,7 +16,7 @@ use crate::{
         BuildError, ConfigError, Disposition, Error, ErrorKind, Extension, ProtocolError,
         RejectedRecipient, Stage, UsageError,
     },
-    message::prepared::{DsnPolicy, DsnReturn, Envelope},
+    message::prepared::{DsnPolicy, DsnReturn, Envelope, xtext_len},
 };
 
 /// Largest pipelined command group written before its replies are read (RFC
@@ -525,6 +525,8 @@ impl Session {
         let mut used = 0usize;
         while used < input.len() {
             let rest = input.get(used..).unwrap_or(&[]);
+            let ehlo = self.pending.front().is_some_and(|p| p.what == Expect::Ehlo);
+            self.parser.keep_whole_text(ehlo);
             let (n, done) = match self.parser.push_view(rest) {
                 Ok(r) => r,
                 Err(p) => {
@@ -609,10 +611,17 @@ impl Session {
             }
             Expect::Ehlo => {
                 if code.get() == 250 {
+                    // The whole reply was kept (keep_whole_text); a cut one
+                    // would turn `SIZE 35882577` into `SIZE 3`.
+                    if self.parser.text_truncated() {
+                        let e = Error::from(ProtocolError::ReplyTooLong).at(stage);
+                        return Err(self.close(e));
+                    }
                     let caps = match Capabilities::from_text(self.parser.text()) {
                         Ok(c) => c,
                         Err(e) => return Err(self.close(Error::from(e).at(stage))),
                     };
+                    self.parser.keep_whole_text(false);
                     self.parser
                         .set_enhanced(caps.has(Extension::EnhancedStatusCodes));
                     self.caps = Some(caps);
@@ -1534,7 +1543,9 @@ impl Session {
 /// Appends the MAIL line of `txn` to `out`; on refusal nothing is appended.
 fn write_mail(out: &mut Vec<u8>, txn: &Txn, caps_size: bool) -> Result<(), Error> {
     let mut l = Line::new(out);
-    l.put(b"MAIL FROM:").path(txn.envelope.return_path());
+    l.put(b"MAIL FROM:")
+        .path(txn.envelope.return_path())
+        .params();
     if caps_size && txn.size > 0 {
         l.put(b" SIZE=").decimal(txn.size);
     }
@@ -1558,7 +1569,7 @@ fn write_mail(out: &mut Vec<u8>, txn: &Txn, caps_size: bool) -> Result<(), Error
             l.put(b" ENVID=").xtext(id.as_bytes());
         }
     }
-    l.end()
+    l.end_with(MAIL_PARAMETERS)
 }
 
 /// Appends the RCPT line for recipient `i` of `txn` to `out`; on refusal
@@ -1566,7 +1577,7 @@ fn write_mail(out: &mut Vec<u8>, txn: &Txn, caps_size: bool) -> Result<(), Error
 fn write_rcpt(out: &mut Vec<u8>, txn: &Txn, i: usize) -> Result<(), Error> {
     let addr = txn.envelope.recipients().get(i);
     let mut l = Line::new(out);
-    l.put(b"RCPT TO:").path(addr);
+    l.put(b"RCPT TO:").path(addr).params();
     if let Some(d) = txn.envelope.dsn().filter(|_| txn.dsn) {
         let n = d.notify();
         if n.bits() == 0 {
@@ -1588,13 +1599,21 @@ fn write_rcpt(out: &mut Vec<u8>, txn: &Txn, i: usize) -> Result<(), Error> {
                 }
             }
         }
-        // ORCPT carries the address as given; UTF-8 addresses need RFC 6533 types: omitted.
-        if let Some(a) = addr.filter(|a| !a.needs_smtputf8()) {
-            l.put(b" ORCPT=rfc822;").xtext(a.as_str().as_bytes());
+        // ORCPT carries the address as given; UTF-8 addresses need RFC 6533
+        // types, and the whole parameter may be at most 500 characters
+        // (RFC 3461 4.2): otherwise it is left out, which DSN allows (the
+        // notice then names the RCPT address).
+        if let Some(a) = addr.filter(|a| {
+            !a.needs_smtputf8() && ORCPT_PREFIX.len() + xtext_len(a.as_str().as_bytes()) <= 500
+        }) {
+            l.put(b" ").put(ORCPT_PREFIX).xtext(a.as_str().as_bytes());
         }
     }
-    l.end()
+    l.end_with(RCPT_PARAMETERS)
 }
+
+/// `ORCPT=` and the address type, before the xtext address.
+const ORCPT_PREFIX: &[u8] = b"ORCPT=rfc822;";
 
 /// Appends a constant command line.
 fn push_command(out: &mut Vec<u8>, command: &[u8]) {

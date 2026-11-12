@@ -129,6 +129,21 @@ pub struct Address {
 }
 
 impl Address {
+    /// An address from `local@domain` with no validation, so tests can
+    /// reach the session's last checks (a command line over its limit).
+    #[cfg(test)]
+    pub(crate) fn unchecked(text: &str) -> Address {
+        let at = text.rfind('@').map_or(0, |i| i + 1);
+        Address {
+            domain: Domain {
+                text: String::from(text),
+                start: at,
+                ascii: text.is_ascii(),
+                literal: false,
+            },
+        }
+    }
+
     /// Parses an `addr-spec`: a dot-atom or quoted-string local part, `@`, and
     /// a domain name. Comments, folding whitespace, obsolete syntax, and domain
     /// literals are refused. Leading and trailing spaces are ignored.
@@ -554,11 +569,17 @@ impl fmt::Debug for Mailbox {
 
 /// The header form: the display name as an atom phrase, a quoted string, or
 /// (for non-ASCII text) RFC 2047 encoded words, then `<address>`.
+/// The header form on one line: the folds a header needs are left out, so
+/// the text holds no CR or LF (a log line stays one line).
 impl fmt::Display for Mailbox {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = String::new();
         crate::message::header::write_mailbox(self, &mut s, 0);
-        f.write_str(&s)
+        // Every fold is CRLF before a space, so removing CRLF unfolds it.
+        for piece in s.split("\r\n") {
+            f.write_str(piece)?;
+        }
+        Ok(())
     }
 }
 

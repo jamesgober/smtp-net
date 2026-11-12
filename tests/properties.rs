@@ -106,6 +106,27 @@ proptest! {
     }
 
     #[test]
+    fn prop_display_names_of_any_length_stay_within_998_and_decode(
+        words in proptest::collection::vec("[a-zA-Z0-9.,\"\\\\()<>@:;\u{e9}\u{4e2d}]{1,40}|[a-z]{900,1100}", 1..80),
+    ) {
+        let name = words.join(" ");
+        let Ok(mailbox) = smtp_net::Mailbox::new(Some(&name), Address::parse("a@example.com").unwrap()) else {
+            return Ok(());
+        };
+        let built = Message::builder()
+            .from(mailbox.clone()).unwrap()
+            .to(mailbox.clone()).unwrap()
+            .text("hello").unwrap()
+            .build_with(&mut Counter(1), 1_700_000_000);
+        let Ok(m) = built else { return Ok(()) };
+        let bytes = m.to_bytes().unwrap();
+        wire_ok(&bytes)?;
+        let payload = m.prepare().unwrap().encode();
+        prop_assert!(smtp_net::PreparedMessage::decode(&payload).is_ok());
+        prop_assert!(!mailbox.to_string().contains(['\r', '\n']));
+    }
+
+    #[test]
     fn prop_builder_output_obeys_wire_rules(
         subject in "\\PC{0,200}",
         name in "\\PC{0,40}",

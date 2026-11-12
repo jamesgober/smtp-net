@@ -296,26 +296,80 @@ pub(crate) fn write_mailbox(m: &Mailbox, out: &mut String, col: usize) {
         out.push_str(addr);
         return;
     };
-    if is_atom_phrase(name) {
-        out.push_str(name);
-    } else if name.is_ascii() && !name.contains("=?") {
-        let mut buf = Vec::new();
-        // The name passed the control check when the mailbox was made.
-        if write::write_quoted(name.as_bytes(), &mut buf).is_ok() {
-            out.push_str(&String::from_utf8_lossy(&buf));
-        }
+    let start = out.len();
+    let mut quoted = Vec::new();
+    // The name passed the control check when the mailbox was made.
+    let plain = if is_atom_phrase(name) {
+        Some(name)
+    } else if name.is_ascii()
+        && !name.contains("=?")
+        && write::write_quoted(name.as_bytes(), &mut quoted).is_ok()
+    {
+        core::str::from_utf8(&quoted).ok()
     } else {
-        let mut buf = Vec::new();
-        let room = RECOMMENDED_HEADER_LINE
-            .saturating_sub(col)
-            .max(MAX_ENCODED_WORD.min(16));
-        if encode_shorter(name, room, &mut buf).is_ok() {
-            out.push_str(&String::from_utf8_lossy(&buf));
+        None
+    };
+    match plain.filter(|p| longest_word(p) <= MAX_PLAIN_WORD) {
+        // Folded at its spaces, so no line passes 998 octets (T-36).
+        Some(p) => push_folded(out, p, col),
+        None => {
+            // Not ASCII, or a word too long for one line: RFC 2047 words,
+            // which fold between any two of them.
+            let mut buf = Vec::new();
+            let room = RECOMMENDED_HEADER_LINE
+                .saturating_sub(col)
+                .max(MAX_ENCODED_WORD.min(16));
+            if encode_shorter(name, room, &mut buf).is_ok() {
+                out.push_str(&String::from_utf8_lossy(&buf));
+            }
         }
+    }
+    let written = out.get(start..).unwrap_or("");
+    let at = match written.rfind('\n') {
+        Some(i) => written.len() - i - 1,
+        None => col + written.len(),
+    };
+    if at > 1 && at + 3 + addr.len() > RECOMMENDED_HEADER_LINE {
+        // The address on a line of its own (FWS before the angle address).
+        out.push_str("\r\n");
     }
     out.push_str(" <");
     out.push_str(addr);
     out.push('>');
+}
+
+/// The longest word of a phrase written as it is (atoms, or one quoted
+/// string): a longer word could not share a line with the folding space
+/// and still fit in 998 octets, so such a name is written as RFC 2047 words.
+const MAX_PLAIN_WORD: usize = 900;
+
+/// The longest run between two spaces.
+fn longest_word(text: &str) -> usize {
+    text.split(' ').map(str::len).max().unwrap_or(0)
+}
+
+/// Appends `text`, starting at column `col`, folding before a space
+/// whenever the next word would pass the recommended 78 columns. A space
+/// escaped inside a quoted string (`\ `) is never a fold point.
+fn push_folded(out: &mut String, text: &str, mut col: usize) {
+    let mut escaped = false;
+    let mut word_start = 0;
+    let cut = |out: &mut String, word: &str, col: &mut usize| {
+        if word.starts_with(' ') && *col > 1 && *col + word.len() > RECOMMENDED_HEADER_LINE {
+            out.push_str("\r\n");
+            *col = 0;
+        }
+        out.push_str(word);
+        *col += word.len();
+    };
+    for (i, b) in text.bytes().enumerate() {
+        if b == b' ' && !escaped && i > word_start {
+            cut(out, text.get(word_start..i).unwrap_or(""), &mut col);
+            word_start = i;
+        }
+        escaped = b == b'\\' && !escaped;
+    }
+    cut(out, text.get(word_start..).unwrap_or(""), &mut col);
 }
 
 /// Names the crate writes itself: kept as `&'static str`, not copied. The
@@ -434,7 +488,8 @@ impl HeaderBlock {
         Ok(())
     }
 
-    /// An address list, folded between mailboxes.
+    /// An address list, folded between mailboxes and inside long display
+    /// names.
     pub(crate) fn mailboxes(&mut self, name: &str, list: &[Mailbox]) {
         let start = self.bytes.len();
         self.bytes.extend_from_slice(name.as_bytes());

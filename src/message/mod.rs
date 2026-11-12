@@ -345,6 +345,29 @@ fn find_bidi(text: &str) -> Option<usize> {
         .position(|w| matches!(w, [0xE2, 0x80, 0xAA..=0xAE] | [0xE2, 0x81, 0xA6..=0xA9]))
 }
 
+/// The offset of the first character in a file name that can make a
+/// reader show it as another name (T-24, T-35): a bidirectional override
+/// or isolate (`invoice\u{202E}fdp.exe` shows as `invoiceexe.pdf`), the
+/// zero-width and direction marks U+200B to U+200F (`E2 80 8B..8F`), or
+/// U+FEFF (`EF BB BF`).
+fn find_file_name_trick(name: &str) -> Option<usize> {
+    name.as_bytes().windows(3).position(|w| {
+        matches!(
+            w,
+            [0xE2, 0x80, 0xAA..=0xAE]
+                | [0xE2, 0x81, 0xA6..=0xA9]
+                | [0xE2, 0x80, 0x8B..=0x8F]
+                | [0xEF, 0xBB, 0xBF]
+        )
+    })
+}
+
+/// An at sign a reader shows as `@`: ASCII, full width (U+FF20), or small
+/// (U+FE6B) (T-25).
+fn has_at_sign(name: &str) -> bool {
+    name.contains(['@', '\u{FF20}', '\u{FE6B}'])
+}
+
 fn mailbox<M>(m: M) -> Result<Mailbox, Error>
 where
     M: TryInto<Mailbox>,
@@ -749,19 +772,23 @@ impl MessageBuilder {
     }
 
     /// Allows bidirectional overrides and isolates (U+202A to U+202E, U+2066
-    /// to U+2069) in the Subject and display names. Off by default: they can
-    /// make a reader show the text in another order than it was written
-    /// (T-35). Right-to-left text needs none of them; the marks U+200E and
-    /// U+200F are always allowed.
+    /// to U+2069) in the Subject and display names, and those and the
+    /// zero-width and direction marks (U+200B to U+200F, U+FEFF) in
+    /// attachment file names. Off by default: they can make a reader show
+    /// the text in another order than it was written, or a file name as
+    /// another one (T-24, T-35). Right-to-left text needs none of them; the
+    /// marks U+200E and U+200F are always allowed in the Subject and
+    /// display names.
     #[must_use]
     pub fn allow_bidi_controls(mut self, allow: bool) -> Self {
         self.allow_bidi = allow;
         self
     }
 
-    /// Refuses a display name containing `@` in From, Sender, Reply-To, To,
-    /// and Cc, so `"support@bank.example" <someone@else.example>` cannot be
-    /// built (T-25). Off by default; turn it on when display names come from
+    /// Refuses a display name containing `@`, or the full-width (U+FF20) or
+    /// small (U+FE6B) at sign, in From, Sender, Reply-To, To, and Cc, so
+    /// `"support@bank.example" <someone@else.example>` cannot be built
+    /// (T-25). Off by default; turn it on when display names come from
     /// users, and never put untrusted text in the From display name.
     #[must_use]
     pub fn refuse_address_like_display_names(mut self, refuse: bool) -> Self {
@@ -781,11 +808,29 @@ impl MessageBuilder {
         ];
         for (field, list) in fields {
             for name in list.iter().filter_map(Mailbox::display_name) {
-                if self.refuse_address_like && name.contains('@') {
+                if name.len() > self.limits.max_header_value as usize {
+                    return Err(BuildError::TooLarge {
+                        size: name.len() as u64,
+                        limit: u64::from(self.limits.max_header_value),
+                    }
+                    .into());
+                }
+                if self.refuse_address_like && has_at_sign(name) {
                     return Err(HeaderError::AddressLikeDisplayName { field }.into());
                 }
                 if let (false, Some(position)) = (self.allow_bidi, find_bidi(name)) {
                     return Err(HeaderError::BidiControl { field, position }.into());
+                }
+            }
+        }
+        if !self.allow_bidi {
+            for a in &self.attachments {
+                if let Some(position) = find_file_name_trick(a.file_name()) {
+                    return Err(HeaderError::BidiControl {
+                        field: "attachment file name",
+                        position,
+                    }
+                    .into());
                 }
             }
         }

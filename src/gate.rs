@@ -32,7 +32,7 @@ use crate::message::prepared::Envelope;
 ///         }
 ///     }
 ///
-///     fn refund(&self, envelope: &Envelope, _now_unix_ms: u64) {
+///     fn refund(&self, envelope: &Envelope, _admitted_unix_ms: u64) {
 ///         self.left.fetch_add(envelope.recipients().len() as u32, Ordering::AcqRel);
 ///     }
 /// }
@@ -50,10 +50,13 @@ pub trait SendGate: Send + Sync {
     fn admit(&self, envelope: &Envelope, now_unix_ms: u64) -> Admission;
 
     /// An admitted message was then not sent (the connection failed before
-    /// the server accepted MAIL): give its allowance back. The default
-    /// keeps the allowance.
-    fn refund(&self, envelope: &Envelope, now_unix_ms: u64) {
-        let _ = (envelope, now_unix_ms);
+    /// the server accepted MAIL): give its allowance back.
+    /// `admitted_unix_ms` is the time that was passed to the `admit` being
+    /// refunded, not the time of the failure, so the allowance goes back to
+    /// the window it was taken from even when the failure came minutes
+    /// later. The default keeps the allowance.
+    fn refund(&self, envelope: &Envelope, admitted_unix_ms: u64) {
+        let _ = (envelope, admitted_unix_ms);
     }
 }
 
@@ -78,9 +81,9 @@ impl<A: SendGate, B: SendGate> SendGate for (A, B) {
         }
     }
 
-    fn refund(&self, envelope: &Envelope, now_unix_ms: u64) {
-        self.0.refund(envelope, now_unix_ms);
-        self.1.refund(envelope, now_unix_ms);
+    fn refund(&self, envelope: &Envelope, admitted_unix_ms: u64) {
+        self.0.refund(envelope, admitted_unix_ms);
+        self.1.refund(envelope, admitted_unix_ms);
     }
 }
 
@@ -287,8 +290,8 @@ mod hourly {
             self.admit_count(recipient_count(envelope), now_unix_ms)
         }
 
-        fn refund(&self, envelope: &Envelope, now_unix_ms: u64) {
-            self.refund_count(recipient_count(envelope), now_unix_ms);
+        fn refund(&self, envelope: &Envelope, admitted_unix_ms: u64) {
+            self.refund_count(recipient_count(envelope), admitted_unix_ms);
         }
     }
 
@@ -317,12 +320,12 @@ mod hourly {
             Admission::Admit
         }
 
-        fn refund_count(&self, recipients: u32, now_unix_ms: u64) {
+        fn refund_count(&self, recipients: u32, admitted_unix_ms: u64) {
             let n = match self.unit {
                 CountUnit::Messages => 1,
                 CountUnit::Recipients => u64::from(recipients.max(1)),
             };
-            let minute = now_unix_ms / MINUTE_MS;
+            let minute = admitted_unix_ms / MINUTE_MS;
             if let Some(b) = self.buckets.get((minute % BUCKETS as u64) as usize) {
                 let mut cur = b.load(Ordering::Acquire);
                 loop {
@@ -711,8 +714,8 @@ mod domain {
             Admission::Admit
         }
 
-        fn refund(&self, envelope: &Envelope, now_unix_ms: u64) {
-            let bucket = now_unix_ms / BUCKET_MS;
+        fn refund(&self, envelope: &Envelope, admitted_unix_ms: u64) {
+            let bucket = admitted_unix_ms / BUCKET_MS;
             if let Ok(mut table) = self.table.lock() {
                 for (d, n) in DomainLimit::per_domain_counts(envelope) {
                     if let Some(entry) = table.get_mut(&d) {

@@ -539,22 +539,30 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn admit(server: &Server, message: &PreparedMessage) -> Result<(), Error> {
+/// Asks the gate; returns the time of the admission, which a refund must
+/// give back (so the allowance returns to the window it came from).
+fn admit(server: &Server, message: &PreparedMessage) -> Result<u64, Error> {
+    let now = now_unix_ms();
     let Some(gate) = &server.gate else {
-        return Ok(());
+        return Ok(now);
     };
-    match gate.admit(message.envelope(), now_unix_ms()) {
+    match gate.admit(message.envelope(), now) {
         Admission::RetryAfter(d) => Err(Error::new(ErrorKind::Throttled).with_retry_after(d)),
-        _ => Ok(()),
+        _ => Ok(now),
     }
 }
 
-fn refund_on(server: &Server, message: &PreparedMessage, e: &Error) {
+fn refund_on(server: &Server, message: &PreparedMessage, admitted_unix_ms: u64, e: &Error) {
     if let Some(gate) = &server.gate {
         if !e.possibly_delivered() && !matches!(e.kind(), ErrorKind::Throttled) {
-            gate.refund(message.envelope(), now_unix_ms());
+            gate.refund(message.envelope(), admitted_unix_ms);
         }
     }
+}
+
+/// The instant `Timeouts::total` runs out for a send starting now.
+fn total_deadline(server: &Server) -> Option<Instant> {
+    server.timeouts.total.map(|t| Instant::now() + t)
 }
 
 /// Sends `message` to `server`: derives the envelope, serializes, asks the
@@ -598,16 +606,20 @@ pub fn send(server: &Server, message: &Message) -> Result<Report, Error> {
 /// # Ok::<(), smtp_net::Error>(())
 /// ```
 pub fn send_prepared(server: &Server, message: &PreparedMessage) -> Result<Report, Error> {
-    admit(server, message)?;
+    let admitted = admit(server, message)?;
+    let total = total_deadline(server);
     let result = (|| {
-        let mut client = Client::connect(server)?;
-        let report = client.deliver(message)?;
+        let mut client = Client::connect_by(server, total)?;
+        client.total = total;
+        let report = client.deliver(message);
+        client.total = None;
+        let report = report?;
         // The message is accepted; a failed QUIT changes nothing.
         let _ = client.close();
         Ok(report)
     })();
     if let Err(e) = &result {
-        refund_on(server, message, e);
+        refund_on(server, message, admitted, e);
     }
     server.observe(message, &result);
     result
@@ -665,6 +677,8 @@ pub struct Client {
     plain: Vec<u8>,
     sent: u32,
     last_used: Instant,
+    /// When `Timeouts::total` runs out for the send in progress.
+    total: Option<Instant>,
 }
 
 impl core::fmt::Debug for Client {
@@ -694,7 +708,13 @@ impl Client {
     /// `StartTlsInjection`, `AuthUnavailable`, `AuthFailed`, `Timeout`,
     /// `Rejected`, `Protocol`, `Config`.
     pub fn connect(server: &Server) -> Result<Client, Error> {
-        let (conn, session) = Client::open(server)?;
+        Client::connect_by(server, None)
+    }
+
+    /// As [`connect`](Client::connect), finished by `total` (a send's
+    /// `Timeouts::total`) when that comes first.
+    pub(crate) fn connect_by(server: &Server, total: Option<Instant>) -> Result<Client, Error> {
+        let (conn, session) = Client::open(server, total)?;
         let mut c = Client {
             server: server.clone(),
             conn: Some(conn),
@@ -704,13 +724,26 @@ impl Client {
             plain: Vec::with_capacity(READ_BUFFER),
             sent: 0,
             last_used: Instant::now(),
+            total,
         };
-        c.until_ready()?;
+        let ready = c.until_ready();
+        c.total = None;
+        ready?;
         Ok(c)
     }
 
-    fn open(server: &Server) -> Result<(Conn, Session), Error> {
+    fn open(server: &Server, total: Option<Instant>) -> Result<(Conn, Session), Error> {
         let t = &server.timeouts;
+        let connect_timeout = match total {
+            Some(end) => {
+                let left = end.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(Error::new(ErrorKind::Timeout).at(Stage::Total));
+                }
+                left.min(t.connect)
+            }
+            None => t.connect,
+        };
         if matches!(server.security, Security::StartTls | Security::ImplicitTls)
             && server.tls.is_none()
         {
@@ -744,7 +777,7 @@ impl Client {
         // (`::1` first) to an MTA on 127.0.0.1 only waited 1 s per connect.
         // Every winner still passes the loopback check below.
         let mut options = ConnectOptions::new()
-            .timeout(t.connect)
+            .timeout(connect_timeout)
             .limits(limits)
             .happy_eyeballs(true);
         if is_loopback_host(&server.host) {
@@ -788,15 +821,48 @@ impl Client {
         self.epoch + Duration::from_millis(at.0)
     }
 
-    /// Writes all pending output.
+    /// The deadline for the next read or write: the session's (the oldest
+    /// outstanding reply, or in the body the current block, renewed on
+    /// every block), or the end of `Timeouts::total` when that is sooner.
+    /// True when the total is the one that applies.
+    fn deadline(&self) -> (Option<Instant>, bool) {
+        let stage = self.session.deadline().map(|d| self.instant(d));
+        match (stage, self.total) {
+            (Some(s), Some(t)) if t < s => (Some(t), true),
+            (None, Some(t)) => (Some(t), true),
+            (s, _) => (s, false),
+        }
+    }
+
+    /// A timeout error, at `Stage::Total` when the total ran out.
+    fn timed_out(&mut self, total: bool) -> Error {
+        let now = self.now().max(self.session.deadline().unwrap_or(Millis(0)));
+        let e = if total {
+            self.session
+                .connection_lost(ErrorKind::Timeout)
+                .at(Stage::Total)
+        } else {
+            match self.session.on_timeout(now) {
+                Err(e) => e,
+                Ok(()) => self.session.connection_lost(ErrorKind::Timeout),
+            }
+        };
+        self.drop_conn();
+        e
+    }
+
+    /// Writes all pending output, within the same deadline as a read: in
+    /// the body that is `Timeouts::data_block` per block (T-13).
     fn flush(&mut self) -> Result<(), Error> {
         let pending = self.session.transmit().len();
         if pending == 0 {
             return Ok(());
         }
+        let (deadline, total) = self.deadline();
         let Some(conn) = self.conn.as_mut() else {
             return Err(Error::new(ErrorKind::ConnectionClosed));
         };
+        conn.tcp.set_exchange_deadline(deadline);
         let result = match conn.tls.as_mut() {
             Some(tls) => tls.write(&mut conn.tcp, self.session.transmit()),
             None => conn.tcp.send_all(self.session.transmit()),
@@ -806,6 +872,7 @@ impl Client {
                 self.session.transmitted(pending);
                 Ok(())
             }
+            Err(NetError::TimedOut { .. }) if total => Err(self.timed_out(true)),
             Err(NetError::TimedOut { .. }) => Err(self.lost(ErrorKind::Timeout)),
             Err(e) => Err(self.lost(ErrorKind::Io(net_kind(e)))),
         }
@@ -824,7 +891,7 @@ impl Client {
 
     /// Reads once and feeds the session.
     fn read(&mut self) -> Result<(), Error> {
-        let deadline = self.session.deadline().map(|d| self.instant(d));
+        let (deadline, total) = self.deadline();
         let Some(conn) = self.conn.as_mut() else {
             return Err(Error::new(ErrorKind::ConnectionClosed));
         };
@@ -864,15 +931,7 @@ impl Client {
                     }
                 }
             }
-            Err(NetError::TimedOut { .. }) => {
-                let now = self.now().max(self.session.deadline().unwrap_or(Millis(0)));
-                let e = match self.session.on_timeout(now) {
-                    Err(e) => e,
-                    Ok(()) => self.session.connection_lost(ErrorKind::Timeout),
-                };
-                self.drop_conn();
-                Err(e)
-            }
+            Err(NetError::TimedOut { .. }) => Err(self.timed_out(total)),
             Err(e) => Err(self.lost(ErrorKind::Io(net_kind(e)))),
         }
     }
@@ -889,7 +948,10 @@ impl Client {
                 return Err(err.with_disposition(Disposition::Permanent));
             }
         };
-        let deadline = Instant::now() + self.server.timeouts.tls_handshake;
+        let mut deadline = Instant::now() + self.server.timeouts.tls_handshake;
+        if let Some(t) = self.total {
+            deadline = deadline.min(t);
+        }
         let Some(conn) = self.conn.as_mut() else {
             return Err(Error::new(ErrorKind::ConnectionClosed));
         };
@@ -987,10 +1049,23 @@ impl Client {
     ///
     /// Every send error; see [`send`].
     pub fn send_prepared(&mut self, message: &PreparedMessage) -> Result<Report, Error> {
-        admit(&self.server, message)?;
+        let total = total_deadline(&self.server);
+        self.send_by(message, total)
+    }
+
+    /// As [`send_prepared`](Client::send_prepared), with the end of
+    /// `Timeouts::total` given (a pool counts it from before the connect).
+    pub(crate) fn send_by(
+        &mut self,
+        message: &PreparedMessage,
+        total: Option<Instant>,
+    ) -> Result<Report, Error> {
+        let admitted = admit(&self.server, message)?;
+        self.total = total;
         let result = self.deliver(message);
+        self.total = None;
         if let Err(e) = &result {
-            refund_on(&self.server, message, e);
+            refund_on(&self.server, message, admitted, e);
         }
         self.server.observe(message, &result);
         result
@@ -1086,7 +1161,7 @@ impl Client {
             }
             c.tcp.abort();
         }
-        let (conn, session) = Client::open(&self.server)?;
+        let (conn, session) = Client::open(&self.server, self.total)?;
         self.conn = Some(conn);
         self.session = session;
         self.epoch = Instant::now();

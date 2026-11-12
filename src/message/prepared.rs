@@ -131,8 +131,24 @@ pub struct Dsn {
     policy: DsnPolicy,
 }
 
-/// Longest ENVID, in characters (RFC 3461 4.4).
+/// Longest ENVID on the wire, in characters, after xtext encoding (RFC
+/// 3461 4.4: "The ENVID parameter MAY be up to 100 characters").
 const MAX_ENVID: usize = 100;
+
+/// The length of `value` as xtext: `+XX` for `+`, `=`, and octets outside
+/// 33 to 126, one character for every other octet.
+pub(crate) fn xtext_len(value: &[u8]) -> usize {
+    value
+        .iter()
+        .map(|&b| {
+            if (33..=126).contains(&b) && b != b'+' && b != b'=' {
+                1
+            } else {
+                3
+            }
+        })
+        .sum()
+}
 
 impl Dsn {
     /// DSN parameters with `notify` on every recipient, no `RET`, no `ENVID`,
@@ -154,13 +170,19 @@ impl Dsn {
         self
     }
 
-    /// Sets `ENVID`: printable ASCII, at most 100 characters (xtext-encoded on the wire).
+    /// Sets `ENVID`: printable ASCII, at most 100 characters as sent. The
+    /// value goes out as xtext, where `+`, `=`, and a space take three
+    /// characters each, so an id of 100 characters with any of them is
+    /// refused (RFC 3461 4.4).
     ///
     /// # Errors
     ///
     /// `Build(InvalidDsn)`.
     pub fn with_envelope_id(mut self, id: &str) -> Result<Dsn, Error> {
-        if id.is_empty() || id.len() > MAX_ENVID || !id.bytes().all(|b| (32..127).contains(&b)) {
+        if id.is_empty()
+            || xtext_len(id.as_bytes()) > MAX_ENVID
+            || !id.bytes().all(|b| (32..127).contains(&b))
+        {
             return Err(BuildError::InvalidDsn.into());
         }
         self.envelope_id = Some(String::from(id));
@@ -998,6 +1020,7 @@ mod tests {
         let mut out = Vec::new();
         xtext(b"a+b=c d\x01~", &mut out);
         assert_eq!(out, b"a+2Bb+3Dc+20d+01~");
+        assert_eq!(xtext_len(b"a+b=c d\x01~"), out.len());
     }
 
     #[test]
@@ -1011,6 +1034,17 @@ mod tests {
         assert!(
             Dsn::new(DsnNotify::NEVER)
                 .with_envelope_id(&"x".repeat(101))
+                .is_err()
+        );
+        // Measured as sent: 34 plus signs are 102 characters of xtext.
+        assert!(
+            Dsn::new(DsnNotify::NEVER)
+                .with_envelope_id(&"+".repeat(33))
+                .is_ok()
+        );
+        assert!(
+            Dsn::new(DsnNotify::NEVER)
+                .with_envelope_id(&"+".repeat(34))
                 .is_err()
         );
         assert!(
