@@ -439,7 +439,7 @@ pub enum Event {
 | `Session::poll_event` | FIFO of at most 4 plus the recipient count; bounded by `max_recipients` | none | 0 alloc after `new` | P0 | 3 | 0.3 |
 | `Session::deadline`, `on_timeout` | the stage deadline; `on_timeout` closes the session with `Timeout { stage }` when `now` is past it, otherwise does nothing | `Timeout` | 0 alloc | P0 | 3 | 0.3 |
 | `Session::tls_established` | valid only in `NeedTls` (STARTTLS) or at start (implicit TLS); discards capabilities; queues EHLO | `Usage(WrongState)` | 0 alloc | P0 | 3 | 0.4 |
-| `Session::begin` | validates the envelope against capabilities (SIZE, SMTPUTF8, 8BITMIME, DSN), then queues MAIL, RCPT, and DATA or BDAT per 7.6 | `MessageTooLarge`, `ExtensionRequired(...)`, `Usage(WrongState)` | 40 ns per command, 0 alloc **[est.]** | P0 | 3 | 0.3 |
+| `Session::begin` | validates the envelope against capabilities (SIZE, SMTPUTF8, 8BITMIME, DSN) and measures every MAIL and RCPT line, then queues MAIL, RCPT, and DATA or BDAT per 7.6; a refusal queues nothing | `MessageTooLarge`, `ExtensionRequired(...)`, `Build(CommandTooLong)`, `Usage(WrongState)` | 80 ns per command, 0 alloc **[est.]** | P0 | 3 | 0.3 |
 | `Session::body` | accepts up to the free output capacity, dot-stuffing (DATA) or framing (BDAT); refuses bare CR or LF | `Build(BareLineFeed)` and `Build(BareCarriageReturn)` (permanent), `Usage(WrongState)` | at least 4 GB/s on lines without a leading dot **[est.]**, 0 alloc | P0 | 3 | 0.3 |
 | `Session::end_body` | writes `CRLF . CRLF` (the first CRLF only if the body did not end in CRLF) or `BDAT 0 LAST` when needed; marks the `possibly_delivered` point | `Usage(WrongState)` | 0 alloc | P0 | 3 | 0.3 |
 | `Session::reset` | RSET (after a failed BDAT, or to abandon a transaction) | `Usage(WrongState)` | 0 alloc | P0 | 3 | 0.3 |
@@ -838,6 +838,7 @@ Each enum is `#[non_exhaustive]`, implements `Display` (what was refused and wha
     TooLarge { size: u64, limit: u64 }, DepthExceeded, InlineWithoutHtml, DuplicateContentId,
     BareCarriageReturn { position: u64 }, BareLineFeed { position: u64 }, LineTooLong { line: u64 },
     NoHeaderBlock, LengthMismatch { declared: u64, actual: u64 }, EncodingMismatch, InvalidDsn,
+    CommandTooLong, CommandHasControl,
 }
 #[non_exhaustive] pub enum ConfigError {                                  // Permanent
     PortZero, InvalidHost, PlaintextHostNotLoopback, CredentialsWithoutSecurity,
@@ -1089,3 +1090,4 @@ Each change is recorded in `dev/PLAN.md` section 19.
 | 0.7.0 | Test support: `TestServerBuilder::record`, `TestServer::messages` | D-095 |
 | 0.7.1 | Connects race the resolved addresses (250 ms, 100 ms for loopback); no API change | D-107 |
 | 0.7.1 | `DomainLimit` keeps a newer bucket's count after a backward clock step; no API change | D-106 |
+| 0.7.2 | A refused MAIL or RCPT line queues nothing; new `BuildError::{CommandTooLong, CommandHasControl}` (were `Usage(Closed)`); `Client::is_open` is false while commands or replies are outstanding; `TestServer` answers a nested MAIL with `503` and keeps the transaction | D-119 |

@@ -41,7 +41,7 @@ scripts/run.sh                                 # in smtp-net-bench, the competit
 | Session memory, ready with one transaction | at most 16 KiB | 19,176 bytes (6,888 with a 4 KiB output buffer) | missed, D-085 |
 | `HourlyLimit::admit`, uncontended | at most 30 ns | 29 to 32 ns | met within noise |
 
-`Session::begin` and the whole body path allocate nothing; `tests/alloc.rs` holds that and the build count.
+`Session::begin` (with or without DSN parameters) and the whole body path allocate nothing; `tests/alloc.rs` holds that and the build count.
 
 ## Against other crates
 
