@@ -79,7 +79,7 @@ Exit: 1 hour per fuzz target with no finding open; 24-hour soak passes (NFR-14);
 - [x] SCRAM timing: |t| at most 1.76 on Linux and 1.19 on Windows, against 4.5 (D-099).
 - [x] Defect found and fixed: an out-of-step reply was a permanent `Rejected` (D-096).
 
-## v0.7.1 - Platform notes
+## v0.7.1 - Platform notes - DONE
 Exit: `docs/PLATFORM-NOTES.md` checked against the code and measured where it gives a number; net-io 0.7.1 and tls-net 0.9.0; every gate green. Moved from 0.8 because 0.8 waits on the field test (D-108).
 - [x] `docs/PLATFORM-NOTES.md`.
 - [x] net-io 0.7.1 and tls-net 0.9.0 (D-105).
@@ -89,9 +89,14 @@ Exit: `docs/PLATFORM-NOTES.md` checked against the code and measured where it gi
 Exit: the defect fixed test-first through `Client` and `Pool` against a server that keeps the transaction on a nested MAIL; every gate green; 0.7.0 and 0.7.1 yanked.
 - [x] A refused send left MAIL and RCPT lines queued for the next message on the connection (D-119, T-37).
 
-## v0.8.0 - Alpha
+## v0.8.x - Alpha
 Exit: the first site sends verification and reset mail through task-io and smtp-net in production for two weeks with every failure classified correctly; interop matrix (Exim, Postfix, Mailpit, Microsoft 365, Gmail) green.
 Depends on: task-io in production and the first site live (James).
+0.8.0 ships the simplified API the field test runs on (D-109); what the field test finds ships as 0.8.x patches with no API change.
+- [x] Every public item of the 0.7.1 API checked for plain names and one way to do each thing (`dev/API-0.8.md`); the changes ship in 0.8.0 with a migration table (D-110 to D-118).
+- [x] `docs/API.md` rewritten as a task-oriented reference of every public item; it and the README compile as doctests (D-110).
+- [x] Defect found and fixed: `DomainLimit` admitted everything through the count-based `SendGate::admit`, so a caller using that method had no per-domain limit (D-111).
+- [x] Bugs found before the field test: commands left queued after a refused send, fixed in 0.7.2 (D-119); body write deadlines, `Timeouts::total`, DKIM oversigning, long display names, gate refunds, EHLO capabilities, command-line limits, and smaller ones fixed test-first in 0.8.0 (D-120 to D-131). Still open: a run against a real Postfix (none on this machine; the test server answers a nested MAIL the way Postfix does, and Postfix is in the field-test interop matrix).
 - [ ] Field test on the cPanel host's Exim on `127.0.0.1` (moved from 0.3, D-033), Microsoft 365 and Gmail submission; O-21 (what cPanel counts) and O-24 (`Auto-Submitted`) checked.
 - [ ] DKIM at public receivers (moved from 0.5, D-070): `Authentication-Results: dkim=pass` at Gmail and Outlook.com for RSA, and for Ed25519 where the receiver verifies it, from a domain with both keys published.
 - [ ] XOAUTH2 against Gmail and Microsoft 365 with real tokens.

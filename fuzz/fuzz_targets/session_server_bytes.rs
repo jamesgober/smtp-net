@@ -2,7 +2,8 @@
 //! Arbitrary server bytes against a session in each starting state: no
 //! panic, and nothing is ever written after STARTTLS before the handshake.
 use libfuzzer_sys::fuzz_target;
-use smtp_net::{Address, BodyFlags, Envelope, Millis, Session, SessionConfig, SessionSecurity, SessionState};
+use smtp_net::{Address, Envelope};
+use smtp_net::protocol::{BodyFlags, Millis, Session, SessionConfig, SessionSecurity, SessionState};
 
 fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else { return };

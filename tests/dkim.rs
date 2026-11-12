@@ -9,9 +9,10 @@
 
 use std::fmt::Write as _;
 
+use smtp_net::testing::TestServer;
 use smtp_net::{
     Address, Attachment, Canonicalization, ConfigError, DkimKey, DkimSigner, Envelope, ErrorKind,
-    Message, PreparedMessage, TestServer,
+    Message, PreparedMessage,
 };
 
 const RFC8032_SEED: [u8; 32] = [
@@ -81,7 +82,11 @@ fn test_send_prepared_never_resigns() {
     let s = server.server_builder().dkim(ed25519()).build().unwrap();
     let plain = msg().prepare().unwrap();
     smtp_net::send_prepared(&s, &plain).unwrap();
-    let signed = msg().prepare_signed(&[ed25519()], 1_700_000_000).unwrap();
+    let signed = msg()
+        .prepare()
+        .unwrap()
+        .sign(&[ed25519()], 1_700_000_000)
+        .unwrap();
     smtp_net::send_prepared(&s, &signed).unwrap();
     let got = server.received();
     assert!(!got[0].data.starts_with(b"DKIM-Signature"));
@@ -201,7 +206,9 @@ fn test_write_verifier_corpus() {
                 .unwrap();
             for (name, m) in &messages {
                 let signed = m
-                    .prepare_signed(std::slice::from_ref(&signer), now)
+                    .prepare()
+                    .unwrap()
+                    .sign(std::slice::from_ref(&signer), now)
                     .unwrap();
                 let bytes = signed.bytes();
                 let file = |kind: &str| dir.join(format!("{kind}-{selector}-{mode}-{name}.eml"));
@@ -219,7 +226,9 @@ fn test_write_verifier_corpus() {
     }
     // Two signatures on one message, each checked by the verifier.
     let pair = msg()
-        .prepare_signed(
+        .prepare()
+        .unwrap()
+        .sign(
             &[
                 DkimSigner::new("example.com", "rsa2048", signers[2].1.clone()).unwrap(),
                 DkimSigner::new("example.com", "ed", signers[0].1.clone()).unwrap(),

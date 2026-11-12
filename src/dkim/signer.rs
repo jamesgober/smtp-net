@@ -12,7 +12,7 @@ use crate::encode::base64_append;
 use crate::error::DkimError;
 
 /// Headers signed when present, in this order (PLAN 7.10).
-const DEFAULT_HEADERS: [&str; 14] = [
+const DEFAULT_HEADERS: [&str; 15] = [
     "from",
     "to",
     "cc",
@@ -20,6 +20,7 @@ const DEFAULT_HEADERS: [&str; 14] = [
     "date",
     "message-id",
     "reply-to",
+    "sender",
     "in-reply-to",
     "references",
     "mime-version",
@@ -30,16 +31,11 @@ const DEFAULT_HEADERS: [&str; 14] = [
 ];
 
 /// Headers listed once more than they occur, so one added in transit breaks
-/// the signature (RFC 6376 section 5.4.2; T-20).
-const DEFAULT_OVERSIGN: [&str; 7] = [
-    "from",
-    "to",
-    "cc",
-    "subject",
-    "date",
-    "reply-to",
-    "message-id",
-];
+/// the signature (RFC 6376 section 5.4.2; T-20): every default header. A
+/// verifier hashes the bottom-most instances named in `h=`, so a header
+/// that is signed but not oversigned can be added above the signed one
+/// (a second Content-Type, say) and the signature still verifies.
+const DEFAULT_OVERSIGN: [&str; 15] = DEFAULT_HEADERS;
 
 /// Largest header block signed (64 KiB) **[budget]**.
 pub(crate) const MAX_HEADER_BLOCK: usize = 64 * 1024;
@@ -49,9 +45,11 @@ const WIDTH: usize = 78;
 
 /// Signs messages for one domain and selector.
 ///
-/// Defaults: relaxed/relaxed canonicalization; the headers of PLAN 7.10
-/// signed when present (From always); From, To, Cc, Subject, Date, Reply-To,
-/// and Message-ID oversigned; `t=` set; no `x=`, no `i=`. `l=` (body
+/// Defaults: relaxed/relaxed canonicalization; From, To, Cc, Subject,
+/// Date, Message-ID, Reply-To, Sender, In-Reply-To, References,
+/// MIME-Version, Content-Type, Content-Transfer-Encoding,
+/// List-Unsubscribe, and List-Unsubscribe-Post signed when present (From
+/// always) and every one of them oversigned; `t=` set; no `x=`, no `i=`. `l=` (body
 /// length) is never written, nor `rsa-sha1` (RFC 8301 section 3.1).
 ///
 /// # Examples

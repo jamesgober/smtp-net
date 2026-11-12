@@ -2,9 +2,9 @@
 
 use std::time::Duration;
 
+use smtp_net::testing::{Fault, TestServer};
 use smtp_net::{
-    Attachment, Client, ErrorKind, Fault, Message, RecipientPolicy, Security, Server, Stage,
-    TestServer, Timeouts,
+    Attachment, Client, ErrorKind, Message, RecipientPolicy, Security, Server, Stage, Timeouts,
 };
 
 fn msg(to: &str) -> Message {
@@ -38,7 +38,7 @@ fn test_send_delivers_exact_bytes_after_unstuffing() {
     let m = msg("user@example.org");
     let report = smtp_net::send(&server.server(), &m).unwrap();
     assert_eq!(report.message_id(), m.message_id());
-    assert_eq!(report.accepted().count(), 1);
+    assert_eq!(report.accepted().len(), 1);
     assert!(!report.was_secure());
     let got = server.received();
     assert_eq!(got.len(), 1);
@@ -146,11 +146,11 @@ fn test_rejected_recipient_reported_and_others_delivered() {
         .build()
         .unwrap();
     let report = smtp_net::send(&server.server(), &m).unwrap();
-    assert_eq!(report.accepted().count(), 1);
-    let rejected: Vec<_> = report.rejected().collect();
+    assert_eq!(report.accepted().len(), 1);
+    let rejected = report.rejected();
     assert_eq!(rejected.len(), 1);
-    assert_eq!(rejected[0].0.as_str(), "c@example.org");
-    assert!(rejected[0].2 == smtp_net::Disposition::Permanent);
+    assert_eq!(rejected[0].address().as_str(), "c@example.org");
+    assert!(rejected[0].is_permanent());
     assert_eq!(server.received()[0].recipients, ["b@example.org"]);
 }
 
@@ -178,7 +178,7 @@ fn test_policy_all_refuses_partial_delivery() {
         .unwrap();
     let e = smtp_net::send(&s, &m).unwrap_err();
     assert!(e.is_permanent());
-    assert_eq!(e.recipients().len(), 1);
+    assert_eq!(e.rejected().len(), 1);
     assert!(server.received().is_empty());
 }
 
@@ -194,7 +194,7 @@ fn test_all_recipients_rejected() {
         "{e:?}"
     );
     assert!(e.is_permanent());
-    assert_eq!(e.recipients()[0].0.as_str(), "a@example.org");
+    assert_eq!(e.rejected()[0].address().as_str(), "a@example.org");
 }
 
 #[test]
@@ -492,4 +492,265 @@ fn test_localhost_connects_quickly_when_the_server_listens_on_ipv4_only() {
         drop(client);
         assert!(took < Duration::from_millis(600), "connect took {took:?}");
     }
+}
+
+#[test]
+fn test_client_name_is_checked_by_build_and_sent_in_ehlo() {
+    let server = TestServer::start().unwrap();
+    let bad = server.server_builder().client_name("not a name").build();
+    assert!(matches!(
+        bad.unwrap_err().kind(),
+        ErrorKind::Config(smtp_net::ConfigError::InvalidClientName)
+    ));
+    let named = server
+        .server_builder()
+        .client_name("app-1.example.com")
+        .build()
+        .unwrap();
+    smtp_net::send(&named, &msg("a@example.org")).unwrap();
+    assert!(server.transcript().contains("C: EHLO app-1.example.com"));
+}
+
+#[test]
+fn test_mechanism_list_is_checked_by_build() {
+    let server = TestServer::start().unwrap();
+    let empty = server
+        .server_builder()
+        .credentials(smtp_net::Credentials::password("u", "p"))
+        .mechanisms(&[])
+        .build();
+    assert!(matches!(
+        empty.unwrap_err().kind(),
+        ErrorKind::Config(smtp_net::ConfigError::TooManyMechanisms)
+    ));
+}
+
+#[test]
+fn test_rejected_recipient_accessors_agree_with_the_error() {
+    let server = TestServer::builder()
+        .fault(Fault::RejectRecipient(0))
+        .start()
+        .unwrap();
+    let e = smtp_net::send(&quick(&server), &msg("gone@example.org")).unwrap_err();
+    let r = &e.rejected()[0];
+    assert_eq!(r.address().as_str(), "gone@example.org");
+    assert_eq!(r.reply().code().get() / 100, 5);
+    assert!(r.is_permanent() && !r.is_temporary());
+    assert_eq!(r.disposition(), smtp_net::Disposition::Permanent);
+}
+
+/// A server that answers every command with 250, and after DATA (354)
+/// reads the body `chunk` octets at a time with `pause` between reads, or
+/// not at all when `chunk` is 0. Returns the port.
+fn body_reader(chunk: usize, pause: Duration) -> u16 {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let Ok((sock, _)) = l.accept() else { return };
+        let mut w = sock.try_clone().unwrap();
+        let mut r = BufReader::new(sock);
+        let _ = w.write_all(b"220 slow.example ESMTP\r\n");
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let up = line.to_ascii_uppercase();
+            if up.starts_with("EHLO") {
+                let _ = w.write_all(b"250-slow.example\r\n250 8BITMIME\r\n");
+            } else if up.starts_with("DATA") {
+                let _ = w.write_all(b"354 go\r\n");
+                let mut buf = vec![0u8; chunk.max(1)];
+                loop {
+                    std::thread::sleep(pause);
+                    if chunk == 0 {
+                        continue;
+                    }
+                    match r.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                }
+            } else {
+                let _ = w.write_all(b"250 ok\r\n");
+            }
+        }
+    });
+    port
+}
+
+fn body_of(octets: usize) -> Message {
+    let line = "a".repeat(76) + "\n";
+    Message::builder()
+        .from("a@example.com")
+        .unwrap()
+        .to("b@example.org")
+        .unwrap()
+        .text(&line.repeat(octets / 77))
+        .unwrap()
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn test_body_writes_are_timed_per_block_not_by_the_data_reply() {
+    // T-13: writing the body runs under Timeouts::data_block, renewed for
+    // every block, not under the deadline left by the 354 (data_init). A
+    // reader that never stalls for long keeps the send alive.
+    let port = body_reader(16 * 1024, Duration::from_millis(5));
+    let mut t = Timeouts::local();
+    t.data_init = Duration::from_millis(300);
+    t.data_block = Duration::from_secs(30);
+    t.data_end = Duration::from_millis(300);
+    let server = Server::builder("127.0.0.1", Security::PlaintextLoopback)
+        .port(port)
+        .timeouts(t)
+        .pipelining(false)
+        .build()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let r = smtp_net::send(&server, &body_of(4 << 20));
+    let took = start.elapsed();
+    // The server never answers the end of data; what matters is that the
+    // whole body was written, well after data_init.
+    let e = r.unwrap_err();
+    assert_eq!(e.stage(), Some(Stage::DataEnd), "{e} after {took:?}");
+    assert!(took > Duration::from_millis(300), "{took:?}");
+}
+
+#[test]
+fn test_a_stalled_body_write_times_out_at_data_block() {
+    let port = body_reader(0, Duration::from_millis(50));
+    let mut t = Timeouts::local();
+    t.data_block = Duration::from_millis(500);
+    let server = Server::builder("127.0.0.1", Security::PlaintextLoopback)
+        .port(port)
+        .timeouts(t)
+        .pipelining(false)
+        .build()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let e = smtp_net::send(&server, &body_of(16 << 20)).unwrap_err();
+    assert!(matches!(e.kind(), ErrorKind::Timeout), "{e}");
+    assert_eq!(e.stage(), Some(Stage::Body));
+    assert!(e.is_temporary());
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn test_total_timeout_bounds_the_whole_send() {
+    let server = TestServer::builder()
+        .fault(Fault::DelayAt {
+            stage: Stage::DataEnd,
+            by: Duration::from_secs(3),
+        })
+        .start()
+        .unwrap();
+    let mut t = Timeouts::local();
+    t.total = Some(Duration::from_millis(500));
+    let s = server.server_builder().timeouts(t).build().unwrap();
+    let start = std::time::Instant::now();
+    let e = smtp_net::send(&s, &msg("b@example.org")).unwrap_err();
+    let took = start.elapsed();
+    assert!(matches!(e.kind(), ErrorKind::Timeout), "{e}");
+    assert_eq!(e.stage(), Some(Stage::Total));
+    assert!(e.is_temporary());
+    // The end of the data was written before the total ran out.
+    assert!(e.possibly_delivered());
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    // The same through a Client and a Pool.
+    let mut client = Client::connect(&s).unwrap();
+    let e = client.send(&msg("b@example.org")).unwrap_err();
+    assert_eq!(e.stage(), Some(Stage::Total));
+    let pool = smtp_net::Pool::new(s, 1).unwrap();
+    let e = pool.send(&msg("b@example.org")).unwrap_err();
+    assert_eq!(e.stage(), Some(Stage::Total));
+}
+
+#[test]
+fn test_refund_gives_back_to_the_admission_time() {
+    // A failure seconds after the admission refunds at the admission time,
+    // so the allowance returns to the window it was taken from.
+    use smtp_net::{Admission, Envelope, SendGate};
+    use std::sync::{Arc, Mutex};
+    #[derive(Default)]
+    struct Times {
+        admitted: Mutex<Vec<u64>>,
+        refunded: Mutex<Vec<u64>>,
+    }
+    struct Recorder(Arc<Times>);
+    impl SendGate for Recorder {
+        fn admit(&self, _: &Envelope, now_unix_ms: u64) -> Admission {
+            self.0.admitted.lock().unwrap().push(now_unix_ms);
+            Admission::Admit
+        }
+        fn refund(&self, _: &Envelope, admitted_unix_ms: u64) {
+            self.0.refunded.lock().unwrap().push(admitted_unix_ms);
+        }
+    }
+    let server = TestServer::builder()
+        .fault(Fault::DelayAt {
+            stage: Stage::Mail,
+            by: Duration::from_millis(1500),
+        })
+        .start()
+        .unwrap();
+    let times = Arc::new(Times::default());
+    let mut t = Timeouts::local();
+    t.mail = Duration::from_millis(400);
+    let s = server
+        .server_builder()
+        .timeouts(t)
+        .gate(Recorder(times.clone()))
+        .build()
+        .unwrap();
+    let e = smtp_net::send(&s, &msg("b@example.org")).unwrap_err();
+    assert!(matches!(e.kind(), ErrorKind::Timeout), "{e}");
+    assert!(!e.possibly_delivered());
+    assert_eq!(
+        *times.refunded.lock().unwrap(),
+        *times.admitted.lock().unwrap()
+    );
+}
+
+#[test]
+fn test_tier1_constructors_check_the_host_like_the_builder() {
+    // Server::starttls has no Result to return, so a bad host is
+    // reported by the first connect as Config(InvalidHost), as `build`
+    // would have, before anything is resolved or sent.
+    let start = std::time::Instant::now();
+    for server in [
+        Server::starttls("not a host"),
+        Server::implicit_tls("bad..example"),
+    ] {
+        let e = smtp_net::send(&server, &msg("b@example.org")).unwrap_err();
+        assert!(
+            matches!(
+                e.kind(),
+                ErrorKind::Config(smtp_net::ConfigError::InvalidHost)
+            ),
+            "{e}"
+        );
+        assert!(e.is_permanent());
+        assert!(Client::connect(&server).is_err());
+    }
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(Server::starttls("not a host").to_builder().build().is_err());
+}
+
+#[test]
+fn test_oauth2_one_liner_authenticates() {
+    let server = TestServer::builder()
+        .oauth2("me@example.com", "ya29.token")
+        .start()
+        .unwrap();
+    let s = server.server().oauth2("me@example.com", "ya29.token");
+    smtp_net::send(&s, &msg("b@example.org")).unwrap();
+    assert_eq!(server.received()[0].user.as_deref(), Some("me@example.com"));
 }

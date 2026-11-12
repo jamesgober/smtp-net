@@ -6,7 +6,7 @@ use crate::error::{Disposition, Error, ErrorKind, Stage};
 /// The disposition of a refusal by its code: `4yz` temporary, everything
 /// else permanent.
 pub(crate) fn rejected_disposition(code: ReplyCode) -> Disposition {
-    if code.is_transient() {
+    if code.is_temporary() {
         Disposition::Temporary
     } else {
         Disposition::Permanent
@@ -27,7 +27,7 @@ pub(crate) fn reply_error(stage: Stage, reply: Reply) -> Error {
 /// temporary; everything else permanent.
 pub(crate) fn auth_error(reply: Reply) -> Error {
     let code = reply.code().get();
-    let disposition = if code == 432 || !reply.code().is_transient() {
+    let disposition = if code == 432 || !reply.code().is_temporary() {
         Disposition::Permanent
     } else {
         Disposition::Temporary

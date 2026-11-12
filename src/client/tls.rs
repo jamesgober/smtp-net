@@ -23,7 +23,7 @@ use crate::{
 ///     }
 /// }
 /// let server = smtp_net::Server::builder("localhost", smtp_net::Security::StartTls)
-///     .tls_connector(Refuse)
+///     .tls(Refuse)
 ///     .build()?;
 /// # let _ = server;
 /// # Ok::<(), smtp_net::Error>(())

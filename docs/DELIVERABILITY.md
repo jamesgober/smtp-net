@@ -37,11 +37,11 @@ Or run the example: `cargo run --example dkim_dns_record --features dkim -- dkim
   ```
 
   smtp-net accepts RSA keys of 2048 to 4096 bits (shorter keys are refused; RFC 8301 asks for at least 2048) and Ed25519 keys, as PKCS#8 or (RSA) PKCS#1, PEM or DER, unencrypted. Keep the files readable only by the sending service.
-- **Two signatures.** Sign with RSA and Ed25519 under different selectors (RFC 8463 section 6): receivers that verify Ed25519 use it, the others use RSA. Add both signers to the `Server` (`ServerBuilder::dkim`, at most 4) or pass both to `Message::prepare_signed`.
+- **Two signatures.** Sign with RSA and Ed25519 under different selectors (RFC 8463 section 6): receivers that verify Ed25519 use it, the others use RSA. Add both signers to the `Server` (`ServerBuilder::dkim`, at most 4) or pass both to `PreparedMessage::sign`.
 - **Long records.** An RSA 2048-bit record is longer than 255 octets, the limit of one DNS string. It is published as several quoted strings inside one TXT record; most DNS hosting interfaces split it on their own.
 - **Rotation.** Publish the new selector's record, wait for it to be visible, switch the signer, keep the old record for about a week (mail in flight is still verified against it) **[check]**, then remove it.
 - **Defaults.** Relaxed canonicalization for header and body; From, To, Cc, Subject, Date, Reply-To, and Message-ID oversigned, so adding one of them in transit breaks the signature; no `l=` tag, so nothing can be appended under a valid signature.
-- **Sign once.** Sign before the message enters a job queue (`Message::prepare_signed`, then `PreparedMessage::encode`). `send_prepared` never re-signs, so retries send the same signed bytes.
+- **Sign once.** Sign before the message enters a job queue (`message.prepare()?.sign(..)`, then `PreparedMessage::encode`). `send_prepared` never re-signs, so retries send the same signed bytes.
 
 ## 4. cPanel's own DKIM
 
@@ -73,7 +73,7 @@ Mark automated mail with `MessageBuilder::auto_submitted` so auto-responders do 
 
 A refusal during the SMTP conversation comes back as an smtp-net error: check `is_temporary()` and `is_permanent()`, and do not retry a permanent one. Most delivery failures arrive later, as a bounce message (a delivery status notification, RFC 3464) sent to the envelope return path.
 
-- Use a dedicated return-path mailbox (`Envelope::return_path`) so bounces do not land in a person's inbox.
+- Use a dedicated return-path mailbox (`Envelope::with_return_path`) so bounces do not land in a person's inbox.
 - A return path that identifies the message (`bounces+<token>@example.com`) lets the bounce processor match a bounce to the message and the recipient.
 - Treat `5.1.1` (no such mailbox) as permanent and stop sending to that address; keep a suppression list.
 - Ask for notifications only where they are read: `Dsn::new(DsnNotify::FAILURE)` asks the server for failure reports only, when it supports DSN.

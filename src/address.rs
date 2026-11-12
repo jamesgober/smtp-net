@@ -129,9 +129,28 @@ pub struct Address {
 }
 
 impl Address {
+    /// An address from `local@domain` with no validation, so tests can
+    /// reach the session's last checks (a command line over its limit).
+    #[cfg(test)]
+    pub(crate) fn unchecked(text: &str) -> Address {
+        let at = text.rfind('@').map_or(0, |i| i + 1);
+        Address {
+            domain: Domain {
+                text: String::from(text),
+                start: at,
+                ascii: text.is_ascii(),
+                literal: false,
+            },
+        }
+    }
+
     /// Parses an `addr-spec`: a dot-atom or quoted-string local part, `@`, and
     /// a domain name. Comments, folding whitespace, obsolete syntax, and domain
-    /// literals are refused. Leading and trailing spaces are ignored.
+    /// literals are refused, and so is a quoted local part holding a space,
+    /// a tab, or one of `<`, `>`, `@`, `=`, `;`, `,` (it could read as ESMTP
+    /// parameters on a MAIL or RCPT line; RFC 5321 4.1.2 says not to send
+    /// quoted local parts unless they are needed). Leading and trailing
+    /// spaces are ignored.
     ///
     /// # Errors
     ///
@@ -338,6 +357,18 @@ fn parse_address(input: &str, allow_literal: bool) -> Result<Address, AddressErr
         mail::LocalPart::DotAtom(a) => a.len(),
         mail::LocalPart::Quoted(q) => q.raw().len() + 2,
     };
+    if let mail::LocalPart::Quoted(q) = spec.local {
+        // Offset 1: past the opening quote.
+        if let Some(i) = q
+            .raw()
+            .iter()
+            .position(|b| matches!(b, b' ' | b'\t' | b'<' | b'>' | b'@' | b'=' | b';' | b','))
+        {
+            return Err(AddressError::RiskyQuotedLocalPart {
+                position: lead + 1 + i,
+            });
+        }
+    }
     if local_len > MAX_LOCAL_PART {
         return Err(AddressError::TooLong {
             part: AddressPart::LocalPart,
@@ -451,8 +482,11 @@ impl Mailbox {
                 address: Address::parse(input)?,
             });
         }
+        // The angle address starts at the last `<`: a quoted display name
+        // may hold `<` ("Sales <EU>"), and an address cannot (a quoted local
+        // part with `<` is refused).
+        let lt = bytes.iter().rposition(|&b| b == b'<').unwrap_or(0);
         let parsed = mail::parse_mailbox(bytes, &Limits::DEFAULT).map_err(|e| {
-            let lt = bytes.iter().position(|&b| b == b'<').unwrap_or(0);
             if e.offset() < lt {
                 AddressError::DisplayNameInvalid {
                     position: e.offset(),
@@ -463,7 +497,6 @@ impl Mailbox {
                 map_parse_error(e, at.saturating_add(lt + 1), inner.len()).shift(0)
             }
         })?;
-        let lt = bytes.iter().position(|&b| b == b'<').unwrap_or(0);
         let gt = bytes
             .iter()
             .rposition(|&b| b == b'>')
@@ -554,11 +587,17 @@ impl fmt::Debug for Mailbox {
 
 /// The header form: the display name as an atom phrase, a quoted string, or
 /// (for non-ASCII text) RFC 2047 encoded words, then `<address>`.
+/// The header form on one line: the folds a header needs are left out, so
+/// the text holds no CR or LF (a log line stays one line).
 impl fmt::Display for Mailbox {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = String::new();
         crate::message::header::write_mailbox(self, &mut s, 0);
-        f.write_str(&s)
+        // Every fold is CRLF before a space, so removing CRLF unfolds it.
+        for piece in s.split("\r\n") {
+            f.write_str(piece)?;
+        }
+        Ok(())
     }
 }
 
@@ -596,8 +635,8 @@ mod tests {
         for s in [
             "a@b.example",
             "first.last@example.com",
-            "\"john doe\"@example.com",
-            "\"a@b\"@example.com",
+            "\"john..doe\"@example.com",
+            "\"a(b)c\"@example.com",
             "user+tag@sub.example.co.uk",
             "x@123.example",
             "x@xn--bcher-kva.example",
@@ -605,9 +644,46 @@ mod tests {
             let a = Address::parse(s).unwrap_or_else(|e| panic!("{s}: {e}"));
             assert_eq!(a.as_str(), s);
         }
-        let q = Address::parse("\"john doe\"@example.com").unwrap();
-        assert_eq!(q.local_part(), "\"john doe\"");
+        let q = Address::parse("\"john..doe\"@example.com").unwrap();
+        assert_eq!(q.local_part(), "\"john..doe\"");
         assert_eq!(q.domain().as_str(), "example.com");
+    }
+
+    #[test]
+    fn test_quoted_display_name_may_hold_angle_brackets() {
+        // The address is the angle address at the end, not whatever
+        // follows the first `<`.
+        let m = Mailbox::parse("\"Sales <EU>\" <sales@example.com>").unwrap();
+        assert_eq!(m.display_name(), Some("Sales <EU>"));
+        assert_eq!(m.address().as_str(), "sales@example.com");
+        let m = Mailbox::parse("\"a <b@evil.example>\" <c@example.com>").unwrap();
+        assert_eq!(m.address().as_str(), "c@example.com");
+        assert!(Mailbox::parse("Sales <EU> <sales@example.com>").is_err());
+    }
+
+    #[test]
+    fn test_quoted_local_parts_that_read_as_parameters_are_refused() {
+        // `RCPT TO:<"x> NOTIFY=SUCCESS ORCPT=rfc822;spy@evil.example"@...>`
+        // reads as parameters to anything that ends the path at the first `>`.
+        for (s, at) in [
+            (
+                "\"x> NOTIFY=SUCCESS ORCPT=rfc822;spy@evil.example\"@example.com",
+                2,
+            ),
+            ("\"john doe\"@example.com", 5),
+            ("\"a@b\"@example.com", 2),
+            ("\"a<b\"@example.com", 2),
+            ("\"a=b\"@example.com", 2),
+            ("\"a;b\"@example.com", 2),
+            ("\"a,b\"@example.com", 2),
+            ("  \"a b\"@example.com", 4),
+        ] {
+            assert_eq!(
+                Address::parse(s).unwrap_err(),
+                AddressError::RiskyQuotedLocalPart { position: at },
+                "{s}"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Encoders and the header gate (PLAN 11.1).
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
-use smtp_net::{QpState, base64_encode_lines, check_header_value, encode_word, quoted_printable_encode, quoted_printable_finish};
+use smtp_net::mime::{QuotedPrintableState, base64_encode_lines, check_header_value, encode_word, quoted_printable_encode, quoted_printable_finish};
 
 fn bench(c: &mut Criterion) {
     let data: Vec<u8> = (0..1u32 << 20).map(|i| (i * 2_654_435_761u32 >> 24) as u8).collect();
@@ -12,7 +12,7 @@ fn bench(c: &mut Criterion) {
     g.throughput(Throughput::Bytes(text.len() as u64));
     g.bench_function("quoted_printable_1mib", |b| {
         b.iter(|| {
-            let mut st = QpState::new();
+            let mut st = QuotedPrintableState::new();
             let n = quoted_printable_encode(text.as_bytes(), &mut out, &mut st).unwrap();
             black_box(n + quoted_printable_finish(&mut out[n..], &mut st).unwrap())
         })

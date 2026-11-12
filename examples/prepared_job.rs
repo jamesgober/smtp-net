@@ -6,7 +6,8 @@
 //! cargo run --example prepared_job --features testing
 //! ```
 
-use smtp_net::{Fault, Message, PreparedMessage, Server, Stage, TestServer};
+use smtp_net::testing::{Fault, TestServer};
+use smtp_net::{Message, PreparedMessage, Server, Stage};
 
 #[derive(Debug)]
 enum JobOutcome {

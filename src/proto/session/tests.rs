@@ -201,13 +201,15 @@ fn test_body_bare_lf_refused_and_session_closed() {
     let mut s = ready(b"250 mx\r\n");
     s.begin(&envelope(1), BodyFlags::default(), 10, Millis(3))
         .unwrap();
+    // Without PIPELINING each reply comes after its command is written.
     drain(&mut s);
-    s.receive(b"250 ok\r\n250 ok\r\n", Millis(4)).unwrap();
+    s.receive(b"250 ok\r\n", Millis(4)).unwrap();
     drain(&mut s);
-    s.receive(b"250 ok\r\n", Millis(4)).ok();
+    s.receive(b"250 ok\r\n", Millis(4)).unwrap();
     drain(&mut s);
-    s.receive(b"354 go\r\n", Millis(5)).ok();
-    if s.state() == SessionState::Body {
+    s.receive(b"354 go\r\n", Millis(5)).unwrap();
+    assert_eq!(s.state(), SessionState::Body);
+    {
         let e = s
             .body(b"x\n.\nRCPT TO:<evil@x>\r\n", Millis(6))
             .unwrap_err();
@@ -282,6 +284,7 @@ impl Session {
             exchange: None,
             authenticated: self.authenticated,
             secret_out: self.secret_out,
+            written: self.written,
             txn: self.txn.clone(),
             body_deadline: self.body_deadline,
             group: self.group,
@@ -400,7 +403,8 @@ fn test_auth_output_wiped_after_transmit() {
     assert!(!s.secret_out);
 }
 
-/// 64 + 1 + 182 octets: with DSN its RCPT line passes 512 octets.
+/// 64 + 1 + 182 octets: the longest RCPT line a valid address gives with
+/// DSN, about 540 octets.
 fn long_address() -> Address {
     let domain = format!(
         "{}.{}.{}.com",
@@ -415,7 +419,7 @@ fn dsn_envelope(to: &[Address]) -> Envelope {
     use crate::message::prepared::{Dsn, DsnNotify};
     Envelope::new(Address::parse("a@example.com").unwrap(), to)
         .unwrap()
-        .dsn(Dsn::new(DsnNotify::FAILURE))
+        .with_dsn(Dsn::new(DsnNotify::FAILURE))
 }
 
 fn count(haystack: &[u8], needle: &[u8]) -> usize {
@@ -426,15 +430,51 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
 }
 
 #[test]
-fn test_begin_refusing_a_long_rcpt_queues_nothing() {
+fn test_long_rcpt_line_with_dsn_goes_out_whole() {
+    // The 512 octets are the command and its path; NOTIFY and ORCPT have
+    // their own 530 (RFC 3461 5.4), so a long address keeps its ORCPT.
+    let mut s = ready(b"250-mx\r\n250-PIPELINING\r\n250 DSN\r\n");
+    let to = [long_address()];
+    s.begin(&dsn_envelope(&to), BodyFlags::default(), 10, Millis(3))
+        .unwrap();
+    let out = drain(&mut s);
+    let rcpt = out
+        .split(|&b| b == b'\n')
+        .find(|l| l.starts_with(b"RCPT TO:"))
+        .unwrap();
+    assert!(rcpt.len() > 512, "{}", rcpt.len());
+    assert_eq!(count(rcpt, b" ORCPT=rfc822;"), 1);
+}
+
+#[test]
+fn test_orcpt_over_500_characters_is_left_out() {
+    // A valid address gives at most about 400 characters of ORCPT; 200
+    // plus signs (600 of xtext) are over 500 (RFC 3461 4.2), so the
+    // parameter is left out, not refused.
+    let plus = Address::unchecked(&format!("{}@example.org", "+".repeat(200)));
+    let mut s = ready(b"250-mx\r\n250-PIPELINING\r\n250 DSN\r\n");
+    s.begin(&dsn_envelope(&[plus]), BodyFlags::default(), 10, Millis(3))
+        .unwrap();
+    let out = drain(&mut s);
+    assert_eq!(count(&out, b"NOTIFY=FAILURE"), 1);
+    assert_eq!(count(&out, b"ORCPT="), 0);
+}
+
+#[test]
+fn test_begin_refusing_a_line_queues_nothing() {
     // A failed begin must leave no MAIL or RCPT line queued, or the next
     // transaction on the connection joins it (with and without PIPELINING).
+    // Valid addresses cannot give such a line; an unchecked one can.
+    let too_long = Address::unchecked(&format!("{}@example.org", "a".repeat(600)));
     for caps in [
         &b"250-mx\r\n250-PIPELINING\r\n250-CHUNKING\r\n250 DSN\r\n"[..],
         b"250-mx\r\n250 DSN\r\n",
     ] {
         let mut s = ready(caps);
-        let to = [Address::parse("first@example.org").unwrap(), long_address()];
+        let to = [
+            Address::parse("first@example.org").unwrap(),
+            too_long.clone(),
+        ];
         let e = s
             .begin(&dsn_envelope(&to), BodyFlags::default(), 10, Millis(3))
             .unwrap_err();
@@ -459,31 +499,36 @@ fn test_begin_refusing_a_long_rcpt_queues_nothing() {
         assert_eq!(count(&out, b"MAIL FROM:"), 1);
         assert_eq!(count(&out, b"first@example.org"), 0);
     }
-}
-
-#[test]
-fn test_begin_refusing_a_long_mail_line_queues_nothing() {
-    use crate::message::prepared::{Dsn, DsnNotify};
+    // The same for the MAIL line.
     let mut s = ready(b"250-mx\r\n250-PIPELINING\r\n250 DSN\r\n");
-    let from = long_address();
-    // 100 characters that each need xtext: 300 octets of ENVID.
-    let dsn = Dsn::new(DsnNotify::FAILURE)
-        .envelope_id(&"+".repeat(100))
-        .unwrap();
-    let env = Envelope::new(from, &[Address::parse("b@example.org").unwrap()])
-        .unwrap()
-        .dsn(dsn);
+    let env = Envelope::new(too_long, &[Address::parse("b@example.org").unwrap()]).unwrap();
     let e = s
         .begin(&env, BodyFlags::default(), 10, Millis(3))
         .unwrap_err();
-    assert!(matches!(
-        e.kind(),
-        ErrorKind::Build(BuildError::CommandTooLong)
-    ));
     assert_eq!(e.stage(), Some(Stage::Mail));
     assert!(s.transmit().is_empty());
     assert!(!s.wants_read());
-    assert_eq!(s.state(), SessionState::Ready);
+}
+
+#[test]
+fn test_longest_valid_mail_line_fits_its_allowance() {
+    // A 254-octet reverse path, SIZE, BODY, SMTPUTF8, RET, and an ENVID of
+    // 100 characters as sent: the parameters stay within their allowance.
+    use crate::message::prepared::{Dsn, DsnNotify, DsnReturn};
+    let mut s = ready(
+        b"250-mx\r\n250-PIPELINING\r\n250-SIZE\r\n250-8BITMIME\r\n250-SMTPUTF8\r\n250 DSN\r\n",
+    );
+    let dsn = Dsn::new(DsnNotify::FAILURE)
+        .with_return_content(DsnReturn::Headers)
+        .with_envelope_id(&"+".repeat(33))
+        .unwrap();
+    let env = Envelope::new(long_address(), &[Address::parse("b@example.org").unwrap()])
+        .unwrap()
+        .with_dsn(dsn);
+    s.begin(&env, BodyFlags::new(true, true), u64::MAX, Millis(3))
+        .unwrap();
+    let out = drain(&mut s);
+    assert!(out.starts_with(b"MAIL FROM:<"));
 }
 
 #[test]
@@ -491,14 +536,14 @@ fn test_dsn_parameters_are_written_as_xtext_into_the_line() {
     // ENVID and ORCPT go through xtext straight into the line.
     let mut s = ready(b"250-mx\r\n250-PIPELINING\r\n250 DSN\r\n");
     let dsn = crate::message::prepared::Dsn::new(crate::message::prepared::DsnNotify::FAILURE)
-        .envelope_id("order+42")
+        .with_envelope_id("order+42")
         .unwrap();
     let env = Envelope::new(
         Address::parse("a@example.com").unwrap(),
         &[Address::parse("x+y@example.org").unwrap()],
     )
     .unwrap()
-    .dsn(dsn);
+    .with_dsn(dsn);
     s.begin(&env, BodyFlags::default(), 10, Millis(3)).unwrap();
     let out = drain(&mut s);
     assert_eq!(
@@ -506,4 +551,52 @@ fn test_dsn_parameters_are_written_as_xtext_into_the_line() {
         b"MAIL FROM:<a@example.com> ENVID=order+2B42\r\nRCPT TO:<x+y@example.org> NOTIFY=FAILURE ORCPT=rfc822;x+2By@example.org\r\nDATA\r\n"
             .as_slice()
     );
+}
+
+#[test]
+fn test_ehlo_reply_over_1_kib_keeps_every_capability() {
+    // The kept text of a reply stops at 1,024 octets; an EHLO reply is kept
+    // whole (up to the reply budget), so a SIZE straddling the cut is not
+    // read as `SIZE 3` and the lines after it are not lost.
+    let mut ehlo = Vec::new();
+    ehlo.extend_from_slice(b"250-mx.example.com\r\n");
+    ehlo.extend_from_slice(format!("250-X-A{}\r\n", "a".repeat(98)).as_bytes());
+    for i in 0..9 {
+        ehlo.extend_from_slice(format!("250-X-{i}{}\r\n", "b".repeat(96)).as_bytes());
+    }
+    ehlo.extend_from_slice(b"250-SIZE 35882577\r\n");
+    ehlo.extend_from_slice(b"250 PIPELINING\r\n");
+    assert!(ehlo.len() > 1024 && ehlo.len() < 8192);
+    let s = ready(&ehlo);
+    let caps = s.capabilities().unwrap();
+    assert_eq!(caps.size_limit(), Some(35_882_577));
+    assert!(caps.has(Extension::Pipelining));
+}
+
+#[test]
+fn test_reply_before_its_command_is_written_closes_the_session() {
+    // A 220 that arrives with the EHLO reply, while STARTTLS is still
+    // unsent, is an injected reply, not the answer to STARTTLS.
+    let mut c = loopback();
+    c.security = SessionSecurity::StartTlsRequired;
+    let mut s = Session::new(c, Millis(0)).unwrap();
+    s.receive(b"220 mx ESMTP\r\n", Millis(1)).unwrap();
+    drain(&mut s);
+    let e = s
+        .receive(b"250-mx\r\n250 STARTTLS\r\n220 go ahead\r\n", Millis(2))
+        .unwrap_err();
+    assert!(matches!(e.kind(), ErrorKind::StartTlsInjection), "{e}");
+    assert_eq!(s.state(), SessionState::Closed);
+
+    // Without PIPELINING, an RCPT reply that arrives with the MAIL reply.
+    let mut s = ready(b"250 mx\r\n");
+    s.begin(&envelope(1), BodyFlags::default(), 10, Millis(3))
+        .unwrap();
+    drain(&mut s);
+    let e = s.receive(b"250 ok\r\n250 ok\r\n", Millis(4)).unwrap_err();
+    assert!(matches!(
+        e.kind(),
+        ErrorKind::Protocol(ProtocolError::UnexpectedReply)
+    ));
+    assert_eq!(s.state(), SessionState::Closed);
 }

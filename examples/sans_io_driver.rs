@@ -12,7 +12,8 @@ use std::{
     time::Instant,
 };
 
-use smtp_net::{BodyFlags, Event, Millis, Session, SessionConfig, SessionSecurity, TestServer};
+use smtp_net::protocol::{BodyFlags, Event, Millis, Session, SessionConfig, SessionSecurity};
+use smtp_net::testing::TestServer;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = TestServer::start()?;

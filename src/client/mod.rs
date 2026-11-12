@@ -22,13 +22,13 @@ pub use tls::{TlsConnector, TlsSetupError};
 
 use crate::{
     address::{Address, Domain},
-    error::{ConfigError, Disposition, Error, ErrorKind, Stage},
+    error::{ConfigError, Disposition, Error, ErrorKind, RejectedRecipient, Stage},
     gate::{Admission, SendGate},
     message::{Message, prepared::PreparedMessage},
     proto::{
-        Auth, BodyFlags, Capabilities, ClientName, Credentials, Event, MechanismList, Millis,
-        RecipientPolicy, Reply, Secret, Session, SessionConfig, SessionSecurity, SessionState,
-        Timeouts, TlsProtocol,
+        Auth, BodyFlags, Capabilities, ClientName, Credentials, Event, MechanismList,
+        MechanismName, Millis, RecipientPolicy, Reply, Secret, Session, SessionConfig,
+        SessionSecurity, SessionState, Timeouts, TlsProtocol,
     },
 };
 
@@ -64,8 +64,8 @@ impl Security {
     fn default_port(self) -> u16 {
         match self {
             Security::PlaintextLoopback => crate::PORT_SMTP,
-            Security::StartTls => crate::PORT_SUBMISSION,
-            Security::ImplicitTls => crate::PORT_SUBMISSIONS,
+            Security::StartTls => crate::PORT_STARTTLS,
+            Security::ImplicitTls => crate::PORT_IMPLICIT_TLS,
         }
     }
 }
@@ -123,6 +123,10 @@ pub struct Server {
     observer: Option<Arc<dyn Observer>>,
     #[cfg(feature = "dkim")]
     dkim: Vec<crate::DkimSigner>,
+    /// A host refused by the checks `ServerBuilder::build` makes, found by a
+    /// Tier 1 constructor (which returns no `Result`): reported by the
+    /// first connect, before anything is sent.
+    refused: Option<ConfigError>,
 }
 
 /// Most DKIM signers on one server (an RSA and an Ed25519 pair, twice
@@ -137,7 +141,7 @@ impl core::fmt::Debug for Server {
             .field("port", &self.port)
             .field("security", &self.security)
             .field("auth", &self.auth)
-            .field("tls_connector", &self.tls.is_some())
+            .field("tls", &self.tls.is_some())
             .field("insecure", &self.insecure)
             .field("gate", &self.gate.is_some())
             .field("observer", &self.observer.is_some());
@@ -183,13 +187,16 @@ impl Server {
     fn prepare(&self, message: &Message) -> Result<PreparedMessage, Error> {
         #[cfg(feature = "dkim")]
         if !self.dkim.is_empty() {
-            return message.prepare_signed(&self.dkim, now_unix_ms() / 1000);
+            return message.prepare()?.sign(&self.dkim, now_unix_ms() / 1000);
         }
         message.prepare()
     }
 
     fn base(host: &str, security: Security) -> Server {
+        let refused = (host.parse::<IpAddr>().is_err() && Domain::parse(host).is_err())
+            .then_some(ConfigError::InvalidHost);
         Server {
+            refused,
             host: String::from(host),
             port: security.default_port(),
             security,
@@ -228,7 +235,7 @@ impl Server {
     /// A relay with STARTTLS on port 587, certificate verification on, RFC
     /// 5321 timeouts. The TLS engine is tls-net's (feature `tls`, on by
     /// default); without the feature, set one with
-    /// [`ServerBuilder::tls_connector`] (a server without one fails at
+    /// [`ServerBuilder::tls`] (a server without one fails at
     /// connect with `Config(TlsConnectorMissing)`, nothing sent, D-025).
     #[must_use]
     pub fn starttls(host: &str) -> Server {
@@ -249,6 +256,21 @@ impl Server {
         self
     }
 
+    /// Sets a user name and an OAuth 2.0 access token for XOAUTH2 (Gmail,
+    /// Microsoft 365): `Server::starttls("smtp.gmail.com").oauth2(user, token)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let server = smtp_net::Server::starttls("smtp.gmail.com").oauth2("me@gmail.com", "ya29.token");
+    /// assert_eq!(server.port(), smtp_net::PORT_STARTTLS);
+    /// ```
+    #[must_use]
+    pub fn oauth2(mut self, user: &str, token: impl Into<Secret>) -> Server {
+        self.auth = Some(Auth::new(Credentials::oauth2(user, token)));
+        self
+    }
+
     /// A builder for `host` with `security` (the port defaults to 25, 587, or
     /// 465 by security).
     pub fn builder(host: &str, security: Security) -> ServerBuilder {
@@ -256,6 +278,7 @@ impl Server {
             server: Server::base(host, security),
             credentials: None,
             mechanisms: None,
+            client_name: None,
             insecure_remote: false,
         }
     }
@@ -266,6 +289,7 @@ impl Server {
             server: self.clone(),
             credentials: None,
             mechanisms: None,
+            client_name: None,
             insecure_remote: false,
         }
     }
@@ -301,7 +325,8 @@ impl Server {
 pub struct ServerBuilder {
     server: Server,
     credentials: Option<Credentials>,
-    mechanisms: Option<MechanismList>,
+    mechanisms: Option<Vec<MechanismName>>,
+    client_name: Option<String>,
     insecure_remote: bool,
 }
 
@@ -326,19 +351,19 @@ impl ServerBuilder {
         self
     }
 
-    /// The mechanism allowlist, in order of preference (FR-35).
-    ///
-    /// # Errors
-    ///
-    /// `Config(TooManyMechanisms)` for an empty list or more than 8.
-    pub fn mechanisms(mut self, list: &[crate::proto::MechanismName]) -> Result<Self, Error> {
-        self.mechanisms = Some(MechanismList::new(list)?);
-        Ok(self)
+    /// The mechanism allowlist, in order of preference (FR-35): 1 to 8
+    /// names, checked by [`build`](ServerBuilder::build).
+    pub fn mechanisms(mut self, list: &[MechanismName]) -> Self {
+        self.mechanisms = Some(list.to_vec());
+        self
     }
 
-    /// The EHLO argument; the default is the local socket's address literal.
-    pub fn client_name(mut self, name: ClientName) -> Self {
-        self.server.client_name = Some(name);
+    /// The EHLO name: a domain or an IP address (see
+    /// [`ClientName::parse`](crate::protocol::ClientName::parse)), checked
+    /// by [`build`](ServerBuilder::build). The default is the local
+    /// socket's address as a literal, which every server accepts (D-011).
+    pub fn client_name(mut self, name: &str) -> Self {
+        self.client_name = Some(String::from(name));
         self
     }
 
@@ -348,17 +373,14 @@ impl ServerBuilder {
         self
     }
 
-    /// The TLS engine for STARTTLS and implicit TLS.
-    pub fn tls_connector(mut self, connector: impl TlsConnector + 'static) -> Self {
+    /// The TLS engine for STARTTLS and implicit TLS, in place of the
+    /// default (tls-net with the Mozilla roots, feature `tls`). A
+    /// `tls_net::TlsClient` is one, for example a client that trusts only a
+    /// private CA (`tls_net::client_with_ca_pem`); any other engine
+    /// implements [`TlsConnector`].
+    pub fn tls(mut self, connector: impl TlsConnector + 'static) -> Self {
         self.server.tls = Some(Arc::new(connector));
         self
-    }
-
-    /// A tls-net client as the TLS engine: for example one that trusts only
-    /// a private CA (`tls_net::client_with_ca_pem`).
-    #[cfg(feature = "tls")]
-    pub fn tls(self, client: tls_net::TlsClient) -> Self {
-        self.tls_connector(client)
     }
 
     /// Turns certificate verification off. For test relays only: accepted
@@ -410,7 +432,7 @@ impl ServerBuilder {
     /// A DKIM signer applied by [`send`] and [`Client::send`] to every
     /// message built here; repeat for several signatures (at most 4).
     /// [`send_prepared`] never signs: sign before storing the payload
-    /// ([`Message::prepare_signed`]).
+    /// (`message.prepare()?.sign(..)`).
     #[cfg(feature = "dkim")]
     pub fn dkim(mut self, signer: crate::DkimSigner) -> Self {
         self.server.dkim.push(signer);
@@ -428,15 +450,26 @@ impl ServerBuilder {
     /// # Errors
     ///
     /// `Config(PortZero)`, `Config(InvalidHost)`, `Config(PlaintextHostNotLoopback)`,
-    /// `Config(TlsConnectorMissing)`, `Config(InsecureNotAllowed)`.
+    /// `Config(TlsConnectorMissing)`, `Config(InsecureNotAllowed)`,
+    /// `Config(TooManyMechanisms)`, `Config(InvalidClientName)`,
+    /// `Config(TooManyDkimSigners)`.
     pub fn build(self) -> Result<Server, Error> {
         let mut s = self.server;
+        if let Some(name) = &self.client_name {
+            s.client_name =
+                Some(ClientName::parse(name).map_err(|_| ConfigError::InvalidClientName)?);
+        }
+        let mechanisms = match &self.mechanisms {
+            Some(list) => Some(MechanismList::new(list)?),
+            None => None,
+        };
         if s.port == 0 {
             return Err(ConfigError::PortZero.into());
         }
         if s.host.parse::<IpAddr>().is_err() && Domain::parse(&s.host).is_err() {
             return Err(ConfigError::InvalidHost.into());
         }
+        s.refused = None;
         let loopback = is_loopback_host(&s.host);
         match s.security {
             Security::PlaintextLoopback if !loopback => {
@@ -457,7 +490,7 @@ impl ServerBuilder {
         if let Some(c) = self.credentials {
             s.auth = Some(Auth::new(c));
         }
-        if let (Some(m), Some(a)) = (self.mechanisms, s.auth.as_mut()) {
+        if let (Some(m), Some(a)) = (mechanisms, s.auth.as_mut()) {
             a.mechanisms = m;
         }
         Ok(s)
@@ -469,7 +502,7 @@ impl ServerBuilder {
 pub struct Report {
     message_id: String,
     accepted: Vec<Address>,
-    rejected: Vec<(Address, Reply, Disposition)>,
+    rejected: Vec<RejectedRecipient>,
     final_reply: Reply,
     secure: bool,
     tls_protocol: Option<TlsProtocol>,
@@ -483,14 +516,18 @@ impl Report {
         &self.message_id
     }
 
-    /// Recipients the server accepted.
-    pub fn accepted(&self) -> impl Iterator<Item = &Address> {
-        self.accepted.iter()
+    /// Recipients the server accepted, in envelope order.
+    #[must_use]
+    pub fn accepted(&self) -> &[Address] {
+        &self.accepted
     }
 
-    /// Recipients the server refused, with its reply and whether retrying can help.
-    pub fn rejected(&self) -> impl Iterator<Item = (&Address, &Reply, Disposition)> {
-        self.rejected.iter().map(|(a, r, d)| (a, r, *d))
+    /// Recipients the server refused while it accepted others (the default
+    /// [`RecipientPolicy::Any`]), each with its reply and whether retrying
+    /// can help.
+    #[must_use]
+    pub fn rejected(&self) -> &[RejectedRecipient] {
+        &self.rejected
     }
 
     /// The reply to the end of the data (of the last transaction, when
@@ -525,22 +562,30 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn admit(server: &Server, message: &PreparedMessage) -> Result<(), Error> {
+/// Asks the gate; returns the time of the admission, which a refund must
+/// give back (so the allowance returns to the window it came from).
+fn admit(server: &Server, message: &PreparedMessage) -> Result<u64, Error> {
+    let now = now_unix_ms();
     let Some(gate) = &server.gate else {
-        return Ok(());
+        return Ok(now);
     };
-    match gate.admit_envelope(message.envelope(), now_unix_ms()) {
+    match gate.admit(message.envelope(), now) {
         Admission::RetryAfter(d) => Err(Error::new(ErrorKind::Throttled).with_retry_after(d)),
-        _ => Ok(()),
+        _ => Ok(now),
     }
 }
 
-fn refund_on(server: &Server, message: &PreparedMessage, e: &Error) {
+fn refund_on(server: &Server, message: &PreparedMessage, admitted_unix_ms: u64, e: &Error) {
     if let Some(gate) = &server.gate {
         if !e.possibly_delivered() && !matches!(e.kind(), ErrorKind::Throttled) {
-            gate.refund_envelope(message.envelope(), now_unix_ms());
+            gate.refund(message.envelope(), admitted_unix_ms);
         }
     }
+}
+
+/// The instant `Timeouts::total` runs out for a send starting now.
+fn total_deadline(server: &Server) -> Option<Instant> {
+    server.timeouts.total.map(|t| Instant::now() + t)
 }
 
 /// Sends `message` to `server`: derives the envelope, serializes, asks the
@@ -584,16 +629,20 @@ pub fn send(server: &Server, message: &Message) -> Result<Report, Error> {
 /// # Ok::<(), smtp_net::Error>(())
 /// ```
 pub fn send_prepared(server: &Server, message: &PreparedMessage) -> Result<Report, Error> {
-    admit(server, message)?;
+    let admitted = admit(server, message)?;
+    let total = total_deadline(server);
     let result = (|| {
-        let mut client = Client::connect(server)?;
-        let report = client.deliver(message)?;
+        let mut client = Client::connect_by(server, total)?;
+        client.total = total;
+        let report = client.deliver(message);
+        client.total = None;
+        let report = report?;
         // The message is accepted; a failed QUIT changes nothing.
         let _ = client.close();
         Ok(report)
     })();
     if let Err(e) = &result {
-        refund_on(server, message, e);
+        refund_on(server, message, admitted, e);
     }
     server.observe(message, &result);
     result
@@ -651,6 +700,8 @@ pub struct Client {
     plain: Vec<u8>,
     sent: u32,
     last_used: Instant,
+    /// When `Timeouts::total` runs out for the send in progress.
+    total: Option<Instant>,
 }
 
 impl core::fmt::Debug for Client {
@@ -680,7 +731,13 @@ impl Client {
     /// `StartTlsInjection`, `AuthUnavailable`, `AuthFailed`, `Timeout`,
     /// `Rejected`, `Protocol`, `Config`.
     pub fn connect(server: &Server) -> Result<Client, Error> {
-        let (conn, session) = Client::open(server)?;
+        Client::connect_by(server, None)
+    }
+
+    /// As [`connect`](Client::connect), finished by `total` (a send's
+    /// `Timeouts::total`) when that comes first.
+    pub(crate) fn connect_by(server: &Server, total: Option<Instant>) -> Result<Client, Error> {
+        let (conn, session) = Client::open(server, total)?;
         let mut c = Client {
             server: server.clone(),
             conn: Some(conn),
@@ -690,13 +747,29 @@ impl Client {
             plain: Vec::with_capacity(READ_BUFFER),
             sent: 0,
             last_used: Instant::now(),
+            total,
         };
-        c.until_ready()?;
+        let ready = c.until_ready();
+        c.total = None;
+        ready?;
         Ok(c)
     }
 
-    fn open(server: &Server) -> Result<(Conn, Session), Error> {
+    fn open(server: &Server, total: Option<Instant>) -> Result<(Conn, Session), Error> {
+        if let Some(e) = server.refused {
+            return Err(Error::from(e).at(Stage::Connect));
+        }
         let t = &server.timeouts;
+        let connect_timeout = match total {
+            Some(end) => {
+                let left = end.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(Error::new(ErrorKind::Timeout).at(Stage::Total));
+                }
+                left.min(t.connect)
+            }
+            None => t.connect,
+        };
         if matches!(server.security, Security::StartTls | Security::ImplicitTls)
             && server.tls.is_none()
         {
@@ -730,7 +803,7 @@ impl Client {
         // (`::1` first) to an MTA on 127.0.0.1 only waited 1 s per connect.
         // Every winner still passes the loopback check below.
         let mut options = ConnectOptions::new()
-            .timeout(t.connect)
+            .timeout(connect_timeout)
             .limits(limits)
             .happy_eyeballs(true);
         if is_loopback_host(&server.host) {
@@ -774,15 +847,48 @@ impl Client {
         self.epoch + Duration::from_millis(at.0)
     }
 
-    /// Writes all pending output.
+    /// The deadline for the next read or write: the session's (the oldest
+    /// outstanding reply, or in the body the current block, renewed on
+    /// every block), or the end of `Timeouts::total` when that is sooner.
+    /// True when the total is the one that applies.
+    fn deadline(&self) -> (Option<Instant>, bool) {
+        let stage = self.session.deadline().map(|d| self.instant(d));
+        match (stage, self.total) {
+            (Some(s), Some(t)) if t < s => (Some(t), true),
+            (None, Some(t)) => (Some(t), true),
+            (s, _) => (s, false),
+        }
+    }
+
+    /// A timeout error, at `Stage::Total` when the total ran out.
+    fn timed_out(&mut self, total: bool) -> Error {
+        let now = self.now().max(self.session.deadline().unwrap_or(Millis(0)));
+        let e = if total {
+            self.session
+                .connection_lost(ErrorKind::Timeout)
+                .at(Stage::Total)
+        } else {
+            match self.session.on_timeout(now) {
+                Err(e) => e,
+                Ok(()) => self.session.connection_lost(ErrorKind::Timeout),
+            }
+        };
+        self.drop_conn();
+        e
+    }
+
+    /// Writes all pending output, within the same deadline as a read: in
+    /// the body that is `Timeouts::data_block` per block (T-13).
     fn flush(&mut self) -> Result<(), Error> {
         let pending = self.session.transmit().len();
         if pending == 0 {
             return Ok(());
         }
+        let (deadline, total) = self.deadline();
         let Some(conn) = self.conn.as_mut() else {
             return Err(Error::new(ErrorKind::ConnectionClosed));
         };
+        conn.tcp.set_exchange_deadline(deadline);
         let result = match conn.tls.as_mut() {
             Some(tls) => tls.write(&mut conn.tcp, self.session.transmit()),
             None => conn.tcp.send_all(self.session.transmit()),
@@ -792,6 +898,7 @@ impl Client {
                 self.session.transmitted(pending);
                 Ok(())
             }
+            Err(NetError::TimedOut { .. }) if total => Err(self.timed_out(true)),
             Err(NetError::TimedOut { .. }) => Err(self.lost(ErrorKind::Timeout)),
             Err(e) => Err(self.lost(ErrorKind::Io(net_kind(e)))),
         }
@@ -810,7 +917,7 @@ impl Client {
 
     /// Reads once and feeds the session.
     fn read(&mut self) -> Result<(), Error> {
-        let deadline = self.session.deadline().map(|d| self.instant(d));
+        let (deadline, total) = self.deadline();
         let Some(conn) = self.conn.as_mut() else {
             return Err(Error::new(ErrorKind::ConnectionClosed));
         };
@@ -850,15 +957,7 @@ impl Client {
                     }
                 }
             }
-            Err(NetError::TimedOut { .. }) => {
-                let now = self.now().max(self.session.deadline().unwrap_or(Millis(0)));
-                let e = match self.session.on_timeout(now) {
-                    Err(e) => e,
-                    Ok(()) => self.session.connection_lost(ErrorKind::Timeout),
-                };
-                self.drop_conn();
-                Err(e)
-            }
+            Err(NetError::TimedOut { .. }) => Err(self.timed_out(total)),
             Err(e) => Err(self.lost(ErrorKind::Io(net_kind(e)))),
         }
     }
@@ -875,7 +974,10 @@ impl Client {
                 return Err(err.with_disposition(Disposition::Permanent));
             }
         };
-        let deadline = Instant::now() + self.server.timeouts.tls_handshake;
+        let mut deadline = Instant::now() + self.server.timeouts.tls_handshake;
+        if let Some(t) = self.total {
+            deadline = deadline.min(t);
+        }
         let Some(conn) = self.conn.as_mut() else {
             return Err(Error::new(ErrorKind::ConnectionClosed));
         };
@@ -973,10 +1075,23 @@ impl Client {
     ///
     /// Every send error; see [`send`].
     pub fn send_prepared(&mut self, message: &PreparedMessage) -> Result<Report, Error> {
-        admit(&self.server, message)?;
+        let total = total_deadline(&self.server);
+        self.send_by(message, total)
+    }
+
+    /// As [`send_prepared`](Client::send_prepared), with the end of
+    /// `Timeouts::total` given (a pool counts it from before the connect).
+    pub(crate) fn send_by(
+        &mut self,
+        message: &PreparedMessage,
+        total: Option<Instant>,
+    ) -> Result<Report, Error> {
+        let admitted = admit(&self.server, message)?;
+        self.total = total;
         let result = self.deliver(message);
+        self.total = None;
         if let Err(e) = &result {
-            refund_on(&self.server, message, e);
+            refund_on(&self.server, message, admitted, e);
         }
         self.server.observe(message, &result);
         result
@@ -997,7 +1112,7 @@ impl Client {
                 if reused
                     && e.is_temporary()
                     && !e.possibly_delivered()
-                    && e.recipients().is_empty()
+                    && e.rejected().is_empty()
                     && Client::nothing_accepted(&e) =>
             {
                 self.reconnect()?;
@@ -1027,9 +1142,11 @@ impl Client {
             // Recipients still deferred: reported as temporary refusals.
             for i in deferred {
                 if let Some(a) = envelope.recipients().get(i) {
-                    report
-                        .rejected
-                        .push((a.clone(), Reply::too_many(), Disposition::Temporary));
+                    report.rejected.push(RejectedRecipient::new(
+                        a.clone(),
+                        Reply::too_many(),
+                        Disposition::Temporary,
+                    ));
                 }
             }
         }
@@ -1070,7 +1187,7 @@ impl Client {
             }
             c.tcp.abort();
         }
-        let (conn, session) = Client::open(&self.server)?;
+        let (conn, session) = Client::open(&self.server, self.total)?;
         self.conn = Some(conn);
         self.session = session;
         self.epoch = Instant::now();
@@ -1120,7 +1237,7 @@ impl Client {
                         disposition,
                     } => {
                         if let Some(a) = envelope.recipients().get(index) {
-                            rejected.push((a.clone(), reply, disposition));
+                            rejected.push(RejectedRecipient::new(a.clone(), reply, disposition));
                         }
                     }
                     Event::BodyWanted => in_body = true,

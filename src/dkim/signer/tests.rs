@@ -1,5 +1,5 @@
 use super::*;
-use crate::dkim::DkimAlgorithm;
+use crate::DkimAlgorithm;
 
 const RFC8463_SEED: &str = "nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=";
 
@@ -184,7 +184,7 @@ fn test_header_list_and_oversigning() {
     let flat: String = header.replace("\r\n ", "");
     assert!(
         flat.contains(
-            "h=from:to:subject:date:message-id:from:to:cc:subject:date:reply-to:message-id;"
+            "h=from:to:subject:date:message-id:from:to:cc:subject:date:message-id:reply-to:sender:in-reply-to:references:mime-version:content-type:content-transfer-encoding:list-unsubscribe:list-unsubscribe-post;"
         ),
         "{flat}"
     );
@@ -213,6 +213,37 @@ fn test_added_header_changes_the_signed_data() {
         result.is_err(),
         "a header added in transit must break the signature"
     );
+}
+
+#[test]
+fn test_every_default_header_added_in_transit_breaks_the_signature() {
+    // A verifier hashes the bottom-most instances named in h=; a signed
+    // header that is not oversigned can be added above the signed one and
+    // the signature still verifies. Every default header is oversigned, so
+    // each of these breaks it, present in the message or not.
+    let key = rfc_key();
+    let signer = DkimSigner::new("football.example.com", "brisbane", key.clone()).unwrap();
+    let text = String::from_utf8(signed_with(&signer, RFC8463_MESSAGE)).unwrap();
+    verify(text.as_bytes(), &key);
+    for added in [
+        "Content-Type: text/html; charset=utf-8",
+        "Content-Transfer-Encoding: base64",
+        "MIME-Version: 2.0",
+        "Sender: ceo@example.com",
+        "List-Unsubscribe: <https://evil.example/u>",
+        "List-Unsubscribe-Post: List-Unsubscribe=One-Click",
+        "In-Reply-To: <x@evil.example>",
+        "References: <x@evil.example>",
+        "Reply-To: x@evil.example",
+        "Cc: x@evil.example",
+    ] {
+        let tampered = text.replacen("From: Joe", &format!("{added}\r\nFrom: Joe"), 1);
+        let result = std::panic::catch_unwind(|| verify(tampered.as_bytes(), &key));
+        assert!(
+            result.is_err(),
+            "{added} added in transit must break the signature"
+        );
+    }
 }
 
 #[test]

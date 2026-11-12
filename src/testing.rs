@@ -60,9 +60,9 @@ enum Entry {
 /// # Examples
 ///
 /// ```
-/// let t = smtp_net::Transcript::parse("S: 220 ready\nC: EHLO [127.0.0.1]\nS: 250 ok\n")?;
+/// let t = smtp_net::testing::Transcript::parse("S: 220 ready\nC: EHLO [127.0.0.1]\nS: 250 ok\n")?;
 /// assert_eq!(t.len(), 3);
-/// # Ok::<(), smtp_net::ScriptMismatch>(())
+/// # Ok::<(), smtp_net::testing::ScriptMismatch>(())
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transcript {
@@ -481,7 +481,7 @@ impl Driver<'_> {
 /// # Examples
 ///
 /// ```
-/// let server = smtp_net::TestServer::builder().starttls().start()?;
+/// let server = smtp_net::testing::TestServer::builder().starttls().start()?;
 /// let msg = smtp_net::Message::text("a@example.com", "b@example.org", "Hi", "over test TLS")?;
 /// let report = smtp_net::send(&server.server(), &msg)?;
 /// assert!(report.was_secure());
@@ -839,7 +839,7 @@ impl TestServerBuilder {
     /// Use a real server-side TLS engine (any net-io `TlsSession`, such as a
     /// tls-net `ServerSession` built from the fixture certificates) instead of
     /// the [`TestTls`] stand-in, for STARTTLS or implicit TLS. The client then
-    /// needs a matching connector (`ServerBuilder::tls_connector`).
+    /// needs a matching connector (`ServerBuilder::tls`).
     pub fn tls_engine(
         mut self,
         factory: impl Fn() -> Option<Box<dyn TlsSession>> + Send + Sync + 'static,
@@ -920,7 +920,7 @@ impl TestServerBuilder {
 /// # Examples
 ///
 /// ```
-/// let server = smtp_net::TestServer::start()?;
+/// let server = smtp_net::testing::TestServer::start()?;
 /// let msg = smtp_net::Message::text("a@example.com", "b@example.org", "Hi", "Hello\n.\n")?;
 /// smtp_net::send(&server.server(), &msg)?;
 /// let got = server.received();
@@ -1001,7 +1001,7 @@ impl TestServer {
         };
         let mut b = Server::builder(host, security)
             .port(self.port())
-            .tls_connector(TestTls);
+            .tls(TestTls);
         if let Some((u, p)) = &self.config.auth {
             b = b.credentials(Credentials::password(u, p.as_str()));
         }

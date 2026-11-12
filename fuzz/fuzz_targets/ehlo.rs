@@ -1,7 +1,8 @@
 #![no_main]
 //! EHLO capabilities: no panic on any reply text.
 use libfuzzer_sys::fuzz_target;
-use smtp_net::{Capabilities, Extension, ReplyLimits, ReplyParser};
+use smtp_net::{Capabilities, Extension};
+use smtp_net::protocol::{ReplyLimits, ReplyParser};
 
 fuzz_target!(|data: &[u8]| {
     let mut input = b"250-x\r\n".to_vec();

@@ -1,7 +1,7 @@
 #![no_main]
 //! Content types: no panic; parameters added never carry controls.
 use libfuzzer_sys::fuzz_target;
-use smtp_net::ContentType;
+use smtp_net::mime::ContentType;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(s) = std::str::from_utf8(data) else { return };

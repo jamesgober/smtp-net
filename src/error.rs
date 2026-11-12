@@ -153,6 +153,14 @@ pub enum AddressError {
         /// Byte offset of the problem in the input.
         position: usize,
     },
+    /// A quoted local part holding a space, a tab, or one of `<`, `>`, `@`,
+    /// `=`, `;`, `,`. RFC 5321 allows them, but on a MAIL or RCPT line they
+    /// can read as ESMTP parameters to software that ends the path at the
+    /// first `>` (`"x> NOTIFY=SUCCESS"@example.com`).
+    RiskyQuotedLocalPart {
+        /// Byte offset of the character in the input.
+        position: usize,
+    },
 }
 
 impl fmt::Display for AddressError {
@@ -201,6 +209,10 @@ impl fmt::Display for AddressError {
             AddressError::DisplayNameInvalid { position } => write!(
                 f,
                 "the display name is not valid at byte {position}; quote names that contain punctuation such as , ; : < > @ ( )"
+            ),
+            AddressError::RiskyQuotedLocalPart { position } => write!(
+                f,
+                "the quoted local part holds a space or one of < > @ = ; , at byte {position}, which a relay could read as an ESMTP parameter"
             ),
         }
     }
@@ -468,6 +480,9 @@ pub enum ConfigError {
     TooManyDkimSigners,
     /// A pool size outside 1 to 64.
     PoolSize,
+    /// The EHLO name given to `ServerBuilder::client_name` is not a domain
+    /// or an IP address.
+    InvalidClientName,
 }
 
 impl fmt::Display for ConfigError {
@@ -491,6 +506,9 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::TooManyDkimSigners => "a server takes at most 4 DKIM signers",
             ConfigError::PoolSize => "a pool holds 1 to 64 connections",
+            ConfigError::InvalidClientName => {
+                "the EHLO name is not a domain or an IP address; give a name such as mail.example.com, or leave it unset to use the local address"
+            }
         })
     }
 }
@@ -705,7 +723,7 @@ impl fmt::Display for DkimError {
     }
 }
 
-/// A [`BodySource`](crate::BodySource) failed.
+/// A [`BodySource`](crate::mime::BodySource) failed.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SourceError {
@@ -853,7 +871,7 @@ pub enum ErrorKind {
     Protocol(ProtocolError),
     /// The server refused; see [`Error::reply`].
     Rejected,
-    /// Every recipient was refused; see [`Error::recipients`].
+    /// Every recipient was refused; see [`Error::rejected`].
     AllRecipientsRejected,
     /// The message is larger than the server's advertised SIZE.
     MessageTooLarge {
@@ -931,8 +949,69 @@ impl fmt::Display for ErrorKind {
     }
 }
 
-/// A per-recipient failure: the address, the server's reply, and whether retrying can help.
-pub type RecipientFailure = (Address, Reply, Disposition);
+/// A recipient the server refused: the address, the server's reply, and
+/// whether retrying later can help. [`Report::rejected`](crate::Report::rejected)
+/// lists the ones refused while others were accepted; [`Error::rejected`]
+/// lists them when the send failed.
+///
+/// # Examples
+///
+/// ```
+/// fn log_refusals(e: &smtp_net::Error) {
+///     for r in e.rejected() {
+///         let retry = if r.is_temporary() { "retry later" } else { "do not retry" };
+///         eprintln!("{} refused ({}): {retry}", r.address(), r.reply().code().get());
+///     }
+/// }
+/// # let _ = log_refusals;
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedRecipient {
+    address: Address,
+    reply: Reply,
+    disposition: Disposition,
+}
+
+impl RejectedRecipient {
+    pub(crate) fn new(address: Address, reply: Reply, disposition: Disposition) -> Self {
+        RejectedRecipient {
+            address,
+            reply,
+            disposition,
+        }
+    }
+
+    /// The recipient.
+    #[must_use]
+    pub fn address(&self) -> &Address {
+        &self.address
+    }
+
+    /// The server's reply to `RCPT TO` (a `452` stands in for a recipient
+    /// still deferred after the last round).
+    #[must_use]
+    pub fn reply(&self) -> &Reply {
+        &self.reply
+    }
+
+    /// Whether retrying later can succeed.
+    #[must_use]
+    pub fn disposition(&self) -> Disposition {
+        self.disposition
+    }
+
+    /// `disposition() == Disposition::Temporary`: retry this recipient later.
+    #[must_use]
+    pub fn is_temporary(&self) -> bool {
+        self.disposition == Disposition::Temporary
+    }
+
+    /// `disposition() == Disposition::Permanent`: do not retry this recipient.
+    #[must_use]
+    pub fn is_permanent(&self) -> bool {
+        self.disposition == Disposition::Permanent
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Inner {
@@ -945,7 +1024,7 @@ struct Inner {
     security_event: bool,
     /// The server's XOAUTH2 error status, when it sent one.
     detail: Option<alloc::string::String>,
-    recipients: Vec<RecipientFailure>,
+    rejected: Vec<RejectedRecipient>,
 }
 
 /// An smtp-net error: what was refused, where, and whether retrying can help.
@@ -980,7 +1059,7 @@ impl Error {
                 retry_after: None,
                 security_event,
                 detail: None,
-                recipients: Vec::new(),
+                rejected: Vec::new(),
             }),
         }
     }
@@ -1016,8 +1095,8 @@ impl Error {
         self
     }
 
-    pub(crate) fn with_recipients(mut self, recipients: Vec<RecipientFailure>) -> Error {
-        self.inner.recipients = recipients;
+    pub(crate) fn with_rejected(mut self, rejected: Vec<RejectedRecipient>) -> Error {
+        self.inner.rejected = rejected;
         self
     }
 
@@ -1087,11 +1166,11 @@ impl Error {
         self.inner.detail.as_deref()
     }
 
-    /// Per-recipient replies, for `AllRecipientsRejected` and for partial
-    /// failures under `RecipientPolicy::All`.
+    /// The refused recipients, for `AllRecipientsRejected` and for partial
+    /// failures under `RecipientPolicy::All`; empty otherwise.
     #[must_use]
-    pub fn recipients(&self) -> &[RecipientFailure] {
-        &self.inner.recipients
+    pub fn rejected(&self) -> &[RejectedRecipient] {
+        &self.inner.rejected
     }
 }
 
@@ -1144,8 +1223,8 @@ impl fmt::Debug for Error {
         if i.security_event {
             d.field("security_event", &true);
         }
-        if !i.recipients.is_empty() {
-            d.field("recipients", &i.recipients.len());
+        if !i.rejected.is_empty() {
+            d.field("rejected", &i.rejected.len());
         }
         d.finish()
     }
@@ -1264,6 +1343,7 @@ mod tests {
             AddressError::ControlCharacter { position: 0 }.into(),
             AddressError::InternationalDomainUnsupported.into(),
             AddressError::DisplayNameInvalid { position: 0 }.into(),
+            AddressError::RiskyQuotedLocalPart { position: 0 }.into(),
             HeaderError::ControlCharacter {
                 field: "Subject",
                 position: 3

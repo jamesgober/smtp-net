@@ -4,7 +4,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use smtp_net::{ErrorKind, Fault, Message, Pool, Stage, TestServer};
+use smtp_net::testing::{Fault, TestServer};
+use smtp_net::{ErrorKind, Message, Pool, Stage};
 
 fn msg(i: usize) -> Message {
     Message::text(

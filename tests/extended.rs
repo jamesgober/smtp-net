@@ -5,10 +5,11 @@
 
 use std::time::Duration;
 
+use smtp_net::testing::{Fault, TestServer, TestTls};
 use smtp_net::{
-    Address, Admission, Dsn, DsnNotify, DsnReturn, Envelope, ErrorKind, Fault, HourlyLimit,
-    MechanismName, Message, PreparedMessage, Security, SendGate, Server, Stage, TestServer,
-    TestTls, Timeouts, TlsFailure,
+    Address, Admission, Dsn, DsnNotify, DsnPolicy, DsnReturn, Envelope, ErrorKind, HourlyLimit,
+    MechanismName, Message, PreparedMessage, Security, SendGate, Server, Stage, Timeouts,
+    TlsFailure,
 };
 
 fn msg(to: &str) -> Message {
@@ -136,7 +137,7 @@ fn test_wrong_name_refused_unless_verification_off_on_loopback() {
 #[test]
 fn test_insecure_remote_needs_the_second_flag() {
     let b = Server::builder("mail.example.com", Security::StartTls)
-        .tls_connector(TestTls)
+        .tls(TestTls)
         .dangerous_disable_certificate_verification();
     let e = b.clone().build().unwrap_err();
     assert!(matches!(
@@ -190,7 +191,7 @@ fn test_implicit_tls_to_plaintext_port_is_protocol_mismatch() {
     let plain = TestServer::start().unwrap();
     let s = Server::builder("localhost", Security::ImplicitTls)
         .port(plain.port())
-        .tls_connector(TestTls)
+        .tls(TestTls)
         .timeouts(quick())
         .build()
         .unwrap();
@@ -208,7 +209,7 @@ fn test_starttls_to_implicit_port_times_out_with_a_hint() {
     let implicit = TestServer::builder().implicit_tls().start().unwrap();
     let s = Server::builder("localhost", Security::StartTls)
         .port(implicit.port())
-        .tls_connector(TestTls)
+        .tls(TestTls)
         .timeouts(quick())
         .build()
         .unwrap();
@@ -228,7 +229,6 @@ fn test_auth_plain_over_starttls_and_redacted_transcript() {
     let plain = server
         .server_builder()
         .mechanisms(&[MechanismName::Plain])
-        .unwrap()
         .build()
         .unwrap();
     smtp_net::send(&plain, &msg("a@example.org")).unwrap();
@@ -251,7 +251,6 @@ fn test_auth_login_only_allowlist() {
     let s = server
         .server_builder()
         .mechanisms(&[MechanismName::Login])
-        .unwrap()
         .build()
         .unwrap();
     smtp_net::send(&s, &msg("a@example.org")).unwrap();
@@ -348,10 +347,10 @@ fn test_large_chunked_message_waits_for_recipient_replies() {
 fn test_dsn_parameters_sent_when_offered_and_required_refused_otherwise() {
     let server = TestServer::start().unwrap();
     let m = msg("a@example.org");
-    let env = m.envelope().unwrap().dsn(
+    let env = m.envelope().unwrap().with_dsn(
         Dsn::new(DsnNotify::FAILURE | DsnNotify::DELAY)
-            .ret(DsnReturn::Headers)
-            .envelope_id("order+42")
+            .with_return_content(DsnReturn::Headers)
+            .with_envelope_id("order+42")
             .unwrap(),
     );
     let p = PreparedMessage::from_raw(env, m.to_bytes().unwrap()).unwrap();
@@ -371,7 +370,7 @@ fn test_dsn_parameters_sent_when_offered_and_required_refused_otherwise() {
     let env = m
         .envelope()
         .unwrap()
-        .dsn(Dsn::new(DsnNotify::FAILURE).required());
+        .with_dsn(Dsn::new(DsnNotify::FAILURE).with_policy(DsnPolicy::Required));
     let p = PreparedMessage::from_raw(env, m.to_bytes().unwrap()).unwrap();
     let e = smtp_net::send_prepared(&no_dsn.server(), &p).unwrap_err();
     assert!(matches!(
@@ -402,7 +401,7 @@ fn test_too_many_recipients_deferred_to_further_transactions() {
         .build()
         .unwrap();
     let report = smtp_net::send(&server.server(), &m).unwrap();
-    assert_eq!(report.accepted().count(), 3);
+    assert_eq!(report.accepted().len(), 3);
     let got = server.received();
     assert_eq!(got.len(), 3);
     assert!(
@@ -440,11 +439,11 @@ fn test_hourly_limit_throttles_and_refunds() {
     let limit = std::sync::Arc::new(HourlyLimit::messages(1));
     struct Shared(std::sync::Arc<HourlyLimit>);
     impl SendGate for Shared {
-        fn admit(&self, n: u32, t: u64) -> Admission {
-            self.0.admit(n, t)
+        fn admit(&self, e: &Envelope, t: u64) -> Admission {
+            self.0.admit(e, t)
         }
-        fn refund(&self, n: u32, t: u64) {
-            self.0.refund(n, t)
+        fn refund(&self, e: &Envelope, t: u64) {
+            self.0.refund(e, t)
         }
     }
     let down = busy

@@ -1,7 +1,7 @@
 #![no_main]
 //! Reply parser: no panic, budgets hold, and the same result for any split.
 use libfuzzer_sys::fuzz_target;
-use smtp_net::{ReplyLimits, ReplyParser};
+use smtp_net::protocol::{ReplyLimits, ReplyParser};
 
 fuzz_target!(|data: &[u8]| {
     let split = data.first().map_or(1, |b| usize::from(*b % 16) + 1);

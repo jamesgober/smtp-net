@@ -5,11 +5,14 @@ use std::{
     cell::Cell,
 };
 
-use smtp_net::{
-    Address, BodyFlags, BuildError, Envelope, ErrorKind, Event, Message, Millis, Multipart, Part,
-    QpState, RandomSource, ReplyLimits, ReplyParser, Session, SessionConfig, SessionSecurity,
-    base64_encode_lines, check_header_value, quoted_printable_encode, quoted_printable_finish,
+use smtp_net::mime::{
+    Multipart, Part, QuotedPrintableState, RandomSource, base64_encode_lines, check_header_value,
+    quoted_printable_encode, quoted_printable_finish,
 };
+use smtp_net::protocol::{
+    BodyFlags, Event, Millis, ReplyLimits, ReplyParser, Session, SessionConfig, SessionSecurity,
+};
+use smtp_net::{Address, BuildError, Envelope, ErrorKind, Message};
 
 struct Counting;
 
@@ -91,7 +94,7 @@ fn test_encoders_and_header_check_allocate_nothing() {
     assert_eq!(n, 0, "base64");
     let text = "caf\u{e9} = r\u{e9}sum\u{e9} \n.line\nFrom here\n".repeat(100);
     let (n, _) = count(|| {
-        let mut st = QpState::new();
+        let mut st = QuotedPrintableState::new();
         let k = quoted_printable_encode(text.as_bytes(), &mut out, &mut st).unwrap();
         quoted_printable_finish(&mut out[k..], &mut st).unwrap()
     });
@@ -220,9 +223,9 @@ fn test_begin_with_dsn_parameters_allocates_nothing() {
         ],
     )
     .unwrap()
-    .dsn(
+    .with_dsn(
         smtp_net::Dsn::new(smtp_net::DsnNotify::FAILURE)
-            .envelope_id("order+42")
+            .with_envelope_id("order+42")
             .unwrap(),
     );
     let (n, _) = count(|| s.begin(&env, BodyFlags::default(), 10, Millis(2)).unwrap());
@@ -342,7 +345,7 @@ fn test_t26_gib_attachment_refused_when_added() {
         "big.bin",
         "application/octet-stream",
         1 << 30,
-        Box::new(smtp_net::ReadSource::new(std::io::repeat(0))),
+        Box::new(smtp_net::mime::ReadSource::new(std::io::repeat(0))),
     )
     .unwrap();
     let b = Message::builder()

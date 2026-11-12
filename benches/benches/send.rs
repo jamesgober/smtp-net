@@ -4,7 +4,8 @@
 use std::time::Duration;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use smtp_net::{Client, Fault, Message, PreparedMessage, TestServer};
+use smtp_net::{Client, Message, PreparedMessage};
+use smtp_net::testing::{Fault, TestServer};
 
 fn prepared() -> PreparedMessage {
     Message::text("Example <no-reply@example.com>", "user@example.org", "Confirm your email address", "Open https://example.com/c/0123456789abcdef to confirm.\n")

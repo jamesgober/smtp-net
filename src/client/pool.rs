@@ -124,6 +124,7 @@ impl Pool {
     ///
     /// Every send error, and `PoolExhausted`.
     pub fn send_prepared(&self, message: &PreparedMessage) -> Result<Report, Error> {
+        let total = self.server.timeouts.total.map(|t| Instant::now() + t);
         let mut checkout = self.checkout()?;
         let mut guard = self
             .clients
@@ -133,7 +134,7 @@ impl Pool {
             .unwrap_or_else(PoisonError::into_inner);
         let client = match guard.take() {
             Some(c) => c,
-            None => match Client::connect(&self.server) {
+            None => match Client::connect_by(&self.server, total) {
                 Ok(c) => c,
                 Err(e) => {
                     let failed = Err(e);
@@ -143,7 +144,7 @@ impl Pool {
             },
         };
         let mut client = client;
-        let result = client.send_prepared(message);
+        let result = client.send_by(message, total);
         // A failed connection is dropped; a healthy one goes back.
         if client.is_open() {
             *guard = Some(client);

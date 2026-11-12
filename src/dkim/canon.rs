@@ -47,7 +47,8 @@ const RUN: usize = 512;
 /// # Examples
 ///
 /// ```
-/// use smtp_net::{BodyCanonicalizer, Canonicalization};
+/// use smtp_net::Canonicalization;
+/// use smtp_net::dkim::BodyCanonicalizer;
 /// let mut out = Vec::new();
 /// let mut c = BodyCanonicalizer::new(Canonicalization::Relaxed);
 /// c.update(b"Hi  there \t\r\n", &mut |b| out.extend_from_slice(b));
@@ -245,7 +246,8 @@ impl core::fmt::Debug for BodyCanonicalizer {
 /// # Examples
 ///
 /// ```
-/// use smtp_net::{Canonicalization, HeaderCanonicalizer};
+/// use smtp_net::Canonicalization;
+/// use smtp_net::dkim::HeaderCanonicalizer;
 /// let mut out = Vec::new();
 /// HeaderCanonicalizer::new(Canonicalization::Relaxed)
 ///     .canonicalize(b"SubJect :  Hello\r\n   there  \r\n", &mut out);

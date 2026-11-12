@@ -1,11 +1,14 @@
 //! Property tests for the invariants in dev/PLAN.md 12.3.
 
 use proptest::prelude::*;
-use smtp_net::{
-    Address, BodyFlags, Envelope, Event, Message, Millis, QpState, RandomSource, ReplyLimits,
-    ReplyParser, Session, SessionConfig, SessionSecurity, base64_encode_lines, base64_encoded_len,
-    encode_word, quoted_printable_encode, quoted_printable_finish,
+use smtp_net::mime::{
+    QuotedPrintableState, RandomSource, base64_encode_lines, base64_encoded_len, encode_word,
+    quoted_printable_encode, quoted_printable_finish,
 };
+use smtp_net::protocol::{
+    BodyFlags, Event, Millis, ReplyLimits, ReplyParser, Session, SessionConfig, SessionSecurity,
+};
+use smtp_net::{Address, Envelope, Message};
 
 struct Counter(u8);
 impl RandomSource for Counter {
@@ -103,6 +106,27 @@ proptest! {
     }
 
     #[test]
+    fn prop_display_names_of_any_length_stay_within_998_and_decode(
+        words in proptest::collection::vec("[a-zA-Z0-9.,\"\\\\()<>@:;\u{e9}\u{4e2d}]{1,40}|[a-z]{900,1100}", 1..80),
+    ) {
+        let name = words.join(" ");
+        let Ok(mailbox) = smtp_net::Mailbox::new(Some(&name), Address::parse("a@example.com").unwrap()) else {
+            return Ok(());
+        };
+        let built = Message::builder()
+            .from(mailbox.clone()).unwrap()
+            .to(mailbox.clone()).unwrap()
+            .text("hello").unwrap()
+            .build_with(&mut Counter(1), 1_700_000_000);
+        let Ok(m) = built else { return Ok(()) };
+        let bytes = m.to_bytes().unwrap();
+        wire_ok(&bytes)?;
+        let payload = m.prepare().unwrap().encode();
+        prop_assert!(smtp_net::PreparedMessage::decode(&payload).is_ok());
+        prop_assert!(!mailbox.to_string().contains(['\r', '\n']));
+    }
+
+    #[test]
     fn prop_builder_output_obeys_wire_rules(
         subject in "\\PC{0,200}",
         name in "\\PC{0,40}",
@@ -137,7 +161,7 @@ proptest! {
         let input: Vec<u8> = input.into_iter().filter(|&b| b != b'\r').collect();
         let split = split.min(input.len());
         let mut out = vec![0u8; input.len() * 4 + 64];
-        let mut state = QpState::new();
+        let mut state = QuotedPrintableState::new();
         let mut n = quoted_printable_encode(&input[..split], &mut out, &mut state).unwrap();
         n += quoted_printable_encode(&input[split..], &mut out[n..], &mut state).unwrap();
         n += quoted_printable_finish(&mut out[n..], &mut state).unwrap();

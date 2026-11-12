@@ -11,7 +11,7 @@ use super::{
     sink::Sink,
 };
 use crate::{
-    encode::{self, B64_LINE_INPUT, MIME_LINE_LENGTH, QpState, base64_encoded_len},
+    encode::{self, B64_LINE_INPUT, MIME_LINE_LENGTH, QuotedPrintableState, base64_encoded_len},
     error::{Error, HeaderError, SinkError, SourceError},
 };
 
@@ -34,7 +34,8 @@ pub trait BodySource: Send {
 /// # Examples
 ///
 /// ```
-/// use smtp_net::{Attachment, ReadSource};
+/// use smtp_net::Attachment;
+/// use smtp_net::mime::ReadSource;
 /// let data = vec![7u8; 10_000];
 /// let a = Attachment::from_source(
 ///     "data.bin",
@@ -112,10 +113,10 @@ const MAX_FILE_NAME: usize = 255;
 /// # Examples
 ///
 /// ```
-/// let ct = smtp_net::ContentType::parse("text/CSV; header=present")?;
+/// let ct = smtp_net::mime::ContentType::parse("text/CSV; header=present")?;
 /// assert_eq!(ct.essence(), "text/csv");
 /// assert_eq!(ct.parameter("header"), Some("present"));
-/// assert!(smtp_net::ContentType::parse("text/").is_err());
+/// assert!(smtp_net::mime::ContentType::parse("text/").is_err());
 /// # Ok::<(), smtp_net::HeaderError>(())
 /// ```
 #[derive(Clone, PartialEq, Eq)]
@@ -461,7 +462,7 @@ impl Multipart {
 /// # Examples
 ///
 /// ```
-/// use smtp_net::{Multipart, Part, TransferEncoding};
+/// use smtp_net::mime::{Multipart, Part, TransferEncoding};
 /// let tree = Part::multipart(Multipart::Alternative, vec![
 ///     Part::text("text/plain", "plain")?,
 ///     Part::text("text/x-markdown", "**rich**")?.transfer_encoding(TransferEncoding::QuotedPrintable)?,
@@ -931,7 +932,7 @@ fn write_text<S: Sink>(
             Ok(())
         }
         TransferEncoding::QuotedPrintable => {
-            let mut state = QpState::new();
+            let mut state = QuotedPrintableState::new();
             let mut err = None;
             let mut emit = |b: &[u8]| {
                 if err.is_none() {

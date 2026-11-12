@@ -18,7 +18,8 @@ const MAX_SIZE: u64 = 1 << 53;
 /// # Examples
 ///
 /// ```
-/// use smtp_net::{Capabilities, Extension, ReplyLimits, ReplyParser};
+/// use smtp_net::{Capabilities, Extension};
+/// use smtp_net::protocol::{ReplyLimits, ReplyParser};
 /// let mut p = ReplyParser::new(ReplyLimits::default(), false);
 /// let (_, ehlo) = p.push(b"250-mx.example.com\r\n250-SIZE 10240000\r\n250-PIPELINING\r\n250 8BITMIME\r\n")?;
 /// let caps = Capabilities::parse(&ehlo.unwrap())?;

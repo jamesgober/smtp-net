@@ -9,7 +9,7 @@ use crate::error::SinkError;
 /// # Examples
 ///
 /// ```
-/// use smtp_net::{CountingSink, Sink};
+/// use smtp_net::mime::{CountingSink, Sink};
 /// let mut count = CountingSink::default();
 /// count.write(b"hello")?;
 /// assert_eq!(count.bytes, 5);
@@ -60,7 +60,7 @@ impl Sink for CountingSink {
 /// # Examples
 ///
 /// ```
-/// use smtp_net::{IoSink, Sink};
+/// use smtp_net::mime::{IoSink, Sink};
 /// let mut sink = IoSink(Vec::new());
 /// sink.write(b"abc")?;
 /// assert_eq!(sink.0, b"abc");

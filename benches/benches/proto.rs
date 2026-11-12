@@ -1,6 +1,7 @@
 //! Reply parsing and the session's hot paths (PLAN 11.1).
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
-use smtp_net::{Address, BodyFlags, Envelope, Millis, ReplyLimits, ReplyParser, Session, SessionConfig, SessionSecurity};
+use smtp_net::{Address, Envelope};
+use smtp_net::protocol::{BodyFlags, Millis, ReplyLimits, ReplyParser, Session, SessionConfig, SessionSecurity};
 
 fn ready() -> Session {
     let mut c = SessionConfig::default();

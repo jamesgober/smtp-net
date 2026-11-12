@@ -7,16 +7,16 @@ use core::fmt;
 use super::{
     Capabilities, ClientName, Millis, Reply, ReplyLimits, ReplyParser, Timeouts,
     classify::{auth_error, rejected_disposition, reply_error},
-    command::Line,
+    command::{Line, MAIL_PARAMETERS, RCPT_PARAMETERS},
     sasl::{Auth, Exchange, MAX_AUTH_LINE, MechanismName},
     stuff::DotStuffer,
 };
 use crate::{
     error::{
-        BuildError, ConfigError, Disposition, Error, ErrorKind, Extension, ProtocolError, Stage,
-        UsageError,
+        BuildError, ConfigError, Disposition, Error, ErrorKind, Extension, ProtocolError,
+        RejectedRecipient, Stage, UsageError,
     },
-    message::prepared::{DsnPolicy, DsnReturn, Envelope},
+    message::prepared::{DsnPolicy, DsnReturn, Envelope, xtext_len},
 };
 
 /// Largest pipelined command group written before its replies are read (RFC
@@ -324,6 +324,9 @@ impl Expect {
 struct Pending {
     what: Expect,
     deadline: Millis,
+    /// Octets written in all, counting from the start of the session, once
+    /// the command this reply answers has been written.
+    ends_at: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -353,7 +356,7 @@ struct Txn {
 /// Driving a session by hand against scripted replies:
 ///
 /// ```
-/// use smtp_net::{Event, Millis, Session, SessionConfig, SessionSecurity};
+/// use smtp_net::protocol::{Event, Millis, Session, SessionConfig, SessionSecurity};
 /// let mut config = SessionConfig::default();
 /// config.security = SessionSecurity::Plaintext { peer_is_loopback: true };
 /// let mut s = Session::new(config, Millis(0))?;
@@ -379,6 +382,8 @@ pub struct Session {
     authenticated: bool,
     /// The output holds an AUTH response: wiped once it is transmitted.
     secret_out: bool,
+    /// Octets acknowledged through `transmitted` since the session began.
+    written: u64,
     txn: Option<Txn>,
     body_deadline: Option<Millis>,
     /// Bytes counted into the current pipelined group.
@@ -430,6 +435,7 @@ impl Session {
             exchange: None,
             authenticated: false,
             secret_out: false,
+            written: 0,
             txn: None,
             body_deadline: None,
             group: 0,
@@ -457,6 +463,7 @@ impl Session {
         self.pending.push_back(Pending {
             what,
             deadline: now.after(d),
+            ends_at: self.written + self.out.len() as u64,
         });
     }
 
@@ -490,6 +497,22 @@ impl Session {
 
     /// Clears the output; when it held an AUTH response, overwrites the
     /// buffer first (best effort without unsafe code).
+    /// Appends an AUTH line and its CRLF. When the output must grow for
+    /// it, the old buffer is wiped before it is freed, so no copy of an
+    /// earlier response is left behind by the reallocation.
+    fn push_secret(&mut self, line: &[u8]) {
+        let need = self.out.len() + line.len() + 2;
+        if need > self.out.capacity() {
+            let mut grown = Vec::with_capacity(need.max(self.out.capacity().saturating_mul(2)));
+            grown.extend_from_slice(&self.out);
+            let old = core::mem::replace(&mut self.out, grown);
+            drop(crypt_io::Zeroizing::new(old));
+        }
+        self.out.extend_from_slice(line);
+        self.out.extend_from_slice(b"\r\n");
+        self.secret_out = true;
+    }
+
     fn wipe_output(&mut self) {
         if self.secret_out {
             let cap = self.out.capacity();
@@ -525,6 +548,8 @@ impl Session {
         let mut used = 0usize;
         while used < input.len() {
             let rest = input.get(used..).unwrap_or(&[]);
+            let ehlo = self.pending.front().is_some_and(|p| p.what == Expect::Ehlo);
+            self.parser.keep_whole_text(ehlo);
             let (n, done) = match self.parser.push_view(rest) {
                 Ok(r) => r,
                 Err(p) => {
@@ -583,6 +608,16 @@ impl Session {
             self.pending.push_front(p);
             return Err(self.close(e));
         }
+        if p.ends_at > self.written {
+            // A reply to a command not yet written: the server (or something
+            // between) answered ahead, as an injected reply would.
+            let e = if p.what == Expect::StartTls {
+                Error::new(ErrorKind::StartTlsInjection).at(Stage::StartTls)
+            } else {
+                Error::from(ProtocolError::UnexpectedReply).at(stage)
+            };
+            return Err(self.close(e));
+        }
         if !p.what.allows(code) {
             // A reply that cannot answer this command: the replies are out
             // of step with the commands (an extra reply earlier, or a server
@@ -609,10 +644,17 @@ impl Session {
             }
             Expect::Ehlo => {
                 if code.get() == 250 {
+                    // The whole reply was kept (keep_whole_text); a cut one
+                    // would turn `SIZE 35882577` into `SIZE 3`.
+                    if self.parser.text_truncated() {
+                        let e = Error::from(ProtocolError::ReplyTooLong).at(stage);
+                        return Err(self.close(e));
+                    }
                     let caps = match Capabilities::from_text(self.parser.text()) {
                         Ok(c) => c,
                         Err(e) => return Err(self.close(Error::from(e).at(stage))),
                     };
+                    self.parser.keep_whole_text(false);
                     self.parser
                         .set_enhanced(caps.has(Extension::EnhancedStatusCodes));
                     self.caps = Some(caps);
@@ -752,9 +794,7 @@ impl Session {
             Ok(x) => x,
             Err(e) => return Err(self.close(Error::from(e).at(Stage::Auth))),
         };
-        self.out.extend_from_slice(&line);
-        self.out.extend_from_slice(b"\r\n");
-        self.secret_out = true;
+        self.push_secret(&line);
         self.exchange = Some(exchange);
         self.state = SessionState::Authenticating;
         self.expect(Expect::Auth, now);
@@ -804,9 +844,7 @@ impl Session {
                 };
                 match step {
                     Ok(Some(response)) if response.len() + 2 <= MAX_AUTH_LINE => {
-                        self.out.extend_from_slice(&response);
-                        self.out.extend_from_slice(b"\r\n");
-                        self.secret_out = true;
+                        self.push_secret(&response);
                         self.expect(Expect::Auth, now);
                         Ok(())
                     }
@@ -981,13 +1019,17 @@ impl Session {
                 txn.envelope
                     .recipients()
                     .get(*i)
-                    .map(|a| (a.clone(), r.clone(), *d))
+                    .map(|a| RejectedRecipient::new(a.clone(), r.clone(), *d))
             })
             .collect();
         for i in &txn.deferred {
             if let Some(a) = txn.envelope.recipients().get(*i) {
                 let reply = Reply::too_many();
-                recipients.push((a.clone(), reply, Disposition::Temporary));
+                recipients.push(RejectedRecipient::new(
+                    a.clone(),
+                    reply,
+                    Disposition::Temporary,
+                ));
             }
         }
         let e = Error::new(kind)
@@ -997,7 +1039,7 @@ impl Session {
             } else {
                 Disposition::Permanent
             })
-            .with_recipients(recipients);
+            .with_rejected(recipients);
         txn.failed = Some(e);
     }
 
@@ -1145,6 +1187,7 @@ impl Session {
     /// AUTH response is overwritten once it is all written.
     pub fn transmitted(&mut self, n: usize) {
         let n = n.min(self.out.len());
+        self.written += n as u64;
         self.out.drain(..n);
         if self.out.is_empty() {
             self.wipe_output();
@@ -1286,7 +1329,7 @@ impl Session {
                 return Err(Error::new(ErrorKind::MessageTooLarge { size, limit }).at(Stage::Mail));
             }
         }
-        let dsn = match envelope.dsn_parameters() {
+        let dsn = match envelope.dsn() {
             Some(d) if !has(Extension::Dsn) && d.policy() == DsnPolicy::Required => {
                 return Err(
                     Error::new(ErrorKind::ExtensionRequired(Extension::Dsn)).at(Stage::Mail)
@@ -1530,7 +1573,9 @@ impl Session {
 /// Appends the MAIL line of `txn` to `out`; on refusal nothing is appended.
 fn write_mail(out: &mut Vec<u8>, txn: &Txn, caps_size: bool) -> Result<(), Error> {
     let mut l = Line::new(out);
-    l.put(b"MAIL FROM:").path(txn.envelope.from());
+    l.put(b"MAIL FROM:")
+        .path(txn.envelope.return_path())
+        .params();
     if caps_size && txn.size > 0 {
         l.put(b" SIZE=").decimal(txn.size);
     }
@@ -1540,7 +1585,7 @@ fn write_mail(out: &mut Vec<u8>, txn: &Txn, caps_size: bool) -> Result<(), Error
     if txn.flags.smtputf8 {
         l.put(b" SMTPUTF8");
     }
-    if let Some(d) = txn.envelope.dsn_parameters().filter(|_| txn.dsn) {
+    if let Some(d) = txn.envelope.dsn().filter(|_| txn.dsn) {
         match d.return_content() {
             Some(DsnReturn::Full) => {
                 l.put(b" RET=FULL");
@@ -1550,11 +1595,11 @@ fn write_mail(out: &mut Vec<u8>, txn: &Txn, caps_size: bool) -> Result<(), Error
             }
             None => {}
         }
-        if let Some(id) = d.envelope_id_value() {
+        if let Some(id) = d.envelope_id() {
             l.put(b" ENVID=").xtext(id.as_bytes());
         }
     }
-    l.end()
+    l.end_with(MAIL_PARAMETERS)
 }
 
 /// Appends the RCPT line for recipient `i` of `txn` to `out`; on refusal
@@ -1562,8 +1607,8 @@ fn write_mail(out: &mut Vec<u8>, txn: &Txn, caps_size: bool) -> Result<(), Error
 fn write_rcpt(out: &mut Vec<u8>, txn: &Txn, i: usize) -> Result<(), Error> {
     let addr = txn.envelope.recipients().get(i);
     let mut l = Line::new(out);
-    l.put(b"RCPT TO:").path(addr);
-    if let Some(d) = txn.envelope.dsn_parameters().filter(|_| txn.dsn) {
+    l.put(b"RCPT TO:").path(addr).params();
+    if let Some(d) = txn.envelope.dsn().filter(|_| txn.dsn) {
         let n = d.notify();
         if n.bits() == 0 {
             l.put(b" NOTIFY=NEVER");
@@ -1584,13 +1629,21 @@ fn write_rcpt(out: &mut Vec<u8>, txn: &Txn, i: usize) -> Result<(), Error> {
                 }
             }
         }
-        // ORCPT carries the address as given; UTF-8 addresses need RFC 6533 types: omitted.
-        if let Some(a) = addr.filter(|a| !a.needs_smtputf8()) {
-            l.put(b" ORCPT=rfc822;").xtext(a.as_str().as_bytes());
+        // ORCPT carries the address as given; UTF-8 addresses need RFC 6533
+        // types, and the whole parameter may be at most 500 characters
+        // (RFC 3461 4.2): otherwise it is left out, which DSN allows (the
+        // notice then names the RCPT address).
+        if let Some(a) = addr.filter(|a| {
+            !a.needs_smtputf8() && ORCPT_PREFIX.len() + xtext_len(a.as_str().as_bytes()) <= 500
+        }) {
+            l.put(b" ").put(ORCPT_PREFIX).xtext(a.as_str().as_bytes());
         }
     }
-    l.end()
+    l.end_with(RCPT_PARAMETERS)
 }
+
+/// `ORCPT=` and the address type, before the xtext address.
+const ORCPT_PREFIX: &[u8] = b"ORCPT=rfc822;";
 
 /// Appends a constant command line.
 fn push_command(out: &mut Vec<u8>, command: &[u8]) {
